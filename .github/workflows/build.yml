@@ -1,0 +1,266 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支重复推送时取消上一次，省额度也省等待
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认只读；发布 Release 的那个 job 自己再提权
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 语法与一致性检查
+    runs-on: ubuntu-24.04      # 固定版本：ubuntu-latest 即将迁到 26，SDK 组件对系统版本敏感
+    steps:
+      - uses: actions/checkout@v7
+
+      # 用 runner 自带的 Node，不必为了 --check 再装一个运行时
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: JS 语法检查
+        run: |
+          fail=0
+          for f in app/js/*.js app/sw.js server.js; do
+            echo "→ $f"
+            node --check "$f" || fail=1
+          done
+          exit $fail
+
+      - name: 检查敏感文件没被提交
+        run: |
+          bad=0
+          for f in .ripple-cookie .ripple-token; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "::error::不应提交 $f"
+              bad=1
+            fi
+          done
+          # debug keystore 是公开密码的调试证书，必须入库以保持签名稳定
+          if ! git ls-files --error-unmatch android/debug.keystore >/dev/null 2>&1; then
+            echo "::error::android/debug.keystore 未被版本控制：每次全新 checkout 都会生成新密钥，发布的 APK 签名将不稳定"
+            bad=1
+          fi
+          # 再扫一遍内容，防止有人换了文件名又塞回来
+          for f in .ripple-cookie .ripple-token; do
+            if [ -e "$f" ]; then echo "::warning::$f 存在于工作区（本地开发正常，确认已被忽略）"; fi
+          done
+          exit $bad
+
+      - name: 构建产物没有被误提交
+        run: |
+          bad=0
+          for pat in "*.apk" "*.aab" "android/build-manual/*" "android/app/src/main/assets/www/*"; do
+            hits=$(git ls-files "$pat" || true)
+            if [ -n "$hits" ]; then
+              echo "::error::构建产物被提交了：$pat"
+              echo "$hits" | head -5
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: 版本号一致性
+        run: |
+          if [ ! -f version.json ]; then
+            echo "::error::缺少 version.json"
+            exit 1
+          fi
+          VC=$(sed -n 's/.*"versionCode"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' version.json | head -1)
+          VN=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
+          echo "version.json → $VN ($VC)"
+          if [ -z "$VC" ] || [ -z "$VN" ]; then
+            echo "::error::version.json 解析失败"
+            exit 1
+          fi
+          # 这三处由 build-apk.sh 自动同步；不一致说明有人手改了，必须失败而不是告警
+          bad=0
+          grep -q "versionCode $VC" android/app/build.gradle \
+            || { echo "::error::build.gradle versionCode 与 version.json 不一致"; bad=1; }
+          grep -q "versionName '$VN'" android/app/build.gradle \
+            || { echo "::error::build.gradle versionName 与 version.json 不一致"; bad=1; }
+          # version.js 由脚本生成但必须入库（网页版直接引用），这里校验内容已同步
+          if [ -f app/js/version.js ]; then
+            grep -q "name: '$VN'" app/js/version.js \
+              || { echo "::error::app/js/version.js 的 name 与 version.json 不一致"; bad=1; }
+            grep -q "code: $VC" app/js/version.js \
+              || { echo "::error::app/js/version.js 的 code 与 version.json 不一致"; bad=1; }
+          else
+            echo "::error::缺少 app/js/version.js（网页版会 404，请先跑一次 build-apk.sh）"
+            bad=1
+          fi
+          exit $bad
+
+  build:
+    name: 构建 APK
+    runs-on: ubuntu-24.04      # 同上，固定版本避免底层镜像迁移导致构建失败
+    needs: check
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write          # 创建 Release 并上传资产
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 签名稳定性是「能不能覆盖升级」的前提。CI 每次都是全新 checkout，
+      # 如果 keystore 没入库，build-apk.sh 会生成一把新密钥 —— 每个版本的
+      # 证书指纹都不一样，用户必须卸载再装。这里直接失败，不要静默凑合。
+      - name: 校验 debug keystore 存在
+        run: |
+          KS=android/debug.keystore
+          if [ ! -f "$KS" ]; then
+            echo "::error::$KS 不存在。它必须提交到仓库：CI 每次全新 checkout，缺了就只能生成新密钥，发布的 APK 签名会每版不同。"
+            exit 1
+          fi
+          echo "keystore 存在：$(ls -l "$KS")"
+          keytool -list -keystore "$KS" -storepass android -alias androiddebugkey \
+            | grep -i "SHA1\|SHA-256" || true
+
+      - name: 安装 Android SDK 组件
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "build-tools;36.0.0" > /dev/null
+          echo "已安装："
+          ls "$ANDROID_HOME/build-tools"
+          ls "$ANDROID_HOME/platforms"
+
+      # runner 已经把 ANDROID_HOME / ANDROID_SDK_ROOT 设好了，
+      # 不要在 env 里写 ${{ env.ANDROID_HOME }} —— job 级 env 为空时它会展开成空串，
+      # 反而把 runner 自带的值盖掉。脚本自己会读这两个变量。
+      - name: 构建
+        run: bash android/build-apk.sh
+
+      - name: 显示产物信息
+        run: |
+          APK=$(ls android/build-manual/*.apk | head -1)
+          echo "产物：$APK"
+          ls -lh "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$APK" | head -1
+
+      # Artifact 是临时产物（需登录、有过期时间），只当兜底留存。
+      # 真正给人下载的是 Release 资产 —— 下面这一步负责发布。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ripple-apk
+          path: android/build-manual/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 整理发布用的文件名
+        id: meta
+        run: |
+          VC=$(sed -n 's/.*"versionCode"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' version.json | head -1)
+          VN=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
+          echo "version=$VN" >> "$GITHUB_OUTPUT"
+          echo "code=$VC"     >> "$GITHUB_OUTPUT"
+          echo "tag=v$VN"     >> "$GITHUB_OUTPUT"
+
+          SRC=$(ls android/build-manual/*.apk | head -1)
+          # 发布出去的名字去掉 -debug，看着体面些
+          OUT="Ripple-${VN}.apk"
+          cp "$SRC" "$OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+
+          SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "产物：$OUT"
+          echo "SHA256：$SHA"
+
+      - name: 从 CHANGELOG 提取本版说明
+        id: notes
+        run: |
+          VN="${{ steps.meta.outputs.version }}"
+          OUT=/tmp/notes.md
+          if [ -f CHANGELOG.md ] && grep -q "^## $VN" CHANGELOG.md; then
+            # 抓从本版标题到下一个 "## " 之间的内容
+            awk -v v="$VN" '
+              $0 ~ "^## "v"([ ]|$)" { on=1; next }
+              on && /^## / { exit }
+              on { print }
+            ' CHANGELOG.md > "$OUT"
+            echo "已从 CHANGELOG.md 提取 $VN 的说明（$(wc -l < "$OUT") 行）"
+          else
+            echo "CHANGELOG.md 里没有 $VN 的段落，使用占位说明"
+          fi
+
+          # 指纹直接从**成品 APK** 读，而不是从 keystore 猜：
+          # 用户真正关心的是「这个包是什么签名」，而 apksigner --print-certs 给的
+          # 是实际打包用的证书摘要（顺带兼容 keytool 各版本 "SHA256:" / "SHA-256:" 的差异）。
+          CERT=$("$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs \
+                   "${{ steps.meta.outputs.file }}" 2>/dev/null \
+                 | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)
+          echo "签名证书 SHA-256：${CERT:-（读取失败）}"
+
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "**安装包**：\`${{ steps.meta.outputs.file }}\`"
+            echo ""
+            echo "**SHA-256**：\`${{ steps.meta.outputs.sha256 }}\`"
+            echo ""
+            echo "> 用仓库内固定的 debug keystore 签名，签名跨版本稳定，可直接覆盖安装。"
+            echo "> 签名证书 SHA-256：\`${CERT:-unknown}\`"
+            echo "> debug 证书的密码是公开的，**不能上架应用商店**；仅供自用 / 内测分发。"
+            echo "> minSdk 24 / Android 7.0+。"
+            echo "> 校验下载完整性：\`sha256sum ${{ steps.meta.outputs.file }}\`"
+          } >> "$OUT"
+
+          {
+            echo "body<<__EOF__"
+            cat "$OUT"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          FILE="${{ steps.meta.outputs.file }}"
+
+          # 同版本重跑时不炸：已存在就更新说明 + 覆盖资产
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，更新说明并覆盖资产"
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+            gh release upload "$TAG" "$FILE" --clobber
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" "$FILE" \
+              --title "Ripple ${TAG#v}" \
+              --notes-file /tmp/notes.md \
+              --latest
+          fi
+
+          echo "完成：${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+
+      - name: 写入 Job 摘要
+        run: |
+          {
+            echo "## Ripple ${{ steps.meta.outputs.version }}"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| APK | \`${{ steps.meta.outputs.file }}\` |"
+            echo "| 大小 | $(du -h "${{ steps.meta.outputs.file }}" | cut -f1) |"
+            echo "| versionCode | ${{ steps.meta.outputs.code }} |"
+            echo "| SHA-256 | \`${{ steps.meta.outputs.sha256 }}\` |"
+            echo ""
+            echo "[→ 下载页面](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.tag }})"
+          } >> "$GITHUB_STEP_SUMMARY"
+

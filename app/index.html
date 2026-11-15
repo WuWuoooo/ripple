@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=3,user-scalable=yes">
+<meta name="theme-color" content="#07070b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ripple">
+<meta name="description" content="Ripple 涟漪 · 一个会呼吸的手机音乐播放器">
+<title>Ripple 涟漪</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="assets/icons/icon-180.png">
+<link rel="icon" href="assets/icons/icon-192.png">
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/layouts.css">
+<link rel="stylesheet" href="css/components.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.2v13.6L19 12z" fill="currentColor"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M6 5h2v14H6zM20 5v14L9 12z" fill="currentColor"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM4 5v14l11-7z" fill="currentColor"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-repeat" viewBox="0 0 24 24"><path d="M17 2l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-repeat1" viewBox="0 0 24 24"><path d="M17 2l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><text x="12" y="15.4" font-size="8" font-weight="700" text-anchor="middle" fill="currentColor" stroke="none">1</text></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 21s-7.5-4.7-9.3-9A5.2 5.2 0 0 1 12 6.2 5.2 5.2 0 0 1 21.3 12c-1.8 4.3-9.3 9-9.3 9z" fill="currentColor"/></symbol>
+  <symbol id="i-heart-o" viewBox="0 0 24 24"><path d="M12 20.3S5.2 16 3.5 11.8A4.4 4.4 0 0 1 12 7.4a4.4 4.4 0 0 1 8.5 4.4C18.8 16 12 20.3 12 20.3z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5M5 9.5V20h14V9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-lib" viewBox="0 0 24 24"><circle cx="7" cy="18" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="18" cy="15.5" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 18V6l11-2v11.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16.5 16.5 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a1.7 1.7 0 0 0-1.6-1H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 3 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 7 4.6h.1A1.7 1.7 0 0 0 9 3V3a2 2 0 1 1 4 0v.1A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 19.4 9v.1a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
+  <symbol id="i-lyric" viewBox="0 0 24 24"><path d="M4 7h9M4 12h16M4 17h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-queue" viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13M17.5 9.5v9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-chev-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-chev-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.4" fill="currentColor"/><circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="19" cy="12" r="1.4" fill="currentColor"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-1-.2-2-.5-2.9A6 6 0 0 1 12 3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8M10.3 21a2 2 0 0 0 3.4 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-eq" viewBox="0 0 24 24"><path d="M3 12h3l3-7 4 14 3-7h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-volume" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M15.5 8.5a5 5 0 0 1 0 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 11v6M12 7.6v.2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 5 5 9-11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .6-8A6 6 0 0 0 6.1 11 3.5 3.5 0 0 0 7 18z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-comment" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.3 9.3 0 0 1-3.4-.6L3 21l1.7-4.5A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-order" viewBox="0 0 24 24"><path d="M4 6h9M4 12h9M4 18h9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M17 8v11M14.5 10.5 17 8l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-infinite" viewBox="0 0 24 24"><path d="M6.5 8.5c-2 0-3.5 1.6-3.5 3.5s1.5 3.5 3.5 3.5c3.5 0 5.5-7 10-7 2 0 3.5 1.6 3.5 3.5s-1.5 3.5-3.5 3.5c-4.5 0-6.5-7-10-7z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-qr" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><rect x="10" y="10" width="4" height="4" fill="currentColor"/></symbol>
+</svg>
+
+<div class="ambient"><i></i><i></i><i></i></div>
+<div class="grain"></div>
+
+<div class="app">
+  <header class="topbar">
+    <div class="hello">
+      <small id="helloDate">20:47 · 星期六</small>
+      <h1 id="helloTitle">晚上好，欢迎回来</h1>
+    </div>
+
+    <button class="tb-btn" id="btnSearch" title="搜索"><svg><use href="#i-search"/></svg></button>
+    <button class="tb-btn" id="btnTheme" title="切换深浅色"><svg><use href="#i-moon"/></svg></button>
+    <button class="tb-btn" id="btnSettings" title="设置"><svg><use href="#i-settings"/></svg></button>
+  </header>
+
+  <main class="view" id="view">
+
+    <!-- ============ 首页 ============ -->
+    <section class="page on" data-page="home">
+      <div class="hero">
+        <div class="halo"></div>
+        <div class="hero-txt">
+          <div class="kicker" id="heroKicker">Daily Mix</div>
+          <h2 id="heroTitle">深夜的低频，<br>和一点失真的暖意</h2>
+          <p id="heroSub">正在读取你的口味…</p>
+          <div class="hero-btns">
+            <button class="btn solid" id="btnHeroPlay">
+              <svg width="13" height="13"><use href="#i-play"/></svg>立即播放
+            </button>
+            <button class="btn ghost" id="btnHeroShuffle">随机</button>
+          </div>
+        </div>
+        <div class="hero-art art">
+          <img id="heroArt" alt="">
+          <div class="ripple"></div>
+          <div class="hero-cap"><span>VOICE · 07</span><b>冬季刊</b></div>
+        </div>
+      </div>
+
+      <div class="sec-head"><span class="n">01</span><h2 id="dailyTitle">每日推荐</h2>
+        <span class="more" id="dailyMore">全部 <svg width="12" height="12"><use href="#i-chev-right"/></svg></span></div>
+      <div class="carousel" id="carousel"></div>
+
+      <div class="sec-head"><span class="n">02</span><h2>排行榜</h2>
+        <span class="more" id="toplistMore" data-act="toplist">更多 <svg width="12" height="12"><use href="#i-chev-right"/></svg></span></div>
+      <div class="carousel" id="toplistCarousel"></div>
+
+      <div class="sec-head"><span class="n">03</span><h2>最近播放</h2>
+        <span class="more" data-nav="library">记录 <svg width="12" height="12"><use href="#i-chev-right"/></svg></span></div>
+      <div class="grid" id="gridView"></div>
+      <div class="list" id="listView"></div>
+    </section>
+
+    <!-- ============ 曲库 ============ -->
+    <section class="page" data-page="library">
+      <div class="segline" id="segline">
+        <b class="on" data-seg="songs">歌曲</b><b data-seg="albums">专辑</b><b data-seg="artists">艺人</b><b data-seg="downloads">下载</b>
+      </div>
+      <div class="chiprow" id="libChips">
+        <button class="chip on" data-filter="all">全部</button>
+        <button class="chip" data-filter="lossless">无损</button>
+        <button class="chip" data-filter="local">本地</button>
+        <button class="chip" data-filter="online">在线</button>
+      </div>
+      <div class="sec-head"><span class="n">LIB</span><h2>全部歌曲</h2><span class="more" id="libCount">0 首</span></div>
+      <div class="list" id="libList"></div>
+
+      <div class="sec-head"><span class="n">PL</span><h2 id="myPlTitle">我的歌单</h2>
+        <span class="more" id="myPlHint"></span></div>
+      <div class="list" id="myPlaylists"></div>
+
+      <div class="sec-head"><span class="n">IMP</span><h2>导入</h2></div>
+      <div class="set-card glass">
+        <div class="set-row" id="rowImport">
+          <div class="ic"><svg><use href="#i-folder"/></svg></div>
+          <div class="tx"><b>从手机导入音乐</b><span>支持 MP3 / FLAC / M4A / WAV / OGG，保存在本机</span></div>
+          <div class="val"><svg><use href="#i-chev-right"/></svg></div>
+        </div>
+        <div class="set-row" id="rowSheet">
+          <div class="ic"><svg><use href="#i-plus"/></svg></div>
+          <div class="tx"><b>从链接添加</b><span>粘贴音频直链，或网易云歌曲链接</span></div>
+          <div class="val"><svg><use href="#i-chev-right"/></svg></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 搜索 ============ -->
+    <section class="page" data-page="search">
+      <div class="searchbox">
+        <svg width="16" height="16"><use href="#i-search"/></svg>
+        <input id="searchInput" placeholder="搜索歌曲、歌手，或粘贴链接" enterkeyhint="search" autocomplete="off">
+        <button class="clear" id="searchClear" hidden><svg width="13" height="13"><use href="#i-x"/></svg></button>
+      </div>
+      <div class="chiprow" id="searchScope">
+        <button class="chip on" data-scope="online">网易云</button>
+        <button class="chip" data-scope="local">本机导入</button>
+      </div>
+      <div id="searchBody">
+        <div class="sec-head"><span class="n">HOT</span><h2>热搜</h2></div>
+        <div class="chiprow" id="hotWords"></div>
+        <div class="sec-head"><span class="n">REC</span><h2>试试这些</h2></div>
+        <div class="list" id="recList"></div>
+      </div>
+    </section>
+
+    <!-- ============ 歌单详情 ============ -->
+    <section class="page" data-page="playlist">
+      <div class="pl-head" id="plHead">
+        <button class="back" id="plBack"><svg width="16" height="16"><use href="#i-chev-down"/></svg></button>
+        <div class="pl-art art" id="plArt"><img alt=""><div class="ripple"></div></div>
+        <div class="pl-tx">
+          <span class="k" id="plKind">歌单</span>
+          <h2 id="plTitle">歌单</h2>
+          <p id="plSub">—</p>
+          <div class="pl-btns">
+            <button class="btn solid" id="plPlay"><svg width="12" height="12"><use href="#i-play"/></svg>播放全部</button>
+            <button class="btn ghost" id="plShuffle">随机</button>
+          </div>
+        </div>
+      </div>
+      <div class="sec-head"><span class="n">TRACKS</span><h2 id="plCount">曲目</h2>
+        <span class="more" id="plLoading"></span></div>
+      <div class="list" id="plTracks"></div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="page" data-page="settings">
+      <div class="set-group">
+        <div class="acct" id="acctCard">
+          <div class="glow"></div>
+          <div class="acct-row" id="acctRow">
+            <div class="ava"><img id="acctAva" alt="" hidden></div>
+            <div class="who">
+              <b id="acctName">未登录网易云</b>
+              <span id="acctSub">登录后可听会员曲目、同步我喜欢与每日推荐</span>
+            </div>
+            <div class="val" style="color:var(--text3)"><svg width="14" height="14"><use href="#i-chev-right"/></svg></div>
+          </div>
+          <div class="stats">
+            <div><b id="statSongs">0</b><span>已听分钟</span></div>
+            <div><b id="statLikes">0</b><span>我喜欢</span></div>
+            <div><b id="statPl">0</b><span>我的歌单</span></div>
+          </div>
+          <div class="btns" id="acctBtns">
+            <button class="btn solid" id="btnLogin">登录网易云</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">界面</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-moon"/></svg></div>
+            <div class="tx"><b>主题</b><span>深色 / 浅色 / 跟随系统</span></div>
+            <div class="segmini" id="themeSeg">
+              <button data-theme="dark">深</button><button data-theme="light">浅</button><button data-theme="auto">自动</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>封面动态取色</b><span>界面主色随专辑封面变化</span></div>
+            <label class="sw on" data-set="dynamicColor"></label>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>玻璃强度</b><span id="glassBlurHint">26 px</span></div>
+            <div class="sld"><input type="range" min="0" max="40" step="2" data-set="glassBlur"></div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-play"/></svg></div>
+            <div class="tx"><b>动画速度</b><span id="animSpeedHint">1.0×</span></div>
+            <div class="sld"><input type="range" min="0.5" max="1.6" step="0.1" data-set="animSpeed"></div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>列表密度</b><span>紧凑 / 标准</span></div>
+            <label class="sw" data-set="compactList"></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">播放</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-volume"/></svg></div>
+            <div class="tx"><b>音质偏好</b><span>取不到就自动往下降一档</span></div>
+            <div class="segmini" id="qualitySeg">
+              <button data-q="standard">标准</button><button data-q="exhigh">极高</button><button data-q="lossless">无损</button><button data-q="hires">Hi-Res</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-volume"/></svg></div>
+            <div class="tx"><b>音量</b><span id="volHint">85%</span></div>
+            <div class="sld"><input type="range" min="0" max="1" step="0.05" data-set="volume"></div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>均衡器</b><span id="eqHint">关闭</span></div>
+            <div class="val" id="eqVal">关闭 ›</div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-play"/></svg></div>
+            <div class="tx"><b>淡入淡出</b><span>切歌与暂停时的音量过渡</span></div>
+            <div class="segmini" id="fadeSeg">
+              <button data-fade="0">关</button><button data-fade="0.4">0.4s</button><button data-fade="0.8">0.8s</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-play"/></svg></div>
+            <div class="tx"><b>无缝播放</b><span>预加载下一首，曲间零间隔</span></div>
+            <label class="sw on" data-set="gapless"></label>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>音量归一化</b><span>不同来源音量拉平</span></div>
+            <label class="sw" data-set="normalize"></label>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-play"/></svg></div>
+            <div class="tx"><b>播放速度</b><span id="speedHint">1.0×</span></div>
+            <div class="sld"><input type="range" min="0.75" max="1.5" step="0.05" data-set="speed"></div>
+          </div>
+          <div class="set-row" id="rowSleep">
+            <div class="ic"><svg><use href="#i-moon"/></svg></div>
+            <div class="tx"><b>睡眠定时</b><span id="sleepHint">关闭</span></div>
+            <div class="val" id="sleepVal">关闭 ›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">歌词</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>显示歌词</b><span>播放页底部歌词面板</span></div>
+            <label class="sw on" data-set="showLyric"></label>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>翻译</b><span>有译文时显示第二行</span></div>
+            <label class="sw on" data-set="showTrans"></label>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>歌词字号</b><span id="lyricSizeHint">标准</span></div>
+            <div class="sld"><input type="range" min="11" max="19" step="1" data-set="lyricSize"></div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>歌词偏移</b><span id="lyricOffsetHint">0.0s</span></div>
+            <div class="sld"><input type="range" min="-2" max="2" step="0.1" data-set="lyricOffset"></div>
+          </div>
+          <div class="set-row" id="rowSbLyric">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>状态栏歌词</b><span id="sbHint">关闭</span></div>
+            <label class="sw" data-set="sbLyric"></label>
+          </div>
+          <div class="set-row" id="rowSbTune">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>状态栏歌词样式</b><span>颜色 / 字号 / 位置 / 锁定</span></div>
+            <div class="val" id="sbLockVal">已锁定 ›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">通知与后台</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-bell"/></svg></div>
+            <div class="tx"><b>通知栏播放控件</b><span id="mediaHint">锁屏 / 通知中心显示</span></div>
+            <label class="sw on" data-set="mediaSession"></label>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-bell"/></svg></div>
+            <div class="tx"><b>通知不打断播放</b><span>横幅只提示，不暂停、不压低音量</span></div>
+            <label class="sw on" data-set="notifyQuiet"></label>
+          </div>
+          <div class="set-row" id="rowTestNotify">
+            <div class="ic"><svg><use href="#i-bell"/></svg></div>
+            <div class="tx"><b>发送测试通知</b><span>验证音乐是否继续播放</span></div>
+            <div class="val">试一试 ›</div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-bell"/></svg></div>
+            <div class="tx"><b>请求通知权限</b><span id="permHint">未授权</span></div>
+            <div class="val" id="permVal">授权 ›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">网易云</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-link"/></svg></div>
+            <div class="tx"><b>接口通道</b><span id="apiHint">检测中…</span></div>
+            <div class="val" id="apiVal">—</div>
+          </div>
+          <div class="set-row" id="rowApiBase">
+            <div class="ic"><svg><use href="#i-link"/></svg></div>
+            <div class="tx"><b>接口地址</b><span id="apiBaseHint">留空 = 同源 / 原生通道</span></div>
+            <div class="val" id="apiBaseVal">设置 ›</div>
+          </div>
+          <div class="set-row" id="rowApiTest">
+            <div class="ic"><svg><use href="#i-cloud"/></svg></div>
+            <div class="tx"><b>测试连接</b><span>搜索一次「周杰伦」看返回耗时</span></div>
+            <div class="val">测试 ›</div>
+          </div>
+          <div class="set-row" id="rowRefreshLike">
+            <div class="ic"><svg><use href="#i-heart"/></svg></div>
+            <div class="tx"><b>同步「我喜欢」</b><span>把网易云收藏同步到本机列表</span></div>
+            <div class="val">同步 ›</div>
+          </div>
+          <div class="set-row" id="rowLogout" hidden>
+            <div class="ic"><svg><use href="#i-trash"/></svg></div>
+            <div class="tx"><b>退出网易云账号</b><span>只清本地登录态，不改动账号</span></div>
+            <div class="val">退出 ›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">存储</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-download"/></svg></div>
+            <div class="tx"><b>已导入音乐</b><span id="storageHint">0 首 · 0 MB</span></div>
+            <div class="val" id="clearLocal">清空 ›</div>
+          </div>
+          <div class="set-row" id="rowClearHistory">
+            <div class="ic"><svg><use href="#i-trash"/></svg></div>
+            <div class="tx"><b>清除播放记录</b><span>不影响已导入的音乐</span></div>
+            <div class="val">清除 ›</div>
+          </div>
+          <div class="set-row" id="rowReset">
+            <div class="ic"><svg><use href="#i-info"/></svg></div>
+            <div class="tx"><b>恢复默认设置</b><span>布局、主题、播放选项全部重置</span></div>
+            <div class="val">重置 ›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <div class="lbl">关于</div>
+        <div class="set-card glass">
+          <div class="set-row" id="rowLog">
+            <div class="ic"><svg><use href="#i-list"/></svg></div>
+            <div class="tx"><b>软件日志</b><span id="logHint">记录播放/接口/状态栏的运行情况</span></div>
+            <div class="val">查看 ›</div>
+          </div>
+          <div class="set-row" id="rowAbout">
+            <div class="ic"><svg><use href="#i-info"/></svg></div>
+            <div class="tx"><b>Ripple 涟漪</b><span id="aboutVer">— · build —</span></div>
+            <div class="val"><svg><use href="#i-chev-right"/></svg></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="about-note">
+        第三方播放器，不提供任何音乐资源。在线内容版权归网易云音乐及权利人所有，请仅收听你本身有权访问的内容。
+      </div>
+    </section>
+  </main>
+
+  <div class="bottom-scrim"></div>
+
+  <!-- 底部迷你播放器 -->
+  <div class="dock" id="dock">
+    <div class="dock-inner glass" id="dockInner">
+      <div class="dock-prog" id="dockProg" style="width:0"></div>
+      <div class="thumb art" id="dockThumb"><img alt=""><div class="ripple"></div></div>
+      <div class="meta" id="dockMeta">
+        <b id="dockTitle">未在播放</b>
+        <span id="dockArtist">选择一首歌开始</span>
+      </div>
+      <button class="play" id="dockPlay"><svg><use href="#i-play"/></svg></button>
+      <button class="next" id="dockNext"><svg><use href="#i-next"/></svg></button>
+    </div>
+  </div>
+
+  <nav class="tabbar" id="tabbar">
+    <a href="#" data-nav="home" class="on"><svg><use href="#i-home"/></svg>发现</a>
+    <a href="#" data-nav="library"><svg><use href="#i-lib"/></svg>曲库</a>
+    <a href="#" data-nav="search"><svg><use href="#i-search"/></svg>搜索</a>
+    <a href="#" data-nav="settings"><svg><use href="#i-settings"/></svg>我的</a>
+  </nav>
+</div>
+
+<!-- 全屏播放页 -->
+<section class="np" id="np" aria-hidden="true">
+  <div class="np-bg" id="npBg"></div>
+  <div class="np-glow"></div>
+  <div class="np-veil"></div>
+  <div class="np-inner">
+    <div class="np-top">
+      <button class="cir" id="npClose"><svg><use href="#i-chev-down"/></svg></button>
+      <div class="t"><b>正在播放</b><span id="npFrom">示例曲库</span></div>
+      <button class="cir" id="npMore"><svg><use href="#i-more"/></svg></button>
+    </div>
+
+    <div class="cover-wrap">
+      <div class="np-cover art" id="npCover">
+        <img alt=""><div class="gloss"></div><div class="ripple"></div>
+      </div>
+    </div>
+
+    <div class="np-meta" id="npMeta">
+      <div class="tx">
+        <h2 id="npTitle">未在播放</h2><span class="np-vip" id="npVip" hidden>VIP</span>
+        <p id="npArtist">—</p>
+      </div>
+      <button class="np-like" id="npLike"><svg><use href="#i-heart-o"/></svg></button>
+    </div>
+
+    <!-- 歌词：默认三行；展开时这一块原地长高，封面/按钮让位 -->
+    <div class="np-lyricbox" id="npLyricBox">
+      <div class="np-lyric" id="npLyricMini">
+        <div class="ln" id="lyrPrev">—</div>
+        <div class="ln cur" id="lyrCur">—</div>
+        <div class="ln" id="lyrNext">—</div>
+      </div>
+      <div class="lyric" id="npLyric"></div>
+    </div>
+
+    <div class="np-seek">
+      <div class="bar" id="npBar">
+        <div class="buf" id="npBuf"></div>
+        <div class="fill" id="npFill"></div>
+        <div class="knob" id="npKnob"></div>
+      </div>
+      <div class="tm"><span id="npCur">0:00</span><span id="npDur">0:00</span></div>
+    </div>
+
+    <div class="np-ctl">
+      <button class="c mode on" id="npMode" title="播放模式">
+        <svg><use href="#i-repeat" id="npModeIcon"/></svg>
+        <span class="tag" id="npModeTag">列表</span>
+      </button>
+      <button class="c nav" id="npPrev"><svg><use href="#i-prev"/></svg></button>
+      <button class="main" id="npPlay"><svg><use href="#i-play"/></svg></button>
+      <button class="c nav" id="npNext"><svg><use href="#i-next"/></svg></button>
+      <button class="c" id="npQueueBtn" title="播放列表"><svg><use href="#i-queue"/></svg></button>
+    </div>
+
+    <div class="np-flexspacer"></div>
+
+    <div class="np-actions">
+      <button id="npComment"><svg><use href="#i-comment"/></svg><b>评论</b></button>
+      <button id="npDetail"><svg><use href="#i-info"/></svg><b>歌曲详情</b></button>
+      <button id="npDownload"><svg><use href="#i-download"/></svg><b>下载</b></button>
+    </div>
+  </div>
+
+  <!-- 评论（从下方弹出，和播放列表同一套交互） -->
+  <div class="sheet-mask" id="cmtMask"></div>
+  <div class="np-sheet cmt-sheet" id="cmtSheet">
+    <div class="grab"></div>
+    <div class="sheet-hd">
+      <b>评论</b><span id="cmtCount">—</span>
+      <button class="x" id="cmtClose">收起</button>
+    </div>
+    <div class="cmt-body" id="cmtBody"></div>
+  </div>
+
+  <!-- 播放列表 -->
+  <div class="sheet-mask" id="npMask"></div>
+  <div class="np-sheet" id="npQueueSheet">
+    <div class="grab"></div>
+    <div class="sheet-hd">
+      <b>播放列表</b><span id="npQueueCount">0 首</span>
+      <button class="x" id="npQueueClose">收起</button>
+    </div>
+    <div class="queue" id="npQueue"></div>
+  </div>
+
+  <!-- 播放设置：右上角「…」从下方弹出（与评论/播放列表同一套交互） -->
+  <div class="sheet-mask" id="npOptMask"></div>
+</section>
+
+  <!-- 均衡器 -->
+  <div class="sheet-mask" id="eqMask"></div>
+  <div class="np-sheet" id="eqSheet">
+    <div class="grab"></div>
+    <div class="sheet-hd">
+      <b>均衡器</b><span>5 段</span>
+      <button class="x" id="eqClose">收起</button>
+    </div>
+    <div class="cmt-body" id="eqBody" style="flex:1;overflow-y:auto;min-height:0"></div>
+  </div>
+
+  <!-- 自定义取色器 -->
+  <div class="sheet-mask" id="pickMask"></div>
+  <div class="np-sheet" id="pickSheet">
+    <div class="grab"></div>
+    <div class="sheet-hd">
+      <b>自定义颜色</b><span>拖动选色</span>
+      <button class="x" id="pickClose">收起</button>
+    </div>
+    <div class="opt-body" id="pickBody"></div>
+  </div>
+
+  <!-- 状态栏歌词调整 -->
+  <div class="sheet-mask" id="sbMask"></div>
+  <div class="np-sheet" id="sbSheet">
+    <div class="grab"></div>
+    <div class="sheet-hd">
+      <b>状态栏歌词</b><span>调整样式</span>
+      <button class="x" id="sbClose">收起</button>
+    </div>
+    <div class="opt-body" id="sbBody"></div>
+  </div>
+
+  <div class="np-sheet" id="npOptSheet">
+    <div class="grab"></div>
+    <div class="sheet-hd">
+      <b>播放设置</b><span>只影响音乐本身</span>
+      <button class="x" id="npOptClose">收起</button>
+    </div>
+    <div class="opt-body" id="npOptBody"></div>
+  </div>
+
+
+<div class="toasts" id="toasts"></div>
+
+<input type="file" id="filePicker" accept="audio/*,.mp3,.flac,.m4a,.wav,.ogg,.aac" multiple hidden>
+
+<!-- 同源 server.js 托管时这里会返回访问令牌；APK/file:// 下 404 不影响（原生通道不需要） -->
+<script src="/ripple-token.js" onerror="void 0"></script>
+<script src="js/version.js"></script>
+<script src="js/log.js"></script>
+<script src="js/lrc.js"></script>
+<script src="js/netease.js"></script>
+<script src="js/store.js"></script>
+<script src="js/player.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+name: Bug report
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量把下面填完整，信息不全的问题很难定位。
+
+  - type: input
+    id: version
+    attributes:
+      label: Ripple 版本
+      description: 「我的 → 关于」里显示的版本号
+      placeholder: 例如 1.0.0 · build 100
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: 手机型号与系统
+      placeholder: 例如 vivo V2425A / Android 17
+    validations:
+      required: true
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: 问题出现在
+      options:
+        - APK（安卓 App）
+        - 浏览器 / PWA
+        - 两者都有
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 一步一步写，越具体越好
+      placeholder: |
+        1. 打开 App
+        2. 搜索「周杰伦」
+        3. 点第三首
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望发生
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际发生
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: |
+        `Download/Ripple-log.txt` 的内容（App 内「我的 → 查看日志」也能看）。
+        崩溃的话还有 `Download/Ripple-crash-*.txt`。
+        **贴之前请删掉任何带账号信息的内容。**
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已经搜过现有 issue，没有重复
+          required: true
+        - label: 日志里没有我已删除的敏感信息（cookie / 账号）
+          required: true

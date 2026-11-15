@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.ripple.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.ripple.app'
+        minSdk 24
+        targetSdk 34
+        versionCode 100
+        versionName '1.0.0'
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ''
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    aaptOptions {
+        noCompress 'mp3'
+    }
+}
+
+// 网页源码在 ../../app，每次构建前自动同步进 assets/www，
+// 这样改完前端直接 assembleDebug 就是最新的，不用手动 cp。
+tasks.register('syncWebAssets', Copy) {
+    from "${rootDir}/../app"
+    into "${projectDir}/src/main/assets/www"
+    includeEmptyDirs = false
+}
+
+tasks.named('preBuild') {
+    dependsOn 'syncWebAssets'
+}
+

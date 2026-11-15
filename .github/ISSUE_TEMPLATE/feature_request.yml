@@ -1,0 +1,39 @@
+name: Feature request
+description: 提一个功能建议
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前建议先看一眼 README 的「不做什么」一节 —— 涉及绕过会员/版权限制的需求不会被接受。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的不便
+      description: 先说问题，再说方案。这样别人才好判断是不是同一个需求
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望怎么解决
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternative
+    attributes:
+      label: 试过哪些替代做法
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 确认
+      options:
+        - label: 这个需求不涉及绕过会员、付费或版权限制
+          required: true

@@ -1,0 +1,156 @@
+/* ============================================================
+   components.css · 补充组件（液态玻璃单套观感）
+   ============================================================ */
+
+/* 搜索框 */
+.searchbox{display:flex;align-items:center;gap:10px;height:44px;border-radius:22px;padding:0 14px;
+  margin:6px 0 12px;background:var(--panel);border:1px solid var(--line);color:var(--text3);
+  transition:.25s}
+.searchbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.searchbox svg{flex:none}
+.searchbox input{flex:1;min-width:0;background:none;border:0;outline:0;font-size:13px;
+  color:var(--text);height:100%}
+.searchbox input::placeholder{color:var(--text3)}
+.searchbox .clear{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+  background:var(--panel2);color:var(--text3)}
+
+/* 关于 */
+.about-note{font-size:10px;line-height:1.8;color:var(--text3);padding:22px 6px 30px;text-align:center;
+  opacity:.8}
+
+/* 弹窗 */
+.modal-wrap{position:fixed;inset:0;z-index:120;display:flex;align-items:center;justify-content:center;
+  padding:24px;background:rgba(0,0,0,.42);
+  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:0;transition:opacity .24s}
+.modal-wrap.on{opacity:1}
+.modal{width:100%;max-width:340px;border-radius:22px;padding:22px;transform:translateY(10px) scale(.97);
+  transition:transform var(--dur) var(--ease)}
+.modal-wrap.on .modal{transform:none}
+.modal h3{font-family:var(--display);font-size:17px;margin:0 0 8px;font-weight:640}
+.modal p{font-size:12px;line-height:1.7;color:var(--text2);margin:0 0 16px}
+.modal-input{width:100%;height:42px;border-radius:12px;background:var(--panel2);
+  border:1px solid var(--line2);padding:0 12px;font-size:12px;outline:none;margin-bottom:16px}
+.modal-input:focus{border-color:var(--accent)}
+.modal-btns{display:flex;gap:10px;justify-content:flex-end}
+.modal-btns .btn{height:38px;padding:0 18px;font-size:12px}
+
+/* 紧凑密度 */
+body.compact .row{padding-top:5px;padding-bottom:5px}
+body.compact .grid{gap:9px}
+
+/* 封面图统一填满 */
+.np-cover img{width:100%;height:100%;object-fit:cover;display:block}
+.dock .thumb img{width:100%;height:100%;object-fit:cover}
+.row .r-th img,.gcard .th img,.c-card .c-art img{width:100%;height:100%;object-fit:cover;display:block}
+
+/* 设置里的 sw 作为 label 时的点击区域 */
+.set-row label.sw{cursor:pointer}
+
+/* 滚动条隐藏（页面级） */
+.page{scrollbar-width:none}
+
+/* 大屏预览（桌面浏览器）时给一点留白，模拟手机 */
+@media (min-width:900px){
+  .app{max-width:480px;margin:0 auto;box-shadow:0 0 0 1px var(--line),0 40px 80px -40px rgba(0,0,0,.5);
+    background:var(--bg)}
+  body{background:#0a0a0c}
+  [data-theme="light"] body{background:#e9e5df}
+  .np{max-width:480px;left:50%;transform:translate(-50%,101%)}
+  .np.open{transform:translate(-50%,0)}
+  .toasts{max-width:452px;left:50%;transform:translateX(-50%)}
+}
+
+/* 歌单卡片（列表式，用于歌单详情/搜索结果） */
+.plrow{display:flex;align-items:center;gap:12px;padding:9px 2px;transition:background .18s}
+.plrow:active{background:var(--panel)}
+.plrow .th{width:54px;height:54px;border-radius:14px;overflow:hidden;flex:none}
+.plrow .tx{flex:1;min-width:0}
+.plrow .tx b{display:block;font-size:12.5px;font-weight:560;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.plrow .tx span{display:block;font-size:10.5px;color:var(--text3);margin-top:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.plrow .go{color:var(--text3);flex:none}
+.plrow .go svg{width:14px;height:14px}
+
+/* ---------- 歌单详情头 ---------- */
+.pl-head{position:relative;margin:8px -18px 0;padding:0 18px 18px;overflow:hidden}
+.pl-head .back{position:relative;z-index:3;width:34px;height:34px;border-radius:50%;display:grid;
+  place-items:center;color:var(--text);background:var(--panel);border:1px solid var(--line);margin:6px 0 14px}
+.pl-head .back svg{transform:rotate(90deg);width:15px;height:15px}
+.pl-head .back:active{transform:scale(.92)}
+.pl-art{position:absolute;right:-8%;top:-40%;width:230px;height:230px;border-radius:30px;
+  opacity:.5;filter:blur(2px);transform:rotate(-8deg);z-index:0;
+  box-shadow:0 24px 50px -26px rgba(0,0,0,.9)}
+.pl-head::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+  background:linear-gradient(180deg,transparent 20%,var(--bg) 88%)}
+.pl-tx{position:relative;z-index:2}
+.pl-tx .k{font-size:9px;letter-spacing:.24em;text-transform:uppercase;color:var(--accent);font-weight:600}
+.pl-tx h2{font-size:25px;line-height:1.22;font-weight:660;letter-spacing:-.02em;margin:8px 0 6px;max-width:16ch}
+.pl-tx p{font-size:11px;color:var(--text3);margin:0;line-height:1.6}
+.pl-btns{display:flex;gap:8px;margin-top:14px}
+.pl-btns .btn{height:38px;padding:0 16px;font-size:12px}
+
+/* 歌曲详情弹窗 */
+.detail-list{margin:2px 0 16px}
+.drow{display:flex;gap:12px;padding:8px 0;font-size:11.5px;line-height:1.5}
+.drow+.drow{border-top:1px solid var(--line)}
+.drow b{width:62px;flex:none;color:var(--text3);font-weight:500}
+.drow span{flex:1;min-width:0;word-break:break-all}
+
+/* 评论弹窗 */
+/* .cmt-wrap / .modal:has(.cmt-wrap) 已删除：评论改成了 sheet 方案，
+   评论内容挂在 #cmtBody 上，这两个类名已经没有任何元素使用 */
+.cmt-hd{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--text3);
+  padding:10px 0 6px;position:sticky;top:0;background:color-mix(in srgb,var(--bg) 82%,transparent);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);z-index:1}
+/*
+ * 评论骨架屏：用一个横扫的高光渐变表示「在加载」。
+ * 纯 CSS 动画，不用图片，暗色/浅色主题都自适应。
+ */
+.sk-wrap{padding-top:6px}
+.sk-line{display:block;height:10px;border-radius:5px;margin:7px 0;
+  background:linear-gradient(90deg,
+    color-mix(in srgb,var(--text) 8%,transparent) 25%,
+    color-mix(in srgb,var(--text) 16%,transparent) 37%,
+    color-mix(in srgb,var(--text) 8%,transparent) 63%);
+  background-size:400% 100%;
+  animation:sk-sweep 1.4s ease-in-out infinite}
+.sk-ava{width:30px;height:30px;border-radius:50%;flex:none;
+  background:linear-gradient(90deg,
+    color-mix(in srgb,var(--text) 8%,transparent) 25%,
+    color-mix(in srgb,var(--text) 16%,transparent) 37%,
+    color-mix(in srgb,var(--text) 8%,transparent) 63%);
+  background-size:400% 100%;
+  animation:sk-sweep 1.4s ease-in-out infinite}
+@keyframes sk-sweep{0%{background-position:100% 0}100%{background-position:0 0}}
+/* 骨架条目不要分隔线，看着更干净 */
+.cmt.sk{border-top-color:transparent}
+
+.cmt{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+.cmt .ava{width:30px;height:30px;border-radius:50%;overflow:hidden;flex:none;background:var(--panel2)}
+.cmt .ava img{width:100%;height:100%;object-fit:cover;display:block}
+.cmt .bd{flex:1;min-width:0}
+.cmt .bd b{display:block;font-size:10.5px;font-weight:560;color:var(--accent);opacity:.9}
+.cmt .bd p{font-size:11.5px;line-height:1.6;color:var(--text);margin:3px 0 0;word-break:break-word;
+  white-space:pre-wrap}
+.cmt .bd small{display:block;font-size:9.5px;color:var(--text3);margin-top:4px}
+
+/* 日志查看器 */
+.log-wrap{max-height:48vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);
+  border-radius:12px;padding:10px;margin-bottom:14px;scrollbar-width:thin}
+.log-wrap pre{margin:0;font-family:var(--mono);font-size:9.5px;line-height:1.6;
+  color:var(--text2);white-space:pre-wrap;word-break:break-all}
+
+/* 登录方式选择 */
+.login-opt{display:flex;align-items:center;gap:12px;width:100%;padding:13px 12px;
+  border-radius:14px;border:1px solid var(--line);background:var(--panel2);
+  margin-bottom:10px;text-align:left;transition:var(--dur-s) var(--ease)}
+.login-opt:active{transform:scale(.98);border-color:var(--accent);background:var(--accent-soft)}
+.login-opt .ic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;flex:none;
+  background:var(--accent-soft);color:var(--accent);border:1px solid var(--line)}
+.login-opt .ic svg{width:17px;height:17px}
+.login-opt .tx{flex:1;min-width:0}
+.login-opt .tx b{display:block;font-size:12.5px;font-weight:560}
+.login-opt .tx span{display:block;font-size:10px;color:var(--text3);margin-top:3px;line-height:1.5}
+.login-opt .go{color:var(--text3);flex:none}
+.login-opt .go svg{width:14px;height:14px}

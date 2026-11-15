@@ -1,0 +1,175 @@
+/* ============================================================
+   Ripple · layouts.css
+   只有一套观感：液态玻璃（Liquid Glass）
+   旧版的 B 日光杂志 / C 极简控制台已移除。
+   ============================================================ */
+
+/* ---------- 顶栏：安全区 + 玻璃 ---------- */
+/* 顶栏：APK 里 --safe-t 已被原生归零（系统自己留了状态栏的高度），
+   浏览器里则由 env(safe-area-inset-top) 兜底，所以同一条规则两边都对 */
+/* 顶栏：--safe-t 已经是状态栏的真实高度（APK 由 Java 量出来），
+   这里只再加很小的内部间距，绝不叠加第二份安全区 */
+.topbar{
+  padding:var(--safe-t) 18px 4px;
+  gap:10px;
+  min-height:0;
+}
+/* [data-layout] 那套多风格残留已删除：JS 从不设置该属性，实际只有一套观感 */
+
+/* 顶栏是 .view 的兄弟节点（不是覆盖层），所以安全区一旦垫进去就不会被状态栏压住 */
+.topbar{position:relative;z-index:3}
+
+/* ---------- 底部：胶囊 Tab + 浮动 Dock ---------- */
+.tabbar{
+  display:flex;position:absolute;left:12px;right:12px;bottom:calc(var(--safe-b) + 8px);z-index:19;
+  height:62px;border-radius:22px;align-items:center;justify-content:space-around;
+  background:var(--glass);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  border:1px solid var(--glass-border);
+  box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl);
+  pointer-events:auto;transition:transform var(--dur) var(--ease),opacity var(--dur);
+}
+.tabbar a{
+  display:grid;justify-items:center;gap:3px;font-size:9px;color:var(--text3);
+  text-decoration:none;width:56px;padding:6px 0;transition:var(--dur-s);position:relative;
+}
+.tabbar a.on{color:var(--text)}
+.tabbar a.on svg{filter:drop-shadow(0 0 8px var(--accent))}
+.tabbar svg{width:20px;height:20px}
+.tabbar a.on::after{
+  content:"";position:absolute;top:-1px;width:16px;height:2px;border-radius:2px;
+  background:var(--accent);box-shadow:0 0 10px var(--accent);
+}
+
+.dock{bottom:calc(var(--safe-b) + 78px);padding:0 14px}
+.dock-inner{
+  border-radius:20px;background:var(--dock-bg);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(190%);
+  backdrop-filter:blur(var(--glass-blur)) saturate(190%);
+  border:1px solid var(--glass-border);
+  box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl);
+}
+.page{padding-bottom:calc(var(--safe-b) + 152px)}
+.bottom-scrim{height:210px}
+
+/* ---------- Hero ---------- */
+.hero{
+  margin-top:6px;border-radius:26px;padding:22px;position:relative;overflow:hidden;
+  display:block;background:var(--glass);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  border:1px solid var(--glass-border);
+  box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl);
+}
+.hero-txt{position:relative;z-index:2}
+.hero .halo{
+  position:absolute;right:-20%;top:-40%;width:220px;height:220px;border-radius:50%;
+  background:radial-gradient(circle,var(--accent),transparent 65%);filter:blur(20px);opacity:.55;
+  pointer-events:none;transition:background .8s;
+}
+.hero .kicker{
+  font-size:9px;letter-spacing:.24em;color:var(--accent);text-transform:uppercase;font-weight:600;
+}
+.hero h2{font-size:23px;line-height:1.26;letter-spacing:-.02em;font-weight:640;margin:9px 0 8px;max-width:15ch}
+.hero p{font-size:11.5px;line-height:1.7;color:var(--text2);margin:0;max-width:22ch}
+.hero-btns{display:flex;gap:8px;margin-top:16px}
+.hero-btns .btn{height:38px;padding:0 16px;font-size:12px}
+.hero-cap{display:none}
+.hero-art{
+  position:absolute;right:-30px;bottom:-30px;width:164px;height:164px;border-radius:22px;
+  overflow:hidden;opacity:.92;transform:rotate(-7deg);
+  box-shadow:0 20px 40px -18px rgba(0,0,0,.85),0 0 0 1px rgba(255,255,255,.14);
+}
+.hero-art img{transition:opacity var(--dur-l)}
+
+/* ---------- 横向歌单卡 ---------- */
+.carousel{display:flex;gap:11px;overflow-x:auto;scrollbar-width:none;margin:0 -18px;padding:0 18px 4px}
+.carousel::-webkit-scrollbar{display:none}
+.c-card{
+  flex:0 0 200px;border-radius:22px;overflow:hidden;position:relative;height:240px;
+  box-shadow:0 18px 36px -22px rgba(0,0,0,.9),0 0 0 1px var(--line);
+  transition:transform var(--dur) var(--ease);
+}
+.c-card:active{transform:scale(.97)}
+.c-card .c-art{position:absolute;inset:0}
+.c-card .c-art::after{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(180deg,rgba(0,0,0,.05) 34%,rgba(0,0,0,.76));
+}
+.c-card .c-k{
+  position:absolute;left:12px;top:12px;font-size:8.5px;letter-spacing:.14em;padding:4px 8px;
+  border-radius:20px;background:rgba(0,0,0,.32);border:1px solid rgba(255,255,255,.22);color:#fff;
+  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+}
+.c-card .c-tx{position:absolute;left:14px;right:14px;bottom:14px;color:#fff}
+.c-card .c-tx b{display:block;font-size:14.5px;font-weight:620;letter-spacing:-.01em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-card .c-tx span{display:block;font-size:10px;opacity:.72;margin-top:4px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-card .c-play{
+  position:absolute;right:12px;bottom:12px;width:34px;height:34px;border-radius:50%;
+  display:grid;place-items:center;background:rgba(255,255,255,.2);
+  border:1px solid rgba(255,255,255,.42);color:#fff;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+}
+.c-card .c-play svg{width:12px;height:12px}
+.c-card.ghost{display:grid;place-items:center;background:var(--panel);border:1px dashed var(--line2);
+  box-shadow:none;color:var(--text3);font-size:11.5px;text-align:center;padding:16px}
+
+/* ---------- 封面网格 ---------- */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+.gcard{min-width:0}
+.gcard .th{
+  width:100%;aspect-ratio:1;border-radius:18px;overflow:hidden;position:relative;
+  box-shadow:0 16px 30px -20px rgba(0,0,0,.9);transition:transform var(--dur) var(--ease);
+}
+.gcard:active .th{transform:scale(.97)}
+.gcard .pl{
+  position:absolute;right:8px;bottom:8px;width:28px;height:28px;border-radius:50%;
+  background:rgba(12,10,20,.5);border:1px solid rgba(255,255,255,.3);display:grid;place-items:center;
+  color:#fff;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:0;
+  transform:translateY(4px);transition:.25s;
+}
+.gcard.on .pl{opacity:1;transform:none}
+.gcard b{display:block;font-size:12.5px;font-weight:560;margin:9px 2px 3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gcard.on b{color:var(--accent)}
+.gcard span{display:block;font-size:10.5px;color:var(--text3);margin:0 2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* 首页只有网格，列表留给「最近播放」以外的地方 */
+#listView{display:none}
+
+/* ---------- 播放页 ---------- */
+.np-cover{border-radius:26px}
+
+/* ---------- 账号卡 ---------- */
+.acct{padding:18px;border-radius:22px;position:relative;overflow:hidden;
+  background:var(--glass);border:1px solid var(--glass-border);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl)}
+.acct-row{display:flex;align-items:center;gap:13px;position:relative;z-index:2}
+.acct .ava{width:54px;height:54px;border-radius:50%;overflow:hidden;flex:none;
+  border:1px solid var(--glass-border);background:conic-gradient(from 200deg,#ffd9a0,#ff8fb1,#a898ff,#7de3d0,#ffd9a0)}
+.acct .ava img{width:100%;height:100%;object-fit:cover;display:block}
+.acct .who{flex:1;min-width:0}
+.acct .who b{display:block;font-size:15px;font-weight:640;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acct .who span{display:block;font-size:10.5px;color:var(--text3);margin-top:5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acct .badge{display:inline-flex;align-items:center;gap:4px;font-size:9px;padding:2px 7px;border-radius:9px;
+  border:1px solid rgba(240,200,106,.4);color:#F0C86A;background:rgba(240,200,106,.12);margin-left:6px;
+  vertical-align:middle}
+.acct .stats{display:flex;gap:18px;margin-top:16px;position:relative;z-index:2}
+.acct .stats div{flex:1;min-width:0}
+.acct .stats b{display:block;font-size:16px;font-weight:640;letter-spacing:-.01em}
+.acct .stats span{display:block;font-size:9.5px;color:var(--text3);margin-top:3px;letter-spacing:.04em}
+.acct .glow{position:absolute;right:-40%;top:-60%;width:220px;height:220px;border-radius:50%;
+  background:radial-gradient(circle,var(--accent),transparent 66%);filter:blur(26px);opacity:.45;pointer-events:none}
+.acct .btns{display:flex;gap:8px;margin-top:16px;position:relative;z-index:2}
+.acct .btns .btn{flex:1;height:38px;font-size:12px}
+.acct.signed .acct-row{cursor:pointer}
+
+/* ---------- 登录遮罩（网页端需要有登录入口时） ---------- */
+.login-tip{font-size:11px;line-height:1.8;color:var(--text3);padding:0 4px 10px}

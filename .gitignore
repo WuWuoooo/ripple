@@ -1,0 +1,46 @@
+# 构建产物
+android/build-manual/
+android/app/build/
+android/app/src/main/assets/www/
+android/.gradle/
+android/local.properties
+# 注意：android/debug.keystore 必须入库，不要忽略。
+# 它是公开密码（android）的 debug 证书，不是秘密；但签名必须长期稳定，
+# 否则每次 CI 全新 checkout 都会生成新密钥，发布出去的 APK 签名各不相同，
+# 用户升级时 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+
+# 运行时状态（都含登录态/访问令牌，绝不能提交）
+.ripple-cookie
+.ripple-token
+.dsh/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log
+
+# 打包产物（放进 Releases，不进仓库）
+dist/releases/
+*.apk
+*.aab
+*.idsig
+
+# 内部文档（代码审查报告等不进公开仓库）
+docs/code_check/
+Ripple-代码审查报告.md
+*代码审查*
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.iml
+*.swp
+.cxx/
+
+# 内部产物：审查报告、四份专项明细、用户上传的日志
+.review/
+docs/user-logs/
+docs/代码审查报告.md
+
+# 独立 HTML 调参页（功能已内置到 app/js/animtune.js，避免两套并存）
+tools/
