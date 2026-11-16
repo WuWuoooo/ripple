@@ -17,9 +17,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
+    <!-- allowBackup=false：SharedPreferences 里存着 MUSIC_U，不该跟着云备份走。
+         选它而不是 dataExtractionRules，是因为后者要在 res/xml 下新增两个资源文件，
+         而本次改动范围只限 Java 层与 manifest。 -->
     <application
         android:name=".RippleApp"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -28,13 +31,26 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
 
+        <!--
+            小窗 / 分屏 / 自由窗口：
+              · resizeableActivity 以前是 false，等于直接告诉系统「我不支持多窗口」，
+                iQOO Neo10 (Android 17) 上给应用开小窗就会提示「此应用不支持小窗」。
+                改成 true 后系统允许自由调整窗口尺寸。
+              · screenOrientation="portrait" 已删除：锁竖屏会让系统在判定「可调整尺寸」
+                时直接否决多窗口（Android 12+ 大屏上虽被忽略，手机上仍然生效）。
+                横竖屏交给上面 configChanges 里的 orientation|screenSize|screenLayout 处理，
+                尺寸变化不会重建 Activity（重建会导致 WebView 重载、播放中断）。
+              · supportsPictureInPicture=false：我们只要小窗/分屏，不做画中画。
+              · configChanges 里的 density|fontScale 也是为小窗准备 —— 拖动窗口时
+                这两个会频繁变，不声明就会不停重建。
+        -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density|fontScale"
             android:exported="true"
             android:launchMode="singleTop"
-            android:resizeableActivity="false"
-            android:screenOrientation="portrait"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="false"
             android:theme="@style/AppTheme"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>

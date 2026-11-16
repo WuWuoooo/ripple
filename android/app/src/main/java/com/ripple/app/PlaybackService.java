@@ -18,6 +18,7 @@ import android.os.IBinder;
 import android.os.Looper;
 
 import java.io.InputStream;
+import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
@@ -48,7 +49,11 @@ public class PlaybackService extends Service {
     }
 
     private static PlaybackService instance;
-    private static Sink sink;
+    /**
+     * 网页侧回调。必须是弱引用：原来的静态强引用会让服务一直持有已销毁的
+     * MainActivity（连同整棵 View 树），反复进出 App 就一路泄漏到 OOM。
+     */
+    private static WeakReference<Sink> sinkRef;
 
     private MediaSession session;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -66,7 +71,13 @@ public class PlaybackService extends Service {
     private boolean foregroundStarted = false;
 
     public static void setSink(Sink s) {
-        sink = s;
+        sinkRef = s == null ? null : new WeakReference<>(s);
+    }
+
+    /** 取当前还活着的回调（Activity 已被回收时返回 null） */
+    private static Sink sink() {
+        WeakReference<Sink> r = sinkRef;
+        return r == null ? null : r.get();
     }
 
     public static boolean isRunning() {
@@ -120,7 +131,7 @@ public class PlaybackService extends Service {
 
                 @Override
                 public void onSeekTo(long pos) {
-                    Sink s = sink;
+                    Sink s = sink();
                     if (s != null) s.onSeekTo(pos);
                 }
             });
@@ -132,7 +143,7 @@ public class PlaybackService extends Service {
     }
 
     private void send(String cmd) {
-        Sink s = sink;
+        Sink s = sink();
         if (s != null) s.onMediaCommand(cmd);
     }
 
@@ -186,9 +197,13 @@ public class PlaybackService extends Service {
             this.position = parseLong(positionMs);
             long d = parseLong(durationMs);
             if (d > 0) this.duration = d;
-            boolean changed = this.playing != playing;
             this.playing = playing;
-            if (changed) updatePlaybackState();
+            /*
+             * 每秒都要把最新的 position 交给 MediaSession。
+             * 以前只在 playing 变化时才重建 PlaybackState，而系统靠 setState 里的
+             * position 做进度插值 —— 于是锁屏/通知栏的进度条长期停滞或跳变。
+             */
+            updatePlaybackState();
             pushNotification();
         } catch (Throwable e) {
             /* 进度更新失败不打扰 */
@@ -216,11 +231,35 @@ public class PlaybackService extends Service {
     @Override
     public void onDestroy() {
         instance = null;
+        /*
+         * 系统因内存压力回收服务时走的是 onDestroy，不是 stopAndQuit()。
+         * 原来这里不 stopForeground，通知栏就会留下一条点不动的「正在播放」僵尸通知。
+         */
+        try {
+            if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
+            else stopForeground(true);
+        } catch (Throwable ignored) {
+        }
+        foregroundStarted = false;
+        setSink(null);
         try {
             if (session != null) { session.release(); session = null; }
         } catch (Throwable ignored) {
         }
         super.onDestroy();
+    }
+
+    /**
+     * 显式声明前台服务类型。
+     * targetSdk 34 下类型主要靠 manifest 声明，但官方建议运行时也传一次，
+     * 避免两边不一致时抛 IllegalArgumentException。
+     */
+    private void enterForeground(Notification n) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIF_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        } else {
+            startForeground(NOTIF_ID, n);
+        }
     }
 
     @Override
@@ -233,7 +272,7 @@ public class PlaybackService extends Service {
          */
         if (!foregroundStarted) {
             try {
-                startForeground(NOTIF_ID, buildNofitication());
+                enterForeground(buildNofitication());
                 foregroundStarted = true;
             } catch (Throwable e) {
                 CrashLog.record(this, "media-fg", e);
@@ -388,7 +427,18 @@ public class PlaybackService extends Service {
             Notification.Action next = new Notification.Action.Builder(
                     android.R.drawable.ic_media_next, "下一首",
                     cmdIntent("next")).build();
-            b.addAction(prev).addAction(toggle).addAction(next);
+            /*
+             * 第 8 条：通知栏加「喜欢」。
+             * 系统 drawable 里没有心形，所以自带一个 ic_heart 矢量图。
+             * 点击后通过 cmdIntent("like") 回到网页，由 __rippleMediaCmd 处理 ——
+             * 收藏逻辑（含未登录提示）仍然只有网页那一份，不重复实现。
+             */
+            Notification.Action like = new Notification.Action.Builder(
+                    R.drawable.ic_heart, "喜欢", cmdIntent("like")).build();
+            /* 用户要求「喜欢」放在最右边：上一首 / 播放暂停 / 下一首 / 喜欢 */
+            b.addAction(prev).addAction(toggle).addAction(next).addAction(like);
+            // 紧凑视图放前三个常用键；喜欢在最右侧的展开区
+            style.setShowActionsInCompactView(0, 1, 2);
             if (coverBmp != null) b.setLargeIcon(coverBmp);
         }
         return b.build();
@@ -410,7 +460,7 @@ public class PlaybackService extends Service {
             if (nm == null) return;
             Notification n = buildNofitication();
             if (!foregroundStarted) {
-                startForeground(NOTIF_ID, n);
+                enterForeground(n);
                 foregroundStarted = true;
             } else {
                 nm.notify(NOTIF_ID, n);

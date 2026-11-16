@@ -3,11 +3,18 @@
    ============================================================ */
 (function (g) {
   const KEY = 'ripple.state.v1';
+  /*
+   * L-16：播放进度单独存一个小键。
+   * 以前每 4 秒把整个 state（history 200 条 + onlineCache 60 条）JSON.stringify
+   * 再同步写 localStorage —— 主线程卡顿与耗电的固定来源，而且这些数据 99% 没有变化。
+   * 现在进度只写这一个小对象，整份 state 只在真正改设置/曲库时才整体落盘。
+   */
+  const KEY_PROGRESS = 'ripple.progress.v1';
   const DB_NAME = 'ripple-db';
   const DB_STORE = 'files';
 
   const DEFAULTS = {
-    theme: 'dark',
+    theme: 'auto',       // 默认跟随系统深浅色
     dynamicColor: true,
     glassBlur: 26,
     animSpeed: 1,
@@ -67,6 +74,9 @@
     load() {
       let saved = {};
       try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { saved = {}; }
+      // 进度小对象独立读取；老版本没有这个键就退回整份 state 里的值
+      let prog = null;
+      try { prog = JSON.parse(localStorage.getItem(KEY_PROGRESS) || 'null'); } catch (e) { prog = null; }
       /*
        * localStorage 可能被写坏（手工改、版本升级、配额写一半）。
        * 以前这里直接用 saved.history，一旦它变成非数组，
@@ -82,6 +92,13 @@
         imports: arr(saved.imports),
         onlineCache: arr(saved.onlineCache).filter((x) => x && x.id),
       };
+      // 进度小键优先（它比整份 state 更新），字段仍然挂在 settings 上，其他代码不用改
+      if (prog && typeof prog === 'object') {
+        if (typeof prog.lastTrackId === 'string') this.state.settings.lastTrackId = prog.lastTrackId;
+        if (Number(prog.lastPosition) >= 0) this.state.settings.lastPosition = Number(prog.lastPosition);
+        if (Array.isArray(prog.lastQueue)) this.state.settings.lastQueue = prog.lastQueue.filter((x) => typeof x === 'string');
+        if (Number(prog.queueIndex) >= 0) this.state.settings.queueIndex = Number(prog.queueIndex);
+      }
       return this.state;
     },
     save() {
@@ -93,9 +110,42 @@
         }));
       } catch (e) {}
     },
+    /**
+     * L-16：只写进度相关的 4 个字段（几十字节），不碰 history / onlineCache。
+     * 每 12 秒调用一次，开销可以忽略。
+     */
+    saveProgress(prog) {
+      try {
+        localStorage.setItem(KEY_PROGRESS, JSON.stringify({
+          lastTrackId: prog.lastTrackId || '',
+          lastPosition: Number(prog.lastPosition) || 0,
+          lastQueue: Array.isArray(prog.lastQueue) ? prog.lastQueue.slice(0, 200) : [],
+          queueIndex: Number(prog.queueIndex) || 0,
+        }));
+      } catch (e) {}
+    },
+    /**
+     * 改一个设置项。
+     *
+     * 审查 3.2：以前每次调用都立刻 save() —— 而 save() 会把
+     * settings + liked + history(200) + playedSec + imports + onlineCache(60)
+     * **全量序列化**写 localStorage。设置面板里拖滑块是每帧触发一次 input 事件，
+     * 于是拖动一次滑块 = 几百次全量写盘，主线程被 JSON.stringify 拖住，
+     * 观感就是「拖起来发涩」。
+     *
+     * 现在合并到下一帧之后再写：同一帧内的多次 set 只落盘一次。
+     * 用 requestAnimationFrame 而不是 setTimeout，是因为它天然与渲染帧对齐，
+     * 不会在页面不可见时也排队执行。
+     *
+     * 需要「立刻落盘」的场景（比如切歌前）显式调 Store.save() 即可。
+     */
     set(key, val) {
       this.state.settings[key] = val;
-      this.save();
+      if (this._saveRaf) return;
+      const run = () => { this._saveRaf = 0; this.save(); };
+      this._saveRaf = (typeof requestAnimationFrame === 'function')
+        ? requestAnimationFrame(run)
+        : setTimeout(run, 16);
     },
 
     /* ---------- IndexedDB ---------- */
@@ -122,8 +172,13 @@
       return new Promise((res, rej) => {
         const tx = db.transaction(DB_STORE, 'readwrite');
         tx.objectStore(DB_STORE).put(rec);
-        tx.oncomplete = res;
+        tx.oncomplete = () => res();
         tx.onerror = () => rej(tx.error);
+        /*
+         * B-7：配额满时事务走的是 abort 而不是 error，onerror 不触发，
+         * Promise 永远 pending —— 导入界面就卡在「正在导入…」，只能杀进程。
+         */
+        tx.onabort = () => rej(tx.error || new Error('IndexedDB 事务被中止（可能是存储配额已满）'));
       });
     },
     async dbAll() {
@@ -171,6 +226,16 @@
       return this.all().find((t) => t.id === id);
     },
     async restoreLocal() {
+      /*
+       * 审查 3.2：每次冷启动都会为每个本地曲目 createObjectURL 一批 blob URL，
+       * 但从不回收 —— 反复冷启动会持续泄漏。
+       * 重建之前先把上一批（同一会话内重入时）回收掉。
+       */
+      try {
+        (this.localTracks || []).forEach((t) => {
+          if (t && t.src && /^blob:/.test(t.src)) URL.revokeObjectURL(t.src);
+        });
+      } catch (e) {}
       try {
         const recs = await this.dbAll();
         this.localTracks = recs.map((r) => ({

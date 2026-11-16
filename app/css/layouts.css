@@ -24,8 +24,8 @@
   display:flex;position:absolute;left:12px;right:12px;bottom:calc(var(--safe-b) + 8px);z-index:19;
   height:62px;border-radius:22px;align-items:center;justify-content:space-around;
   background:var(--glass);
-  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(180%);
-  backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
   border:1px solid var(--glass-border);
   box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl);
   pointer-events:auto;transition:transform var(--dur) var(--ease),opacity var(--dur);
@@ -45,8 +45,8 @@
 .dock{bottom:calc(var(--safe-b) + 78px);padding:0 14px}
 .dock-inner{
   border-radius:20px;background:var(--dock-bg);
-  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(190%);
-  backdrop-filter:blur(var(--glass-blur)) saturate(190%);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
   border:1px solid var(--glass-border);
   box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl);
 }
@@ -57,8 +57,8 @@
 .hero{
   margin-top:6px;border-radius:26px;padding:22px;position:relative;overflow:hidden;
   display:block;background:var(--glass);
-  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(180%);
-  backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
   border:1px solid var(--glass-border);
   box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl);
 }
@@ -66,7 +66,7 @@
 .hero .halo{
   position:absolute;right:-20%;top:-40%;width:220px;height:220px;border-radius:50%;
   background:radial-gradient(circle,var(--accent),transparent 65%);filter:blur(20px);opacity:.55;
-  pointer-events:none;transition:background .8s;
+  pointer-events:none;transition:background .8s var(--ease-soft);
 }
 .hero .kicker{
   font-size:9px;letter-spacing:.24em;color:var(--accent);text-transform:uppercase;font-weight:600;
@@ -129,7 +129,7 @@
   position:absolute;right:8px;bottom:8px;width:28px;height:28px;border-radius:50%;
   background:rgba(12,10,20,.5);border:1px solid rgba(255,255,255,.3);display:grid;place-items:center;
   color:#fff;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:0;
-  transform:translateY(4px);transition:.25s;
+  transform:translateY(4px);transition:.25s var(--ease);
 }
 .gcard.on .pl{opacity:1;transform:none}
 .gcard b{display:block;font-size:12.5px;font-weight:560;margin:9px 2px 3px;
@@ -147,8 +147,8 @@
 /* ---------- 账号卡 ---------- */
 .acct{padding:18px;border-radius:22px;position:relative;overflow:hidden;
   background:var(--glass);border:1px solid var(--glass-border);
-  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(180%);
-  backdrop-filter:blur(var(--glass-blur)) saturate(180%);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
   box-shadow:var(--shadow),inset 0 1px 0 var(--glass-hl)}
 .acct-row{display:flex;align-items:center;gap:13px;position:relative;z-index:2}
 .acct .ava{width:54px;height:54px;border-radius:50%;overflow:hidden;flex:none;

@@ -1,0 +1,539 @@
+/* ============================================================
+   Ripple · responsive.css
+   断点适配：小屏手机 / 常规手机 / 大屏手机 / 折叠屏 / 平板 / 桌面
+   外加低配降级（<html class="perf-low">，由 JS 判断后加上）
+
+   断点判据（宽度按 CSS px ≈ dp）：
+     < 360                        小屏手机（老机型、分屏窄窗）
+     360 – 599                    常规手机
+     600 – 699                    大屏手机
+     >= 700 且 宽高比 <= 1.84     平板 / 折叠屏展开 / 桌面（含竖屏与横屏）
+     >= 1180 且 宽高比 <= 1.84    宽平板 / 桌面
+     >= 700 的「矮胖」屏          手机横屏，强制回手机布局
+
+   为什么带宽高比条件：
+     只看宽度会把「手机横过来」误判成平板 —— 一台 1024×460 的手机横屏
+     宽度有 1024，套上左侧竖排导航和两栏播放页后，竖排导航撑出屏幕、
+     歌词和歌名叠在一起。手机横屏的宽高比典型是 20:9 ~ 21:9（>=2.2），
+     平板横屏接近 16:10（1.5~1.6），拿 1.84 当分界两边都留了余量。
+
+   为什么不再用 min-height：
+     之前用 min-height:600px 排除手机横屏，结果把一台 832×543 的
+     低分辨率平板也一起排除了 —— 它掉进「大屏手机」档，内容被限宽成
+     660px，在 832px 的屏幕上看起来就是中间一条窄栏、两侧留白。
+   ============================================================ */
+
+/* ---------- 0. 尺寸令牌 ---------- */
+:root{
+  --pad-x:18px;            /* 页面左右内边距 */
+  --rail-w:0px;            /* 平板竖排导航宽度；手机上为 0 */
+  --sheet-max:640px;       /* 底部面板最大宽度 */
+  --content-max:100%;      /* 内容区最大宽度 */
+  --np-pad-x:22px;         /* 播放页左右内边距 */
+  --np-cover-max:520px;    /* 播放页封面最大边长 */
+  --grid-cols:2;           /* 首页 / 曲库网格列数 */
+  --hero-pad:22px;
+}
+
+/* 大屏手机：3 列，内容限宽避免一行太长 */
+@media (min-width:600px){
+  :root{--pad-x:22px;--sheet-max:560px;--content-max:660px;--grid-cols:3;}
+}
+
+/* 平板（竖屏 / 横屏） / 折叠屏展开 / 桌面：左侧竖排导航 + 满宽内容 */
+@media (min-width:700px) and (max-aspect-ratio: 184/100){
+  :root{
+    --pad-x:26px;--rail-w:84px;--sheet-max:720px;--content-max:1100px;
+    --np-pad-x:30px;--np-cover-max:560px;--grid-cols:3;--hero-pad:26px;
+  }
+}
+
+/* 宽平板横屏 / 桌面 */
+@media (min-width:1180px) and (max-aspect-ratio: 184/100){
+  :root{
+    --pad-x:34px;--rail-w:92px;--sheet-max:820px;--content-max:1240px;
+    --np-pad-x:44px;--np-cover-max:600px;--grid-cols:4;--hero-pad:30px;
+  }
+}
+
+/* 超宽（桌面 / 大平板横屏） */
+@media (min-width:1500px) and (max-aspect-ratio: 184/100){
+  :root{--content-max:1360px;--grid-cols:5;}
+}
+
+/* ---------- 1. 壳层：内容区宽度 + 平板竖排导航 ---------- */
+.app{padding-left:calc(var(--safe-l) + var(--rail-w))}
+.topbar{padding:var(--safe-t) var(--pad-x) 4px}
+
+/*
+ * 内容居中：不用 max-width 去套每个子元素（那样会把 carousel 的负外边距、
+ * 设置页的两栏 grid 一起坑掉），而是把「多余宽度」变成左右 padding。
+ * 手机上 --content-max 是 100%，这一行等价于原来的 padding:0 18px。
+ */
+.page{
+  padding-left:max(var(--pad-x), calc((100% - var(--content-max)) / 2));
+  padding-right:max(var(--pad-x), calc((100% - var(--content-max)) / 2));
+  /*
+   * 底部留白必须含 --safe-b（手势条 / 导航栏高度）。
+   *
+   * 底部那几个元素都是 absolute/fixed，各自按 --safe-b 往上叠：
+   *   tabbar  高 62，bottom = safe-b + 8
+   *   dock    高 60，bottom = safe-b + 78   → 顶部在 safe-b + 138
+   * 而这里以前写死 150px、不含 safe-b ——
+   * 手势条 27px 的全面屏上，内容底部会被 dock 压住 15~27px（曲库列表最后一行被挡）。
+   * 改成 calc(safe-b + 146px)：138 的净空间 + 8 的呼吸余量。
+   */
+  padding-bottom:calc(var(--safe-b) + 146px);
+}
+.topbar{
+  padding-left:max(var(--pad-x), calc((100% - var(--content-max)) / 2));
+  padding-right:max(var(--pad-x), calc((100% - var(--content-max)) / 2));
+}
+
+/* ---------- 2. 导航：手机上底部胶囊，平板上左侧竖排 ---------- */
+@media (min-width:700px) and (max-aspect-ratio: 184/100){
+  .tabbar{
+    left:calc(var(--safe-l) + 14px);right:auto;
+    top:calc(var(--safe-t) + 18px);bottom:auto;
+    width:56px;height:auto;
+    flex-direction:column;justify-content:flex-start;
+    gap:2px;padding:10px 0;border-radius:26px;
+  }
+  .tabbar a{
+    width:48px;height:46px;padding:0;gap:4px;
+    justify-content:center;border-radius:16px;
+  }
+  .tabbar a.on{background:var(--accent-soft)}
+  /* 选中指示器从「顶部横线」改成「左侧竖条」 */
+  .tabbar a.on::after{
+    top:50%;left:-4px;width:3px;height:18px;
+    transform:translateY(-50%);border-radius:3px;
+  }
+  .tabbar svg{width:21px;height:21px}
+  .tabbar a{font-size:9.5px}
+
+  /* dock 与底部渐变要让开竖排导航 */
+  .dock{padding-left:calc(var(--safe-l) + var(--rail-w));padding-right:var(--safe-r)}
+  .dock-inner{max-width:var(--content-max);margin:0 auto}
+  .bottom-scrim{left:calc(var(--safe-l) + var(--rail-w))}
+  /*
+   * 平板档原来写 padding-bottom:170px，但这一档的底部没有胶囊导航
+   * （导航在左侧竖排），只需要给 dock（约 60px + 18px 间距）留位置。
+   * 170px 在矮屏上会让最后一行内容被那一大片渐变遮罩闷住。
+   */
+  .page{padding-bottom:calc(var(--safe-b) + 96px)}
+  .bottom-scrim{height:120px}
+}
+
+/* ---------- 2b. 把写死 18px 的负外边距换成令牌 ----------
+   .carousel / .pl-head 原来用 margin:0 -18px 之类跟 .page 的 18px 内边距对齐，
+   平板加宽内边距后就会露出一条缝。 */
+.carousel{margin:0 calc(var(--pad-x) * -1);padding:0 var(--pad-x) 4px}
+.pl-head{
+  margin:8px calc(var(--pad-x) * -1) 0;
+  padding:0 var(--pad-x) 18px;
+}
+/* 播放页底部三个按钮的满宽出血同理 */
+.np-actions{
+  margin-left:calc(var(--np-pad-x) * -1);
+  margin-right:calc(var(--np-pad-x) * -1);
+  padding-left:var(--np-pad-x);
+  padding-right:var(--np-pad-x);
+}
+
+/* ---------- 3. 首页：网格列数跟随令牌 ---------- */
+.grid{grid-template-columns:repeat(var(--grid-cols),1fr)}
+
+@media (min-width:700px) and (max-aspect-ratio: 184/100){
+  .carousel{margin:0 calc(var(--pad-x) * -1);padding:0 var(--pad-x) 4px}
+  .c-card{flex:0 0 232px;height:272px}
+  .c-card .c-tx b{font-size:16px}
+  .sec-head{margin:28px 2px 14px}
+  .sec-head h2{font-size:17px}
+  .hero{padding:var(--hero-pad);border-radius:30px}
+  .hero h2{font-size:28px;max-width:20ch}
+  .hero p{font-size:12.5px;max-width:32ch}
+  .hero-art{width:200px;height:200px;right:-24px;bottom:-24px}
+  .gcard .th{border-radius:20px}
+  .gcard b{font-size:13.5px}
+  .row .r-th{width:48px;height:48px}
+  .row .r-tx b{font-size:13.5px}
+  /* 曲库列表在大屏上变成两列，避免一条 1200px 长的行 */
+  [data-page="library"] .list#libList,
+  [data-page="playlist"] .list#plTracks{columns:2;column-gap:28px}
+  [data-page="library"] .list#libList .row,
+  [data-page="playlist"] .list#plTracks .row{break-inside:avoid}
+  .set-card{border-radius:20px}
+  .set-row{padding:14px 16px}
+}
+
+/* 设置页：单栏区间里卡片别拉满整屏（一行 880px 长的文字很难读） */
+@media (min-width:700px) and (max-width:1179px) and (max-aspect-ratio: 184/100){
+  [data-page="settings"]{
+    padding-left:max(var(--pad-x), calc((100% - 820px) / 2));
+    padding-right:max(var(--pad-x), calc((100% - 820px) / 2));
+  }
+  [data-page="playlist"] .pl-tx h2,
+  [data-page="playlist"] .pl-tx p{max-width:46ch}
+}
+
+@media (min-width:1180px) and (max-aspect-ratio: 184/100){
+  /* 设置页在大屏上分两栏，别留一大片空白 */
+  [data-page="settings"]{
+    display:grid;grid-template-columns:1fr 1fr;
+    align-content:start;gap:0 28px;
+  }
+  [data-page="settings"] > .set-group{margin-top:16px}
+  [data-page="settings"] > .set-group:first-of-type{grid-column:1 / -1}
+  [data-page="settings"] > .about-note{grid-column:1 / -1}
+}
+
+/* ---------- 4. 底部面板：大屏上居中限宽 ---------- */
+@media (min-width:600px){
+  .np-sheet{
+    left:50%;right:auto;width:min(var(--sheet-max),calc(100% - 48px));
+    border-radius:26px 26px 0 0;
+    transform:translate(-50%,101%);
+  }
+  .np-sheet.on{transform:translate(-50%,0)}
+  .np-sheet.peek{transform:translate(-50%,0)}
+  .np-sheet#npOptSheet{max-height:min(82%,760px)}
+  .np-sheet{max-height:min(72%,680px)}
+  .toasts{
+    left:50%;right:auto;transform:translateX(-50%);
+    width:min(440px,calc(100% - 40px));
+  }
+}
+
+/* ---------- 5. 播放页：宽屏改成「封面 + 控制」两栏 ---------- */
+@media (min-width:700px) and (max-aspect-ratio: 184/100){
+  /* 以前这里是一条把 .np 压成 480px 居中窄条的老规则，
+     平板横屏时播放页只有中间一小条，等于没适配。现在改成整屏两栏。 */
+  .np{max-width:none;left:0;transform:translateY(calc(100% + 40px))}
+  .np.open{transform:none}
+
+  .np-inner{
+    display:grid;
+    grid-template-columns:minmax(0,1.08fr) minmax(0,1fr);
+    grid-template-rows:auto 1fr 1fr auto auto auto;
+    grid-template-areas:
+      "top   top"
+      "cover info"
+      "cover lyric"
+      "cover seek"
+      "cover ctl"
+      "acts  acts";
+    column-gap:36px;
+    padding:var(--safe-t) var(--np-pad-x) 0;
+  }
+  .np-top{grid-area:top}
+  .cover-wrap{grid-area:cover;align-items:center;padding:6px 0}
+  .np-meta{grid-area:info;margin-top:14px;align-self:end}
+  .np-lyricbox{grid-area:lyric;align-self:start}
+  .np-seek{grid-area:seek;margin:10px 0 0}
+  .np-ctl{grid-area:ctl;margin-top:8px;justify-content:space-around;max-width:460px;width:100%}
+  .np-actions{grid-area:acts}
+  .np-flexspacer{display:none}
+
+  /*
+   * 这里原本有 max-width/max-height: var(--np-cover-max)。
+   * 必须删掉：封面的边长完全由 JS 的 sizeCover() 写成 px，
+   * CSS 再加一道上限就会和 JS 算出来的值打架 ——
+   * 而设计上还要求「动画期间尺寸冻结」，CSS 上限是另一套不听话的约束，
+   * 布局一变（比如展开歌词）实际渲染尺寸就被它改掉，看起来就是封面在缩放。
+   * 上限已经在 sizeCover() 里用 min() 处理了，这一层是重复且有害的。
+   */
+  .np-meta h2{font-size:23px;white-space:normal;display:-webkit-box;
+    -webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .np-artisticon{display:none}
+
+  .np-actions{margin:14px calc(var(--np-pad-x) * -1) 0;padding:12px var(--np-pad-x) var(--safe-b)}
+  .np-actions button{height:50px;border-radius:18px}
+  .np-actions button b{font-size:10.5px}
+
+  /* 展开歌词：放弃两栏，整屏给歌词（平板上歌词本来就该占满） */
+  .np.expanded .np-inner{
+    grid-template-columns:1fr;
+    grid-template-rows:auto auto 1fr auto auto auto;
+    grid-template-areas:"top" "info" "lyric" "seek" "ctl" "acts";
+  }
+  .np.expanded .cover-wrap{display:none}
+  .np.expanded .np-meta{transform:none;align-self:auto}
+  .np.expanded .lyric{padding:10px var(--np-pad-x) 30%}
+}
+
+/* ---------- 5b. 手机横屏：强制回到「手机布局」 ----------
+ *
+ * 问题：一台 1024×460 的手机横过来，宽度命中了 min-width:840 的平板断点，
+ * 于是套上了「左侧竖排导航 + 播放页两栏」—— 但那套布局假设高度充足，
+ * 在 460px 高的屏幕上导航撑到屏幕外、歌词和歌名叠在一起。
+ *
+ * 判据用宽高比而不是绝对高度：横屏时 aspect-ratio = 宽/高，
+ * 手机横过来典型是 20:9 ~ 21:9（≈2.2 ~ 2.33），平板横屏接近 16:10（1.6）。
+ * 取 1.85 作分界，两边各留 ~0.2 余量，折叠屏展开（1.1~1.3）也安全落在平板侧。
+ *
+ * 放在 840 断点之后声明，同特异性时后者覆盖前者。
+ */
+@media (orientation:landscape) and (min-aspect-ratio: 185/100){
+  :root{
+    --rail-w:0px;
+    --pad-x:14px;
+    --np-pad-x:18px;
+    --content-max:100%;
+    --sheet-max:100%;
+    --grid-cols:2;
+  }
+  /* 导航回到底部胶囊 */
+  .tabbar{
+    left:12px;right:12px;top:auto;bottom:calc(var(--safe-b) + 8px);
+    width:auto;height:54px;border-radius:20px;
+    flex-direction:row;justify-content:space-around;
+    gap:0;padding:0;
+  }
+  .tabbar a{width:52px;height:auto;padding:6px 0;gap:3px;font-size:8.5px;border-radius:0}
+  .tabbar a.on{background:none}
+  .tabbar a.on::after{
+    top:-1px;left:auto;width:16px;height:2px;
+    transform:none;border-radius:2px;
+  }
+  .tabbar svg{width:18px;height:18px}
+  .app{padding-left:var(--safe-l)}
+  .dock{padding-left:var(--safe-l);padding-right:var(--safe-r)}
+  .dock-inner{max-width:none}
+  .bottom-scrim{left:0}
+  .page{padding-bottom:calc(var(--safe-b) + 128px)}
+  /* 大屏专用的两列列表在手机横屏上收回单列 */
+  [data-page="library"] .list#libList,
+  [data-page="playlist"] .list#plTracks{columns:auto}
+  /* 设置页不要两栏 */
+  [data-page="settings"]{display:block}
+  /* 底部面板恢复贴底满宽 */
+  .np-sheet{
+    left:0;right:0;width:auto;transform:translateY(calc(100% + 40px));
+    border-radius:22px 22px 0 0;max-height:86%;
+  }
+  .np-sheet.on{transform:none}
+  .np-sheet.peek{transform:none}
+  .toasts{left:14px;right:14px;transform:none;width:auto}
+}
+
+/* 手机横屏：高度不够，同样走两栏，但封面小一号 */
+@media (orientation:landscape) and (max-height:560px){
+  .np-inner{
+    display:grid;
+    grid-template-columns:minmax(0,.92fr) minmax(0,1.08fr);
+    grid-template-rows:auto auto 1fr auto auto auto;
+    grid-template-areas:
+      "top   top"
+      "cover info"
+      "cover lyric"
+      "cover seek"
+      "cover ctl"
+      "acts  acts";
+    column-gap:20px;
+    padding:var(--safe-t) calc(var(--np-pad-x) + 4px) 0;
+  }
+  /*
+   * 手机横屏的两栏：右栏顶部是歌名，中间留给歌词，底部是进度 + 控制。
+   * 关键约束 —— .np-top 和 .np-meta 原来都被挤到同一格里，
+   * 歌名会被「正在播放 / 本地文件」那段小字顶上去、和它重叠。
+   * 现在把 top 单独一行（只在左侧封面顶部占位），info 从第二行开始。
+   */
+  .np-inner{
+    grid-template-rows:auto auto 1fr auto auto auto;
+    grid-template-areas:
+      "top   top"
+      "cover info"
+      "cover lyric"
+      "cover seek"
+      "cover ctl"
+      "acts  acts";
+  }
+  /*
+   * 顶栏横跨两栏：它是「关闭 / 正在播放 / 更多」的横排 flex，
+   * 塞进单栏会被压成只剩两个图标、中间那列文字消失。
+   *
+   * 但 .t 默认是 text-align:center，在整屏宽度里就落在 x=屏幕中点，
+   * 而歌名在右栏开头 —— 两者水平位置几乎重合，只差 4px 垂直间距，
+   * 视觉上就是「本地文件」几个字压在歌名上。
+   * 这里改成左对齐，让「正在播放 · 本地文件」紧跟在关闭按钮右边，
+   * 和右侧的歌名彻底分开。
+   */
+  .np-top{grid-area:top;padding-bottom:6px}
+  /* .t 是 flex:1 撑满剩余宽度，光改 text-align 只是把文字靠左，
+     盒子仍然横跨到屏幕右半边、盖在歌名上方。改成按内容收缩，
+     夹在「关闭」和「更多」两个按钮之间。 */
+  .np-top .t{flex:0 1 auto;text-align:left;margin-right:auto}
+  .np-top .t b{font-size:8.5px;letter-spacing:.16em}
+  .np-top .t span{font-size:10px;margin-top:2px}
+  .cover-wrap{grid-area:cover;padding:2px 0}
+  /* 歌名往下让一点：顶栏文字虽然在左边、不再水平重叠，
+     但它们在同一行高度上，视觉上仍会觉得歌名被顶住了。
+     这里给 10px 的呼吸间距。 */
+  .np-meta{grid-area:info;margin-top:10px;align-self:start}
+  .np-meta h2{font-size:18px;line-height:1.2}
+  .np-meta p{font-size:10.5px;margin:3px 0 0}
+  .np-lyricbox{grid-area:lyric;align-self:stretch;min-height:0;display:flex;flex-direction:column;
+    justify-content:center}
+  .np-lyric{height:calc(var(--lyr-lh) * 2);margin:8px 0 0}
+  .np-lyric .ln:nth-child(3){display:none}
+  .np-seek{grid-area:seek;margin:6px 0 0;align-self:end}
+  .np-ctl{grid-area:ctl;margin-top:8px;justify-content:space-around;align-self:end}
+  .np-actions{grid-area:acts}
+  .np-flexspacer{display:none}
+  /* 封面：横屏时高度是最稀缺资源，按高度取，别按宽度 ——
+     46vh 在 460px 高的屏幕上只有 211px，中间会空出一大片。
+     这里按「可用高度 - 底部控制区」反推，上限 320px。 */
+  /*
+   * 同上：横屏的小一号封面已经由 sizeCover() 按可用高度算出来了，
+   * 这里再写 72vh 只会让 CSS 和 JS 各算一套，动画中互相打架。
+   */
+  .np-actions{margin:8px calc(var(--np-pad-x) * -1) 0;
+    padding:8px calc(var(--np-pad-x) + 4px) calc(var(--safe-b) + 4px)}
+  .np-actions button{height:42px}
+  .np-ctl .main{width:54px;height:54px}
+  .np-ctl .c.nav{width:44px;height:44px}
+  /* 横屏矮屏上展开歌词：整屏给歌词 */
+  .np.expanded .np-inner{
+    grid-template-columns:1fr;
+    grid-template-rows:auto auto 1fr auto auto auto;
+    grid-template-areas:"top" "info" "lyric" "seek" "ctl" "acts";
+  }
+  .np.expanded .cover-wrap{display:none}
+}
+
+/* 折叠屏展开（双屏分段）：中间那条缝两侧各留一点安全距离 */
+@media (horizontal-viewport-segments: 2){
+  .np-inner{column-gap:max(36px,env(viewport-segment-left 1 0,0px))}
+  .page{padding-left:calc(var(--pad-x) + 12px);padding-right:calc(var(--pad-x) + 12px)}
+}
+
+/* ---------- 6. 小屏手机 ---------- */
+@media (max-width:359px){
+  :root{--pad-x:14px;--np-pad-x:16px;--sheet-max:100%;}
+  .topbar{padding:var(--safe-t) var(--pad-x) 2px}
+  .hello h1{font-size:19px}
+  .hello small{font-size:9px}
+  .tb-btn{width:32px;height:32px}
+  .tb-btn svg{width:17px;height:17px}
+  .page{padding-bottom:calc(var(--safe-b) + 136px)}
+  .hero{padding:16px;border-radius:22px}
+  .hero h2{font-size:19px;max-width:14ch}
+  .hero p{font-size:11px;max-width:18ch}
+  .hero-btns{margin-top:12px}
+  .hero-btns .btn{height:34px;padding:0 12px;font-size:11.5px}
+  .hero-art{width:126px;height:126px;right:-26px;bottom:-26px}
+  .sec-head h2{font-size:15px}
+  .grid{gap:10px}
+  .gcard b{font-size:11.5px}
+  .c-card{flex:0 0 168px;height:206px}
+  .c-card .c-tx b{font-size:13px}
+  .row{gap:9px;padding:8px 2px}
+  .row .r-th{width:38px;height:38px;border-radius:10px}
+  .row .r-tx b{font-size:12px}
+  .row .r-idx{width:18px}
+  .tabbar{height:56px;border-radius:20px;left:10px;right:10px}
+  .tabbar a{width:50px;font-size:8.5px}
+  .tabbar svg{width:18px;height:18px}
+  .dock{bottom:calc(var(--safe-b) + 72px)}
+  .dock-inner{height:54px;border-radius:18px}
+  .dock .thumb{width:38px;height:38px;border-radius:10px}
+  .dock .meta b{font-size:11.5px}
+  .np-ctl .main{width:56px;height:56px}
+  .np-ctl .c{width:38px;height:38px}
+  .np-ctl .c.nav{width:46px;height:46px}
+  .np-actions button{height:42px;border-radius:14px}
+  .np-actions button b{font-size:9px}
+  .np-meta h2{font-size:19px}
+  .sld{width:92px}
+  .set-row{padding:12px 12px;gap:10px}
+  .set-row .tx b{font-size:12px}
+  .eq-bands{gap:6px;padding:14px 4px 4px}
+  .eq-track,.eq-track input{height:96px}
+  .eq-track input{width:96px}
+}
+
+/* ---------- 7. 低配模式（html.perf-low）----------
+   触发条件由 JS 判断（大屏物理像素过多 / 设备内存或核心数偏低 / 用户手动开启）：
+   · 停掉氛围光那三个大圆圈的漂移动画（每帧重算 76px 模糊，是最贵的一项）
+   · 去掉颗粒噪点（整屏 mix-blend-mode，每次合成都要重算）
+   · 玻璃模糊降一半、收窄扩散半径
+   · 面板改成纯色底，省掉 backdrop-filter 的整块重采样
+   · 关掉页面入场动画
+   画质优先的用户可以在设置里强制关掉它。 */
+html.perf-low .ambient{filter:blur(46px);opacity:.34}
+html.perf-low .ambient i{animation:none!important}
+html.perf-low .grain{display:none}
+html.perf-low .page.on{animation:none}
+/*
+ * H-20 配套：低配模式下即使 JS 加了 .animating 也不要提升合成层 ——
+ * 低配机提升合成层反而更吃显存，而且 perf-low 本来就要降级动效。
+ * 用 !important 明确压过 base.css 里的 .np.animating。
+ */
+html.perf-low .np,
+html.perf-low .np.animating{will-change:auto!important}
+html.perf-low .np-sheet,
+html.perf-low .sheet-mask,
+html.perf-low .np-sheet.animating,
+html.perf-low .sheet-mask.animating{will-change:auto!important}
+html.perf-low .np-bg{filter:blur(38px) saturate(140%)}
+html.perf-low .glass,
+html.perf-low .tabbar,
+html.perf-low .dock-inner,
+html.perf-low .np-sheet,
+html.perf-low .toast,
+html.perf-low .acct,
+html.perf-low .hero,
+html.perf-low .np-top .cir,
+html.perf-low .c-card .c-k,
+html.perf-low .c-card .c-play,
+html.perf-low .gcard .pl,
+html.perf-low .cmt-hd{
+  -webkit-backdrop-filter:none!important;
+  backdrop-filter:none!important;
+}
+html.perf-low .np-sheet,
+html.perf-low .toast{background:color-mix(in srgb,var(--bg) 94%,transparent)}
+html.perf-low .tabbar,
+html.perf-low .dock-inner{background:color-mix(in srgb,var(--bg) 92%,transparent)}
+html.perf-low .np-ctl .main,
+html.perf-low .btn.solid{box-shadow:none}
+html.perf-low .art .ripple{display:none}
+
+/*
+ * 液态玻璃的降级档位。
+ *
+ * 有三条线会关掉折射（svg url() 滤镜）：
+ *   ① html.perf-low（低配模式，见上面那段）—— 普通毛玻璃，省性能
+ *   ② html.lg-off（玻璃强度拉到 0）—— 连模糊都不做，实色底
+ *   ③ prefers-reduced-motion —— 折射本身不涉及动画，但这类用户往往
+ *      也对「画面在流动」敏感，一并退化成普通毛玻璃更合适
+ *
+ * 注意这里必须用 !important 压过 base.css 里那套带 url(#lg-warp) 的写法。
+ */
+@media (prefers-reduced-motion:reduce){
+  html:not(.perf-low) .glass,
+  html:not(.perf-low) .tabbar,
+  html:not(.perf-low) .dock-inner,
+  html:not(.perf-low) .hero,
+  html:not(.perf-low) .np-sheet,
+  html:not(.perf-low) .toast,
+  html:not(.perf-low) .acct{
+    -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat))!important;
+    backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat))!important;
+  }
+}
+
+/* 尊重系统的「减少动画」 */
+@media (prefers-reduced-motion:reduce){
+  .ambient i{animation:none!important}
+  .grain{display:none}
+  /* B-9：以前只关 animation，全项目 42 条 transition 照跑 ——
+     开了「减少动画」的用户照样看到所有滑动和淡入淡出。这里一起关掉。 */
+  *,*::before,*::after{
+    animation-duration:.001ms!important;
+    animation-iteration-count:1!important;
+    transition-duration:.001ms!important;
+    scroll-behavior:auto!important;
+  }
+}

@@ -31,6 +31,15 @@ public class HttpBridge {
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
     private static final String CH_ID = "ripple_playback";
     private static final String CH_ALERT = "ripple_alert";
+    /*
+     * 提示类通知的固定 id 段。
+     * 以前用的是 currentTimeMillis() % 100000，而播放通知 0x9A01(=39425)
+     * 正好落在这个区间里 —— 点一次「测试通知」就可能把正在播放的通知整条顶掉。
+     * 这里单独占 0x9A10 起的一段，并在段内递增，避免 100 秒内互相覆盖。
+     */
+    private static final int NOTIF_TEST_BASE = 0x9A10;
+    private static final java.util.concurrent.atomic.AtomicInteger NOTIFY_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger(0);
 
     private final Context ctx;
     private final MainActivity act;
@@ -49,6 +58,19 @@ public class HttpBridge {
      * 异步调用网易云。字符串会被转成 JSON 空对象。
      * 回调 window.__rippleNativeResult(cbId, jsonText)。
      */
+    /**
+     * 第 5 条：网页里「两次下拉」确认后调用，关掉界面回到桌面。
+     * 放在网页侧判断是因为只有网页知道当前页面滚到顶了没有、
+     * 是否在 2 秒的确认窗口内。
+     */
+    @JavascriptInterface
+    public void exitApp() {
+        try {
+            act.runOnUiThread(() -> act.finish());
+        } catch (Throwable ignored) {
+        }
+    }
+
     @JavascriptInterface
     public void netease(final String cmd, final String paramsJson, final String cbId) {
         new Thread(() -> {
@@ -92,26 +114,40 @@ public class HttpBridge {
     }
 
     @JavascriptInterface
-    public String cookie() {
-        return ncm.getCookie();
-    }
-
-    @JavascriptInterface
     public void logout() {
         ncm.clearCookie();
     }
 
     /* ================= 通用 ================= */
 
-    @JavascriptInterface
-    public String httpGet(String url) {
+    /**
+     * 只允许网易云自己的域名。
+     * 原来这个方法接受任意 URL，等于给网页开了一个「访问任意内网地址」的入口。
+     */
+    private static boolean allowedHost(String host) {
+        if (host == null) return false;
+        host = host.toLowerCase();
+        if (host.equals("music.163.com") || host.equals("163.com") || host.endsWith(".163.com")) return true;
+        if (host.equals("126.net") || host.endsWith(".126.net")) return true;
+        return false;
+    }
+
+    /**
+     * 同步 GET。
+     * 不再是 @JavascriptInterface：同步桥方法跑在 WebView 的 JS 线程上，
+     * 一次超时就把整个界面冻住，前端只用异步版本。
+     */
+    private String httpGet(String url) {
         HttpURLConnection conn = null;
         try {
             URL u = new URL(url);
+            if (!allowedHost(u.getHost())) {
+                return "{\"code\":-1,\"msg\":\"host not allowed\"}";
+            }
             conn = (HttpURLConnection) u.openConnection();
             conn.setRequestMethod("GET");
-            conn.setConnectTimeout(12000);
-            conn.setReadTimeout(15000);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
             conn.setRequestProperty("User-Agent", UA);
             conn.setRequestProperty("Referer", "https://music.163.com/");
             conn.setRequestProperty("Accept", "*/*");
@@ -191,7 +227,7 @@ public class HttpBridge {
             if (Build.VERSION.SDK_INT >= 21) {
                 b.setVisibility(Notification.VISIBILITY_PUBLIC);
             }
-            nm.notify((int) (System.currentTimeMillis() % 100000), b.build());
+            nm.notify(NOTIF_TEST_BASE + (NOTIFY_SEQ.incrementAndGet() & 0x0FFF), b.build());
             return true;
         } catch (Exception e) {
             return false;
@@ -451,5 +487,31 @@ public class HttpBridge {
     @JavascriptInterface
     public boolean safeMode() {
         return StrictModes.safeMode;
+    }
+
+    /**
+     * 退出安全模式：清掉连续失败计数，让下次启动重新启用 edge-to-edge。
+     *
+     * 为什么需要它：safeMode 的判据是「连续多次没走到前台就重启」，
+     * 而计数住在 SharedPreferences 里。只要中途因为任何原因（用户在 2.6 秒内
+     * 退出、系统强杀、编译期）累积到阈值，就会**一直**降级，
+     * 症状是视口变矮约 60px、状态栏不被背景覆盖、页面整体下移 ——
+     * 用户完全不知道发生了什么，也没有任何自救入口。
+     *
+     * 这里只清计数，不立即重启（重启由网页侧提示用户后自行决定）。
+     * 返回 true 表示计数已清零，下次启动就是正常模式。
+     */
+    @JavascriptInterface
+    public boolean clearSafeMode() {
+        try {
+            ctx.getSharedPreferences("ripple", android.content.Context.MODE_PRIVATE)
+                    .edit().putInt("boot_streak", 0).apply();
+            StrictModes.safeMode = false;
+            LogBridge.add(ctx, "APP", "clearSafeMode：计数已清零，下次启动恢复 edge-to-edge");
+            return true;
+        } catch (Throwable t) {
+            LogBridge.add(ctx, "APP", "clearSafeMode failed: " + t);
+            return false;
+        }
     }
 }

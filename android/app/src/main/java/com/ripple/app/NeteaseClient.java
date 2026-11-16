@@ -194,9 +194,25 @@ final class NeteaseClient {
             case "playlist": {
                 JSONObject o = new JSONObject();
                 o.put("id", p.optString("id"));
-                o.put("n", 100000);
+                /*
+                 * H-7：以前要 100000 首，万人歌单会一次性 innerHTML 上万个节点，
+                 * 主线程阻塞数秒到数十秒。网页端只要 300 首，这里跟着降。
+                 */
+                o.put("n", 300);
                 o.put("s", 8);
                 return post("v6/playlist/detail", o.toString());
+            }
+            case "comment_add": {
+                /*
+                 * 第 16 条：发评论。
+                 * 网易云的接口是 /api/v1/resource/comments/add（weapi 路径去掉 /api 前缀），
+                 * 需要 threadId（歌曲是 R_SO_4_<id>）和 content；
+                 * csrf_token 由 post() 统一从 cookie 里取（Weapi.csrf），不用这里管。
+                 */
+                JSONObject o = new JSONObject();
+                o.put("threadId", "R_SO_4_" + p.optString("id"));
+                o.put("content", p.optString("content"));
+                return post("v1/resource/comments/add", o.toString());
             }
             case "playlist_tracks": return playlistTracks(p);
             case "toplist":      return post("toplist", "{}");
@@ -267,7 +283,8 @@ final class NeteaseClient {
             }
             // 私人 FM（未登录可用的无限电台兜底）
             case "personal_fm": return post("v1/radio/get", "{}");
-            case "raw":          return post(p.optString("path"), p.optString("body", "{}"));
+            // 原 raw 命令（网页可传任意 /weapi/ 路径）已删除：前端从未使用，留着等于
+            // 一旦页面被注入就能以用户身份调用任意接口（含改歌单、改资料等写操作）。
             default:
                 return "{\"code\":-2,\"msg\":\"未知命令 " + cmd + "\"}";
         }

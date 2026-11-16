@@ -76,7 +76,7 @@ android/                ← Java 外壳
 │   └── StrictModes.java      safeMode
 └── build-apk.sh
 
-server.js               ← 浏览器模式的本地服务（静态 + /ncm 代理 + /audio 代理）
+server.js               ← 浏览器模式的本地服务（静态 + /ncm 代理）
 version.json            ← 版本号唯一来源
 ```
 

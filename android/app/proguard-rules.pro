@@ -1,3 +1,3 @@
--keepclassmembers class com.ripple.app.HttpBridge {
-    public *;
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
 }

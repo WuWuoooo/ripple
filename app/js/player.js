@@ -21,6 +21,9 @@
     ctx: null,
     srcNode: null,
     gainNode: null,
+    analyser: null,       // 归一化用的采样分析节点（串在 gain 之后）
+    _rms: 0,              // 实测 RMS（归一化用；0 = 还没测到）
+    _rmsBuf: null,
     filters: [],
     track: null,
     queue: [],
@@ -34,7 +37,15 @@
     init() {
       this.elA = new Audio();
       this.elB = new Audio();
-      for (const el of [this.elA, this.elB]) {
+      /*
+       * B-4：elC 专供「从链接添加」的第三方音频直链。
+       * 这类地址不返回 Access-Control-Allow-Origin，而 elB 带 crossOrigin='anonymous'
+       * （为了接 WebAudio 做均衡器），于是媒体加载会被按 CORS 判失败 ——
+       * 表现是「点了只报音源已失效」，其实根本不是失效。
+       * elC 不设 crossOrigin，也不接 WebAudio（均衡器对它自动不生效）。
+       */
+      this.elC = new Audio();
+      for (const el of [this.elA, this.elB, this.elC]) {
         el.preload = 'auto';
         el.addEventListener('timeupdate', () => this._emit('time', this.time()));
         el.addEventListener('loadedmetadata', () => this._emit('time', this.time()));
@@ -43,6 +54,29 @@
         el.addEventListener('pause', () => { this.playing = false; this._emit('state', false); });
         el.addEventListener('error', () => {
           if (el === this.el && this.track) this._emit('error', this.track);
+        });
+        /*
+         * 审查 3.2：waiting / stalled 以前完全没监听 ——
+         * 用户看到进度条卡住，分不清是在缓冲还是死了。
+         * 现在统一成一个 buffering 事件，UI 拿它做「缓冲中」的提示。
+         */
+        el.addEventListener('waiting', () => {
+          if (el !== this.el) return;
+          this.buffering = true;
+          this._emit('buffering', true);
+        });
+        el.addEventListener('stalled', () => {
+          if (el !== this.el) return;
+          this.buffering = true;
+          this._emit('buffering', true);
+        });
+        ['playing', 'canplay', 'canplaythrough'].forEach((ev) => {
+          el.addEventListener(ev, () => {
+            if (el !== this.el) return;
+            if (!this.buffering) return;
+            this.buffering = false;
+            this._emit('buffering', false);
+          });
         });
       }
       /*
@@ -55,7 +89,9 @@
       try { this.elB.crossOrigin = 'anonymous'; } catch (e) {}
       this.elA.volume = 0.85;
       this.elB.volume = 0.85;
+      this.elC.volume = 0.85;
       this.el = this.elA;
+      this.buffering = false;
     },
 
     on(evt, fn) {
@@ -72,7 +108,10 @@
     },
 
     _pickEl(track) {
-      return track && track.source === 'online' ? this.elA : this.elB;
+      if (track && track.source === 'online') return this.elA;
+      // B-4：跨域直链走不带 crossOrigin 的 elC
+      if (track && (track.remoteUrl || track.crossOrigin === false)) return this.elC;
+      return this.elB;
     },
 
     /**
@@ -112,8 +151,30 @@
           prev = f;
           this.filters.push(f);
         }
-        prev.connect(this.gainNode);
-        this.gainNode.connect(this.ctx.destination);
+        /*
+         * 审查 3.3：归一化必须在**增益之前**取样。
+         * 以前图是 filters → gain → analyser → 输出，测到的是被增益放大后的信号，
+         * 于是实际增益变成 √(target/rms) 而不是 target/rms —— 响度拉不平，
+         * 还会出现「音量呼吸」一样的来回摆。
+         * 现在改成 filters → analyser → gain → 输出，分析器仍串在链路里，
+         * 只是取样点挪到了增益之前。
+         * 万一内核不支持 createAnalyser，就退回直连——归一化失效但不影响播放。
+         */
+        try {
+          this.analyser = this.ctx.createAnalyser();
+          this.analyser.fftSize = 2048;
+          this._rmsBuf = (typeof this.analyser.getFloatTimeDomainData === 'function')
+            ? new Float32Array(this.analyser.fftSize)
+            : new Uint8Array(this.analyser.fftSize);
+          prev.connect(this.analyser);        // 增益之前取样
+          this.analyser.connect(this.gainNode);
+          this.gainNode.connect(this.ctx.destination);
+        } catch (e2) {
+          this.analyser = null;
+          this._rmsBuf = null;
+          prev.connect(this.gainNode);
+          this.gainNode.connect(this.ctx.destination);
+        }
       } catch (e) {
         this.srcNode = null;
       }
@@ -131,6 +192,19 @@
       const t = track || this.track;
       if (!t) return false;
       return this._canGraph(t);
+    },
+
+    /** B-6：把当前设置里的 EQ 重新下发到滤波器（建图之后必须补一次） */
+    _reapplyEQ() {
+      try {
+        const s = g.Store.state.settings;
+        if (s.eq === 'custom' && Array.isArray(s.eqCustom)) this.applyBandsToFilters(s.eqCustom);
+        else this.applyBandsToFilters(EQ_PRESETS[s.eq] || EQ_PRESETS.off);
+      } catch (e) {}
+    },
+
+    applyBandsToFilters(gains) {
+      this.filters.forEach((f, i) => { try { f.gain.value = gains[i] || 0; } catch (e) {} });
     },
 
     setEQ(name) {
@@ -160,27 +234,62 @@
 
     /**
      * 音量归一化：用音频图里的 gainNode 把不同来源的响度拉平。
-     * 之前 gainNode 建了却从没赋过值，所以这个开关点了什么也不发生。
-     * 注意它只对能接进音频图的音源（blob / 同源）有效——跨域源进不了图，
-     * 强行接进去会被判污染而静音。
+     *
+     * 这里的增益**来自实测**：AnalyserNode 每 0.5 秒取一段时域样本算 RMS，
+     * 再做指数平滑，最后把 target/RMS 钳在 0.5~2.0 之间应用到 gainNode。
+     * 之前 gainNode 建了却从没赋过值（`_rms` 只有读没有写），开关点了什么也不发生。
+     *
+     * 边界（诚实说明，不是 bug）：只有能接进音频图的音源才有效果。
+     * 在线流走 elA 直连（CDN 无 CORS 头，接进图会被判污染而静音），
+     * 所以播在线歌曲时归一化不生效 —— 界面用 normalizeUsable() 明确标注。
      */
     setNormalize(on) {
       this._normalize = !!on;
+      if (!this._normalize) this._rms = 0;
+      this._applyGain();
+    },
+    /** 归一化对当前音源是否真的有效（和 eqUsable 同一套判据） */
+    normalizeUsable(track) {
+      return this._canGraph(track || this.track);
+    },
+    /** 从时域样本实测 RMS（0..1 的均方根），平滑后写进 this._rms */
+    _measureLoudness() {
+      const an = this.analyser;
+      if (!an || !this._rmsBuf) return;
+      const buf = this._rmsBuf;
+      try {
+        if (typeof an.getFloatTimeDomainData === 'function' && buf instanceof Float32Array) {
+          an.getFloatTimeDomainData(buf);
+        } else if (typeof an.getByteTimeDomainData === 'function' && buf instanceof Uint8Array) {
+          an.getByteTimeDomainData(buf);
+        } else {
+          return;
+        }
+      } catch (e) {
+        return;
+      }
+      let sum = 0;
+      let n = buf.length;
+      const byte = buf instanceof Uint8Array;
+      for (let i = 0; i < n; i++) {
+        // 字节样本以 128 为中心（0..255），先归一化到 -1..1
+        const v = byte ? (buf[i] - 128) / 128 : buf[i];
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / (n || 1));
+      if (!isFinite(rms) || rms <= 0) return;              // 静音/未开播，别把增益推到最大
+      // 指数平滑：单帧采样抖动很大，平滑后才不会出现「呼吸式」音量起伏
+      this._rms = this._rms ? this._rms * 0.75 + rms * 0.25 : rms;
       this._applyGain();
     },
     _applyGain() {
       if (!this.gainNode) return;
       let g = 1;
-      if (this._normalize) {
-        // 在线流通常压得比较狠，本地导入往往偏轻；按来源给一个温和的补偿
-        const src = this.track && this.track.source;
-        g = src === 'online' ? 1.0 : 1.0;
-        // 有实测 RMS 就用实测值（见 _measureLoudness），否则保持 1.0 不做假动作
-        if (this._rms) {
-          const target = 0.125;                    // 约 -18 dBFS，常见的舒适中位
-          g = Math.max(0.5, Math.min(2.0, target / this._rms));
-        }
+      if (this._normalize && this._rms && this.analyser) {
+        const target = 0.125;                              // 约 -18 dBFS，常见的舒适中位
+        g = Math.max(0.5, Math.min(2.0, target / this._rms));
       }
+      this._appliedGain = g;
       try { this.gainNode.gain.value = g; } catch (e) {}
     },
 
@@ -197,11 +306,21 @@
       const nx = this.queue[(this.index + 1) % this.queue.length];
       if (!nx || !nx.src) return;                   // 在线曲目还没解析地址，预取没有意义
       if (this._prefetchSrc === nx.src) return;
-      this._prefetchSrc = nx.src;
       try {
-        const el = nx.source === 'online' ? this.elA : this.elB;
+        const el = this._pickEl(nx);   // 和 load() 用同一套路由（含 B-4 的 elC）
         if (el === this.el) return;                 // 同一个元素正在放当前的歌，别动它
-        if (this._prefetchEl && this._prefetchEl !== el) this._prefetchEl.removeAttribute('src');
+        /*
+         * B-3：清空上一个预取元素之前，必须确认它不是「正在播放的那一个」。
+         * 旧代码只保护了要写入的 el，没保护要被清空的 _prefetchEl：
+         * 队列 [在线 O1, 本地 L2, 在线 O3] 切到 L2 时，_prefetchEl 仍然是 elB，
+         * 而 elB 此刻正在播 L2 —— removeAttribute('src') 直接把正在听的歌切断。
+         * 修法：遇到「受害者在播」就跳过清空这一步（不腾位置也不影响写入目标元素），
+         * 预取照常进行 —— 只删掉那一句破坏性的调用，而不是放弃整个预取。
+         */
+        if (this._prefetchEl && this._prefetchEl !== el && this._prefetchEl !== this.el) {
+          this._prefetchEl.removeAttribute('src');
+        }
+        this._prefetchSrc = nx.src;
         el.preload = 'auto';
         el.src = nx.src;
         this._prefetchEl = el;
@@ -209,9 +328,29 @@
       } catch (e) {}
     },
 
+    /**
+     * 设置播放速度。
+     *
+     * 以前只写 elA / elB 两个元素，漏了**当前正在播放的 el**
+     * —— 而 _pickEl() 可能会路由到 elC（跨域直链那一个）。
+     * 于是设置面板里拖速度，界面上数字变了，正在放的这首却毫无变化，
+     * 要切一首歌才生效（因为 load() 会重新读 settings.speed）。
+     */
     setRate(r) {
-      this.elA.playbackRate = r;
-      this.elB.playbackRate = r;
+      const v = Number(r) || 1;
+      this.elA.playbackRate = v;
+      this.elB.playbackRate = v;
+      if (this.elC) this.elC.playbackRate = v;
+      /* 当前在播的那个元素单独再写一次：它可能是 elC，也可能与上面重复，写两次无害 */
+      if (this.el) {
+        try { this.el.playbackRate = v; } catch (e) {}
+      }
+      /* 同步进设置，保证「切歌后仍然保持这个速度」（load() 读的就是它） */
+      try {
+        if (g.Store && g.Store.state && g.Store.state.settings) {
+          g.Store.state.settings.speed = v;
+        }
+      } catch (e) {}
     },
 
     time() {
@@ -245,6 +384,9 @@
       const el = this._pickEl(track);
       const switching = el !== this.el;
       if (switching) {
+        /* B-5：切歌前把在飞的淡入淡出停掉，否则它会继续往新元素写音量 */
+        clearInterval(this._fadeTimer);
+        this._fading = false;
         try { this.el.pause(); } catch (e) {}
         this.el = el;
       }
@@ -261,9 +403,18 @@
       el.playbackRate = g.Store.state.settings.speed || 1;
       el.volume = this._targetVol == null ? 0.85 : this._targetVol;
       // 只有 blob / 同源音源才接 WebAudio（见 _canGraph：跨域无 CORS 会被静音）
-      if (this._canGraph(track)) this._ensureGraph(this.elB);
+      if (this._canGraph(track)) {
+        this._ensureGraph(this.elB);
+        /* B-6：建图时每个滤波器增益都是 0，而 EQ 从不在 track 变化时重新下发，
+           所以「启动后播放的第一首本地歌」永远听不到用户选的预设，
+           设置页却显示已启用。这里建图之后立刻补一次。 */
+        this._reapplyEQ();
+      }
       this._emit('track', track);
       this._updateMediaSession();
+      // 换歌后旧歌的 RMS 不再有效，清掉重新实测（第一帧测量前保持 1.0 不做假动作）
+      this._rms = 0;
+      this._rmsAt = 0;
       this._applyGain();
       if (autoplay) this.play();
       this._prefetchNext();
@@ -390,17 +541,30 @@
       this._emit('time', this.time());
     },
 
+    /*
+     * B-5：淡入淡出必须锁定「发起时的那一个元素」。
+     * 原来的实现全程读 this.el，而 this.el 会在 load() 里被换成另一个元素：
+     *   · 暂停后 0.4s 内点下一首 → 淡出回调 pause() 的是刚切过去的新歌
+     *   · 淡入期间切歌 → 旧曲线继续往新元素写音量 → 新歌先没声音再突然跳正常
+     * 现在锁住 el，并在发现 el 已经不是当前元素时直接放弃。
+     */
     _fadeTo(target, secs, done) {
-      if (!this.el) return;
+      const el = this.el;
+      if (!el) return;
       clearInterval(this._fadeTimer);
-      if (!secs) { this.el.volume = target; this._fading = false; done && done(); return; }
+      if (!secs) { el.volume = target; this._fading = false; done && done(); return; }
       this._fading = true;
-      const from = this.el.volume;
+      const from = el.volume;
       const t0 = performance.now();
       const dur = secs * 1000;
       this._fadeTimer = setInterval(() => {
+        if (el !== this.el) {              // 已经切歌：这条曲线作废
+          clearInterval(this._fadeTimer);
+          this._fading = false;
+          return;
+        }
         const k = Math.min(1, (performance.now() - t0) / dur);
-        this.el.volume = from + (target - from) * k;
+        el.volume = from + (target - from) * k;
         if (k >= 1) {
           clearInterval(this._fadeTimer);
           this._fading = false;
@@ -429,6 +593,15 @@
       this.load(track, autoplay);
       g.Store.pushHistory(track);
       g.Store.save();
+      /*
+       * 第 17 条：漫游模式「播到列表末尾自动续加」。
+       * 以前只在 _onEnded（一首歌自然播完）时才 emit needmore，
+       * 所以手动点下一首、或直接播到最后一首时不会续队列；
+       * 而且续队列是异步的，等它回来时 next() 早就按旧队列到头、pause 了。
+       * 这里改成「每次切歌都通知一次」——App 那边只在漫游/心动且剩余 <= 3 首时才动，
+       * 于是进入最后一首的瞬间就会开始续，等下歌时队列已经变长了。
+       */
+      this._emit('needmore', track);
     },
 
     next(auto = false) {
@@ -451,6 +624,8 @@
     },
 
     prev() {
+      // L-20：空队列时 index 会算成 -1，playAt(queue, -1) 静默无操作 —— 死按钮
+      if (!this.queue || !this.queue.length) return;
       if (this.time() > 3) { this.seek(0); return; }
       let i = this.index - 1;
       if (i < 0) i = this.queue.length - 1;
@@ -468,7 +643,22 @@
       cancelAnimationFrame(this._raf);
       const tick = () => {
         if (!this.playing) return;
-        this._emit('time', this.time());
+        /*
+         * 重要：这里以前每个动画帧（≈60 次/秒）都 emit('time')，
+         * 而 'time' 的监听者会写进度条宽度、旋钮位置、两个时间文本，
+         * 再跑一遍歌词二分/线性扫描 —— 秒级精度根本不需要 60Hz，
+         * 白白制造了每秒几百次样式写入与重排，是「只有 30 帧」的主要嫌疑之一。
+         * 现在限到 10Hz（100ms），进度条依然顺滑，DOM 写入少了 6 倍。
+         */
+        const now = performance.now();
+        if (now - (this._timeAt || 0) >= 100) {
+          this._timeAt = now;
+          this._emit('time', this.time());
+        }
+        // 归一化：每 500ms 实测一次 RMS 并更新增益（同一帧循环里限频，不另开定时器）
+        if (this._normalize && this.analyser) {
+          if (now - (this._rmsAt || 0) > 500) { this._rmsAt = now; this._measureLoudness(); }
+        }
         this._raf = requestAnimationFrame(tick);
       };
       this._raf = requestAnimationFrame(tick);
@@ -498,7 +688,27 @@
     updatePositionState() {
       if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
       const d = this.duration();
-      if (!d || !isFinite(d)) return;
+      /*
+       * 以前 duration 没就绪（0 / NaN）时直接 return ——
+       * 而锁屏和通知栏的进度条只在 setPositionState 被调用后才显示，
+       * 于是一首还在加载元数据的歌会在通知栏上**永远停在 0**，
+       * 用户以为播放卡住了。
+       *
+       * 现在没拿到 duration 时用一个「至少 1 秒」的占位，把 position 也钳住，
+       * 让系统能画出「刚开始播」的样子；duration 一就绪就自动恢复正常值。
+       */
+      if (!d || !isFinite(d) || d <= 0) {
+        try {
+          const pos = Math.max(0, this.time());
+          navigator.mediaSession.setPositionState({
+            duration: Math.max(pos + 1, 1),
+            playbackRate: this.el.playbackRate || 1,
+            position: Math.min(pos, Math.max(pos + 1, 1)),
+          });
+          navigator.mediaSession.playbackState = this.playing ? 'playing' : 'paused';
+        } catch (e) {}
+        return;
+      }
       try {
         navigator.mediaSession.setPositionState({
           duration: d, playbackRate: this.el.playbackRate || 1,
@@ -520,7 +730,17 @@
     sleep(minutes, cb) {
       clearInterval(this._sleepTimer);
       this._sleepAt = 0;
-      if (!minutes) { this._sleepCb = null; return; }
+      if (!minutes) {
+        /*
+         * F-2：取消睡眠定时必须把持久化的结束时刻一起清掉。
+         * 旧代码在这里直接 return，Store 里的 sleepUntil 仍是旧值，
+         * 下次启动 restoreSleep() 读到它就又把定时器复活了 ——
+         * 界面显示「关闭」，到点却照样暂停。
+         */
+        this._sleepCb = null;
+        try { g.Store.set('sleepUntil', 0); } catch (e) {}
+        return;
+      }
       this._sleepCb = cb || null;
       this._sleepAt = Date.now() + minutes * 60000;
       try { g.Store.set('sleepUntil', this._sleepAt); } catch (e) {}

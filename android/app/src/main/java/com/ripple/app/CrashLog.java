@@ -31,6 +31,20 @@ import java.util.Locale;
 final class CrashLog {
 
     private static final Object LOCK = new Object();
+
+    /*
+     * 轨迹落盘的节流参数。
+     * 以前每一步都 writeDownloads()：MediaStore 查询 + openOutputStream 全量重写，
+     * 而 MainActivity.onCreate 里就有十来次 step，冷启动光在写文件上就跨进程好几趟。
+     * 现在内存里照常累积，只在「攒够 8 步」或「距上次落盘超过 5 秒」时才写一次；
+     * 崩溃（record / flushTrace）仍然保证拿到完整轨迹。
+     * 保留条数上限而不是纯时间窗口，是因为 native 崩溃来不及走 flushTrace，
+     * 下载目录里那份必须自己跟上关键启动步骤。
+     */
+    private static final long FLUSH_WINDOW_MS = 5000;
+    private static final int FLUSH_EVERY_STEPS = 8;
+    private static long lastFlushAt = 0;
+    private static int stepsSinceFlush = 0;
     static volatile String lastTrace = "";
 
     private static final StringBuilder TRACE = new StringBuilder();
@@ -41,13 +55,20 @@ final class CrashLog {
 
     /* ================= 启动轨迹 ================= */
 
-    /** 记一步（写内存 + 覆盖写 Download/Ripple-trace.txt） */
+    /** 记一步（只在内存累积，按步数/时间窗口节流落盘） */
     static void step(Context ctx, String what) {
         synchronized (LOCK) {
             traceStep++;
             TRACE.append(traceStep).append(". ")
                     .append(new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date()))
                     .append("  ").append(what).append('\n');
+            stepsSinceFlush++;
+            long now = System.currentTimeMillis();
+            boolean byCount = stepsSinceFlush >= FLUSH_EVERY_STEPS;
+            boolean byTime = now - lastFlushAt >= FLUSH_WINDOW_MS;
+            if (!byCount && !byTime) return;
+            stepsSinceFlush = 0;
+            lastFlushAt = now;
             try {
                 writeDownloads(ctx, "trace", TRACE.toString(), true);
             } catch (Throwable ignored) {
@@ -57,6 +78,8 @@ final class CrashLog {
 
     static void flushTrace(Context ctx) {
         synchronized (LOCK) {
+            lastFlushAt = System.currentTimeMillis();
+            stepsSinceFlush = 0;
             try {
                 writePrivate(ctx, "trace", TRACE.toString());
                 writeDownloads(ctx, "trace", TRACE.toString(), true);
@@ -96,7 +119,7 @@ final class CrashLog {
         pw.println("== Ripple crash " + stamp() + " ==");
         pw.println("tag: " + tag);
         pw.println("sdk: " + Build.VERSION.SDK_INT + "  device: " + Build.MANUFACTURER + " " + Build.MODEL);
-        pw.println("version: 1.0.0 (" + 100 + ")");
+        pw.println("version: 1.1.0 (" + 110 + ")");
         pw.println();
         e.printStackTrace(pw);
         pw.println();

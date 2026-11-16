@@ -1,5 +1,5 @@
 {
   "_comment": "唯一的版本号来源。改版本只改这里，然后跑 bash android/build-apk.sh（它会自动同步 Gradle / Java / 网页）。",
-  "versionCode": 100,
-  "versionName": "1.0.0"
+  "versionCode": 110,
+  "versionName": "1.1.0"
 }

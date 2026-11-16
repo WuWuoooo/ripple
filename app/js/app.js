@@ -17,13 +17,26 @@
     onlinePlaylists: null,
     _paletteSeq: 0,
     _dailyCache: null,
+    /* hero 的漫游数据（见 loadRoamHero） */
+    _roamHero: null,
+    _roamHeroSeed: '',
+
     _dailyAt: 0,
     _topCache: null,
     _plCache: new Map(),   // plId -> 歌单详情
   };
 
   /* ================= 启动 ================= */
+  let _booted = false;
   async function boot() {
+    /*
+     * 防重入：DOMContentLoaded 与某些内核的 onPageFinished 都会推一次启动，
+     * 重复执行 boot 会把 Player.init() 里的两个 <audio> 丢掉重建、
+     * 并把下面那个 1 秒定时器再挂一份 —— 表现就是启动后立刻翻倍的
+     * BARS: send / 每秒两次跨桥。这里保证只跑一次。
+     */
+    if (_booted) return;
+    _booted = true;
     Log.add('BOOT', 'start, mode=' + Netease.mode + ' native=' + !!window.RippleNative);
     Store.load();
     applyTheme();
@@ -52,32 +65,111 @@
     try {
       const N = window.RippleNative;
       if (N && typeof N.safeMode === 'function' && N.safeMode()) {
-        toast('已进入安全模式', '上次启动异常，本次关闭全屏铺边；连续正常启动后会恢复', 'warn');
+        /*
+         * safeMode 的症状很有辨识度：视口比正常矮约 60px、状态栏区域
+         * 不被网页背景覆盖、整页内容往下移一截。用户完全不知道是为什么。
+         *
+         * 提示里直接给出自救入口（点一下调 clearSafeMode 清计数），
+         * 而不是让用户一直停在降级状态里。
+         */
         Log.add('BOOT', 'safeMode is ON');
+        toastBottom('当前是安全模式', '状态栏未铺满、页面下移；点这里恢复正常', 'warn', 9000);
+        const tip = $('#toastsBottom .toast:last-child');
+        if (tip) {
+          tip.style.pointerEvents = 'auto';
+          tip.style.cursor = 'pointer';
+          tip.addEventListener('click', () => {
+            try {
+              const ok = N.clearSafeMode ? N.clearSafeMode() : false;
+              if (ok) {
+                tip.remove();
+                toastBottom('已恢复', '下次打开软件就是完整全屏', 'check');
+              } else {
+                toast('恢复失败', '可以到「我的 → 软件日志」把信息发给开发者', 'warn');
+              }
+            } catch (e) {
+              toast('恢复失败', String(e && e.message || e), 'warn');
+            }
+          });
+        }
       }
     } catch (e) {}
 
-    const d = new Date();
-    $('#helloDate').textContent =
-      d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0') +
-      ' · 星期' + '日一二三四五六'[d.getDay()];
+    renderClock();
     $('#helloTitle').textContent = greet() + '，欢迎回来';
 
     syncConnectionUI();
     refreshSystemBars();
     Log.add('BOOT', 'ready, logPath=' + Log.path());
-    setTimeout(refreshSystemBars, 400);
-    setTimeout(() => {
-      toast('Ripple 已就绪', Netease.ready ? '真网易云接口 · 可登录你的账号' : '在线功能不可用', 'info');
-    }, 900);
+    /* 进入软件不再弹「Ripple 已就绪」：每次启动都出现，纯噪音。
+      在线接口不可用的情况在顶部连接状态区已有常驻标识。 */
     registerSW();
-    setInterval(() => {
-      Player.updatePositionState();
+    /*
+     * L-18：全局 1 秒定时器。
+     * 以前它无条件跑：后台时照样每秒写 5 个 DOM 节点、并跨桥推进度，
+     * 把原生侧 pauseTimers 的努力抵消掉。现在后台直接跳过；
+     * 跨桥调用本身也加了值级幂等（见 pushMediaState / pushSbProgress）。
+     * 句柄存下来，回到前台立刻补一次，避免进度显示停在离开时的那一秒。
+     */
+    /*
+     * 左上角「时间 · 星期」。
+     *
+     * 以前只在 boot 时写一次，之后永远停在启动那一刻 ——
+     * 早上打开、晚上再看还是「08:12」，用户会以为软件没刷新或时间错了。
+     * 现在挂进每秒的 tick 里（那个定时器本来就在跑，成本几乎为零），
+     * 并且只在文本真的变了时才写 DOM，避免每秒都动一次布局。
+     *
+     * 跨天时星期也要跟着换，所以不能只更新分钟。
+     */
+    /*
+     * 注意：变量声明必须写在 boot 的最前面。
+     * renderClock() 在 boot() 中间就被调用了一次，而 `let` 声明在
+     * 同作用域里是「暂时性死区」（TDZ）—— 声明位置之前访问会直接抛
+     * ReferenceError，整个 boot 就此中断，页面看起来像「什么都没加载」。
+     * 这里把它提到函数开头（紧跟 boot 定义之后的位置）。
+     */
+    var _lastClock = '';
+    function renderClock() {
+      const el = $('#helloDate');
+      if (!el) return;
+      const d = new Date();
+      const txt = d.getHours().toString().padStart(2, '0') + ':'
+        + d.getMinutes().toString().padStart(2, '0')
+        + ' · 星期' + '日一二三四五六'[d.getDay()];
+      if (txt === _lastClock) return;
+      _lastClock = txt;
+      el.textContent = txt;
+    }
+
+    function startTicker() {
+      clearInterval(App._tickTimer);
+      App._tickTimer = setInterval(() => {
+        if (document.hidden) return;
+        renderClock();                             // 左上角时间每分钟（跨天含星期）自动更新
+        Player.updatePositionState();
+        updateTimes();
+        rememberProgress(false);
+        if (Player.track) pushMediaState(false);   // 通知栏进度条
+        pushSbProgress();                          // 状态栏歌词的填充进度
+      }, 1000);
+    }
+    /*
+     * H-4：以前只在回调里判断 document.hidden —— 定时器本身一直在跑，
+     * 后台每秒照样醒来两次。现在进后台直接 clearInterval（省电、减少后台唤醒），
+     * 回前台再重建并立刻对齐一次时间轴。
+     */
+    startTicker();
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        clearInterval(App._tickTimer);
+        App._tickTimer = null;
+        return;
+      }
+      startTicker();
       updateTimes();
-      rememberProgress(false);
-      if (Player.track) pushMediaState(false);   // 通知栏进度条
-      pushSbProgress();                          // 状态栏歌词的填充进度
-    }, 1000);
+      if (Player.track) pushMediaState(false);
+      pushSbProgress();
+    });
 
     // 启动后异步拉在线内容（失败不打扰）
     refreshAccount().then(() => {
@@ -131,19 +223,35 @@
     const bg = theme === 'light' ? '#F1EEEA' : '#07070B';
     const meta = $('meta[name="theme-color"]');
     if (meta) meta.content = bg;
-    syncSystemBars(bg, theme === 'light');
-    $('#btnTheme').innerHTML = resolvedTheme() === 'light'
+    /*
+     * 这里以前直接 syncSystemBars(bg)（写死的 #07070B），而 paletteFor /
+     * refreshSystemBars 用的是从 CSS 变量算出来的颜色 —— 同一个状态栏
+     * 一次启动被推两个不同的值，日志里就是成对的 BARS: send。
+     * 统一走 refreshSystemBars（同一帧内合并、值没变不重复跨桥）。
+     */
+    refreshSystemBars();
+    $('#btnTheme').innerHTML = theme === 'light'
       ? '<svg><use href="#i-moon"/></svg>' : '<svg><use href="#i-sun"/></svg>';
     $$('#themeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.theme === S().theme));
   }
 
-  /** 把窗口背景色同步给原生状态栏（否则顶上会是一条纯黑） */
-  function syncSystemBars(bg, lightTheme) {
+  /**
+   * 把窗口背景色同步给原生状态栏（否则顶上会是一条纯黑）。
+   *
+   * 跨桥调用是启动期最主要的重复开销：一次启动里 applyTheme / renderAll /
+   * paletteFor / refreshSystemBars 各自都会调一次，日志里就是两三秒内好几条
+   * `BARS: send`。这里做值级幂等 —— 颜色和明暗都没变就不再跨桥、不再写日志。
+   */
+  let _lastBarsKey = '';
+  function syncSystemBars(bg, lightTheme, force) {
     const N = window.RippleNative;
     if (!N || typeof N.systemBars !== 'function') {
       Log.add('BARS', 'no native bridge, skip ' + bg);
       return;
     }
+    const key = bg + '|' + (lightTheme ? 1 : 0);
+    if (!force && key === _lastBarsKey) return;   // 值没变：不跨桥、不写日志
+    _lastBarsKey = key;
     try {
       N.systemBars(bg, bg, !!lightTheme);
       Log.add('BARS', 'send ' + bg + ' light=' + !!lightTheme);
@@ -191,9 +299,19 @@
     return null;
   }
 
-  /** 页面/取色变化后刷新状态栏 */
+  /**
+   * 页面/取色变化后刷新状态栏。
+   * 注意 currentBarColor() 会 getComputedStyle 读 CSS 变量 —— 本身不便宜，
+   * 而它被 applyTheme / paletteFor / go() / openNP / closeNP 各调一次。
+   * 这里合并同一帧内的多次调用（批量提交），避免启动与切歌时连续读样式。
+   */
+  let _barsRaf = 0;
   function refreshSystemBars() {
-    syncSystemBars(currentBarColor(), resolvedTheme() === 'light');
+    if (_barsRaf) return;
+    _barsRaf = requestAnimationFrame(() => {
+      _barsRaf = 0;
+      syncSystemBars(currentBarColor(), resolvedTheme() === 'light');
+    });
   }
 
   /** 按设置里的 eq / eqCustom 真正下发到音频图 */
@@ -204,12 +322,50 @@
     } else {
       Player.setEQ(s.eq);
     }
+    /*
+     * F-5：均衡器状态有两个显示面（设置页那一行 + 弹层面板），
+     * 而 renderEQ() 以前只在「打开面板」时执行。于是在别处改了 EQ
+     * （恢复默认设置、切歌导致可用性变化）后，面板/那一行显示的还是旧状态。
+     * 这里统一收口：下发完就同步两个显示面（面板关着时不重建，省开销）。
+     */
+    refreshEQUI();
+  }
+
+  /**
+   * 均衡器的显示面统一刷新：
+   * · 设置页那一行（文本，便宜，总是刷）
+   * · 弹层面板（贵，只在打开时重建）
+   */
+  function refreshEQUI() {
+    /* H-11：以前这两个 catch 是空的 —— 面板空白时日志里什么都没有，没法排查 */
+    try { syncEQHint(); } catch (e) { if (window.Log) Log.err('EQ', e, 'syncEQHint'); }
+    const sheet = $('#eqSheet');
+    if (sheet && sheet.classList.contains('on')) {
+      try { renderEQ(); } catch (e) { if (window.Log) Log.err('EQ', e, 'renderEQ'); }
+    }
   }
 
   function applyVars() {
     const r = document.documentElement.style;
     const k = Math.max(0.4, Math.min(2.5, Number(S().animSpeed) || 1));
     r.setProperty('--glass-blur', S().glassBlur + 'px');
+    /*
+     * 液态玻璃强度：把「玻璃强度」滑块的 0~40px 折算成 0~1。
+     *
+     * 为什么需要这个额外的量：blur 的 px 值只控制「模糊多大」，
+     * 而液态玻璃还有折射位移、反射高光、按压响应这一整套 ——
+     * 它们都应该跟着同一个滑块一起变强变弱，不能只改模糊。
+     * 用 0~1 的归一化值去缩放这三项的幅度（见 base.css 的液态玻璃段落）。
+     *
+     * 40px 是滑块上限，对应「最强」；0 就是完全没有玻璃效果。
+     */
+    const gs = Math.max(0, Math.min(1, (Number(S().glassBlur) || 0) / 40));
+    r.setProperty('--glass-strength', gs.toFixed(3));
+    /*
+     * 强度为 0 时给 <html> 挂 lg-off，CSS 那边据此彻底关掉 backdrop-filter。
+     * 这不只是省性能 —— 强度 0 时还保留模糊会显得参数没生效。
+     */
+    document.documentElement.classList.toggle('lg-off', gs <= 0.02);
     r.setProperty('--anim', k);
     /* 动画速度拆成三档时长，CSS 里按用途取用：
        --dur    普通过渡（背景、颜色、悬停）
@@ -219,6 +375,14 @@
     r.setProperty('--dur', (0.42 / k).toFixed(2) + 's');
     r.setProperty('--dur-s', (0.22 / k).toFixed(2) + 's');
     r.setProperty('--dur-l', (0.52 / k).toFixed(2) + 's');
+    /*
+     * 展开/收回（封面 + 歌词）单独一档：基准 .3s，随速度倍率缩放，
+     * 但**上限 0.3s** —— 主人要求这段动画不超过 0.3 秒，
+     * 以前速度调到 0.5× 会变成 0.6s。
+     */
+    r.setProperty('--dur-ani', Math.min(0.3, 0.3 / k).toFixed(2) + 's');
+    /* 内置调参器如果存了自定义曲线/时长，让它覆盖掉上面的默认值 */
+    try { if (window.RippleAnimTune && RippleAnimTune.override) RippleAnimTune.override(r); } catch (e) {}
     r.setProperty('--lyric-size', S().lyricSize + 'px');
   }
 
@@ -279,6 +443,15 @@
   }
 
   function paletteFor(track) {
+    /*
+     * 取色是唯一「要下封面图 + 画进 canvas + 读像素」的路径，
+     * 而 paletteFor 会被 Player.on('track') / applyTheme / 系统主题变化各调一次，
+     * 同一首歌常常连着跑两三遍（启动期尤其明显）。
+     * 这里按「曲目签名 + 主题 + 动态色开关」做幂等：同一份输入直接跳过。
+     */
+    const sig = (track ? coverOf(track) : '') + '|' + resolvedTheme() + '|' + (S().dynamicColor ? 1 : 0);
+    if (sig === App._paletteSig) return;
+    App._paletteSig = sig;
     if (!S().dynamicColor) {
       const root = document.documentElement.style;
       const theme = resolvedTheme();
@@ -347,11 +520,46 @@
   }
 
   function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    // F-17：补上单引号转义。属性里用双引号时单引号不影响，但只要有一处
+    // 写成单引号属性（或拼接进 onclick 之类），不转义就是注入点。
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  /**
+   * F-4：封面 URL 是唯一没走 esc() 就直接进 innerHTML 的字段（在线曲目来自
+   * 网易云返回的 picUrl）。这里统一过一遍：只放行 http/https/相对地址/data:image，
+   * 其他协议（javascript:、file: 等）一律退回内置渐变色封面。
+   */
+  function safeCoverUrl(url) {
+    const s = String(url == null ? '' : url).trim();
+    if (!s) return '';
+    if (/^(https?:)?\/\//i.test(s) || /^data:image\//i.test(s)) return s;
+    /*
+     * 相对路径（assets/a.png、./x.png、../x.png）没有协议头，是安全的；
+     * 判断方式：第一个 '/' 之前不出现 ':'，就不会是 javascript:/vbscript:/file:。
+     */
+    const head = s.split('/')[0];
+    if (head.indexOf(':') < 0 && !/^\s*javascript:/i.test(s)) return s;
+    return '';                                    // 其他协议：丢弃，调用方会退回默认封面
+  }
+
+  /** 进 innerHTML 属性用（还要做 HTML 转义） */
+  function safeCover(url) {
+    return esc(safeCoverUrl(url));
+  }
+
+  /** 进 style.backgroundImage 用（不能做 HTML 转义，否则 URL 里的 & 会被写坏） */
+  function cssUrl(url) {
+    const s = safeCoverUrl(url);
+    if (!s) return '';
+    /* H-14：只转义 \ 和 " 不够 —— 含 ) 会直接截断 url()，换行/控制字符同理 */
+    return 'url("' + s.replace(/[\\"()\u0000-\u001f\u007f]/g, '') + '")';
   }
 
   function artHTML(t, cls) {
-    return `<div class="${cls} art"><img src="${coverOf(t)}" alt="" loading="lazy"><div class="ripple"></div></div>`;
+    const cover = safeCover(coverOf(t));
+    return `<div class="${cls} art"><img src="${cover}" alt="" loading="lazy"><div class="ripple"></div></div>`;
   }
 
   function rowHTML(t, i, isOn) {
@@ -386,7 +594,8 @@
   }
 
   function plRowHTML(p) {
-    return `<div class="plrow" data-pl="${p.plId}">
+    // F-17：data-pl 以前是裸插（esc 也只管 title/sub），属性值一律走 esc()
+    return `<div class="plrow" data-pl="${esc(p.plId)}">
       ${artHTML(p, 'th')}
       <div class="tx"><b>${esc(p.title)}</b><span>${esc(p.sub || '')}${p.creator ? ' · ' + esc(p.creator) : ''}</span></div>
       <div class="go"><svg><use href="#i-chev-right"/></svg></div>
@@ -406,34 +615,235 @@
   }
 
   /* ================= 首页 ================= */
+  /*
+   * 首页 / 曲库的「数据签名短路」。
+   * 切歌时 Player.on('track') 会调 renderHome() + renderLibrary()，
+   * 而这两个函数以前无条件 innerHTML 重建整块列表 —— 平板上 300 首曲库
+   * 每切一次歌就要重新布局一遍几百个行节点。现在先算签名：
+   * 曲目集合、当前曲目、筛选/分组都没变就直接返回，一次 DOM 都不碰。
+   */
+  function listSig(list, extra) {
+    let h = 0;
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i];
+      const s = t.id + '\u0001' + (t.title || '') + '\u0001' + (t.artist || '') + '\u0001' + (t.album || '')
+        + '\u0001' + (t.cover || '') + '\u0001' + (t.duration || 0) + '\u0001' + (t.format || '') + '\u0001' + (t.vip ? 1 : 0);
+      for (let k = 0; k < s.length; k++) h = (h * 31 + s.charCodeAt(k)) | 0;
+      h = (h * 31 + i) | 0;
+    }
+    return (extra || '') + '|' + list.length + '|' + h;
+  }
+
+  /*
+   * ============ hero 的漫游数据 ============
+   *
+   * 拉「从某个种子出发的相似歌曲」，取第一首当 hero 的展示内容。
+   *
+   * 两个要点：
+   *   ① 结果按种子 id 缓存，同一种子不重复请求（切歌回来不会重打接口）；
+   *   ② 冷启动时先用 localStorage 里上一次的结果，网络回来再平滑替换 ——
+   *      否则每次进软件 hero 都先空一块（用户报过这个）。
+   */
+  function pickSeedForRoam() {
+    const cur = Player.track;
+    if (cur && cur.source === 'online' && cur.neId) return cur;
+    /* ② 我喜欢的第一首在线歌 —— liked 里存的是 id，需要找回到曲目对象 */
+    const liked = Store.state.liked || [];
+    for (let i = 0; i < liked.length; i++) {
+      const id = liked[i];
+      if (String(id).indexOf('ne_') !== 0) continue;   // 只取在线曲目
+      const t = findTrack(id) || Store.cached().find((x) => x.id === id);
+      if (t && t.neId) return t;
+    }
+    /* ③ 每日推荐里随机一首（按天固定，同一天内不跳） */
+    const daily = App._dailyCache;
+    if (daily && daily.length) {
+      const d = new Date();
+      const dayKey = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+      const t = daily[dayKey % daily.length];
+      if (t && t.neId) return t;
+    }
+    return null;
+  }
+
+  const ROAM_HERO_KEY = 'ripple.roamHero.v1';
+  let _roamHeroBusy = false;
+
+  function loadRoamHeroCache() {
+    try {
+      const raw = localStorage.getItem(ROAM_HERO_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (!o || !o.track) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+
+  function saveRoamHeroCache(seedId, track) {
+    try {
+      localStorage.setItem(ROAM_HERO_KEY, JSON.stringify({
+        seedId: seedId, track: track, at: Date.now(),
+      }));
+    } catch (e) {}
+  }
+
+  /**
+   * 拉取漫游 hero。seed 为 null 时什么都不做（没种子就显示兜底卡片）。
+   * force 为真时忽略「同种子已缓存」的短路（用户点刷新/切歌后强制更新）。
+   */
+  async function loadRoamHero(seed, force) {
+    if (!seed || !seed.neId) { App._roamHero = null; return null; }
+    if (!Netease.ready) return null;
+    /* 同一个种子已经拉过：直接复用，不重复打接口 */
+    if (!force && App._roamHeroSeed === seed.neId && App._roamHero) return App._roamHero;
+    if (_roamHeroBusy) return App._roamHero;
+    _roamHeroBusy = true;
+    try {
+      const list = await Netease.roamSongs(seed.neId, 12);
+      /*
+       * 挑一首当 hero：跳过种子本身（否则封面和「当前播放」重复），
+       * 按天做确定性随机，同一天内不会每次刷新都跳。
+       */
+      const pool = list.filter((x) => x && x.neId && x.neId !== seed.neId);
+      const use = pool.length ? pool : list;
+      if (!use.length) return null;
+      const d = new Date();
+      const dayKey = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+      const picked = use[dayKey % use.length];
+      App._roamHero = picked;
+      App._roamHeroSeed = seed.neId;
+      saveRoamHeroCache(seed.neId, picked);
+      Log.add('ROAM', 'hero <- ' + picked.title + ' (seed ' + seed.title + ', ' + use.length + ' 候选)');
+      /* 数据变了必须重绘（清签名） */
+      App._homeSig = '';
+      renderHome();
+      return picked;
+    } catch (e) {
+      Log.err('ROAM', e, 'loadRoamHero seed=' + (seed && seed.neId));
+      return null;
+    } finally {
+      _roamHeroBusy = false;
+    }
+  }
+
+  /*
+   * 冷启动先把上次的漫游 hero 恢复出来。
+   * 这样首页第一帧就有封面，不用等网络回来（用户报过「重进没封面」）。
+   *
+   * 注意位置：必须放在 ROAM_HERO_KEY / loadRoamHeroCache 定义**之后**。
+   * 它们是 const/function 混用，`const` 在声明前访问会触发 TDZ 直接抛错，
+   * 而且这个错发生在 boot 阶段，会让整个首页渲染中断。
+   */
+  (function restoreRoamHero() {
+    try {
+      const c = loadRoamHeroCache();
+      if (c && c.track) {
+        App._roamHero = c.track;
+        App._roamHeroSeed = c.seedId || '';
+        Log.add('ROAM', 'hero restored from cache: ' + (c.track.title || ''));
+      }
+    } catch (e) { Log.err('ROAM', e, 'restoreRoamHero'); }
+  })();
+
   function renderHome() {
     const cur = Player.track;
     const rec = Store.recent(6);
     const list = (rec.length ? rec : Store.all()).slice(0, 6);
-    const hero = (App._dailyCache && App._dailyCache[0]) || list[0];
+    /*
+     * hero 的取图优先级：
+     *   ① 每日推荐第一首（有真实封面，最贴「今日推荐」的语义）
+     *   ② 最近播放 / 曲库里的第一首（也有真实封面）
+     *   ③ 都没有 → coverOf(undefined) 会给一张固定的渐变兜底图
+     *
+     * ①② 都能出真封面；只有全新安装、且在线推荐还没回来的那一两秒
+     * 会落到 ③。等推荐回来时必须重刷一次（见 loadHomeOnline）。
+     */
+    /*
+     * ============ hero：无限漫游的入口 ============
+     *
+     * hero 展示的是「漫游推荐里的一首歌」，点它直接开启漫游模式
+     * （把相似歌曲灌满队列），而不是只播这一首。
+     *
+     * 数据来自 Netease.roamSongs(seedId) —— 网易云的
+     * v1/discovery/simiSong（相似歌曲）。它**必须有种子歌曲**，所以按优先级取：
+     *   ① 当前正在播放的在线歌（最贴「你现在想听什么」）
+     *   ② 我喜欢的第一首在线歌
+     *   ③ 每日推荐里随机一首
+     *   ④ 都没有 → 只能显示普通的兜底卡片，点进去提示需要先播一首
+     *
+     * 漫游结果缓存在 App._roamHero，按种子 id 失效；
+     * 冷启动时先用上一次的缓存（App._roamHeroCache，落 localStorage），
+     * 避免「每次进来都是灰块」。
+     */
 
-    $('#heroArt').src = coverOf(hero);
+
+    const roamSeed = pickSeedForRoam();
+    const hourNow = new Date().getHours();
+    /*
+     * hero 当前展示的那首歌。
+     *
+     * 来源优先级：
+     *   ① 漫游回来的第一首（App._roamHero，见 loadRoamHero）
+     *   ② 种子歌本身（漫游还没回来 / 请求失败）
+     *   ③ coverOf(null) 的渐变兜底
+     *
+     * 缓存也参与：冷启动时先用 localStorage 里上一次的 hero，
+     * 网络回来再替换 —— 这样不会每次进软件都先空一块。
+     */
+    const roamHero = App._roamHero || null;
+    const hero = roamHero || roamSeed || null;
+    /*
+     * 签名必须包含封面的实际 URL：hero 会在「种子 → 漫游结果」之间切换，
+     * 如果只比较 id，切换瞬间可能算出相同签名导致不重绘，封面就停在旧图上。
+     */
+    const heroCoverSrc = coverOf(hero);
+    const sig = listSig(list, (cur ? cur.id : '') + '|' + hourNow
+      + '|' + (hero ? hero.id : '')
+      + '|' + (roamSeed ? roamSeed.id : '')
+      + '|' + (App._dailyCache ? App._dailyCache.length : 0) + '|' + (Netease.loggedIn ? 1 : 0)
+      + '|' + heroCoverSrc.length + '|' + heroCoverSrc.slice(-24));
+    if (sig === App._homeSig) return;          // 数据和当前曲目都没变：跳过整轮 DOM 写入
+    App._homeSig = sig;
+
+    /* 只在真的变了时才写 src：重复赋同一个 URL 也会触发一次加载/重绘，
+       首页每次 renderAll 都调这里，会造成封面轻微闪一下。 */
+    const artEl = $('#heroArt');
+    if (artEl && artEl.getAttribute('src') !== heroCoverSrc) artEl.src = heroCoverSrc;
     /*
      * 首页大标题以前写死「深夜的低频」，早上打开也是「深夜」，很出戏。
-     * 现在按时段给一句话，并且���日的歌有真实标题时优先用它。
+     * 现在按时段给一句话，并且今日的歌有真实标题时优先用它。
      */
-    const heroHour = new Date().getHours();
+    const heroHour = hourNow;
+    /*
+     * 主标题：hero 现在是「无限漫游」入口，文案也要跟着这个语义走 ——
+     * 按时段给一句「带你一直听下去」的邀请，而不是描述某首歌。
+     */
     const HERO_LINES = [
-      [5, '天快亮了，<br>再来最后一首'],
-      [9, '早晨的第一首，<br>慢慢醒过来'],
-      [12, '中午的间隙，<br>听点轻的'],
-      [14, '下午的光正好，<br>配一点低频'],
-      [18, '傍晚了，<br>让耳朵先回家'],
-      [22, '夜色上来，<br>和一点失真的暖意'],
-      [24, '深夜的低频，<br>和一点失真的暖意'],
+      [5, '天快亮了，<br>沿着这首歌听下去'],
+      [9, '早上好，<br>从一首歌出发'],
+      [12, '中午了，<br>让歌带你走一段'],
+      [14, '下午的光正好，<br>顺着歌单漫游'],
+      [18, '傍晚了，<br>让耳朵自己找下一首'],
+      [22, '夜色上来，<br>一直听下去'],
+      [24, '深夜很长，<br>歌会一首接一首'],
     ];
     const heroLine = (HERO_LINES.find(([h]) => heroHour < h) || HERO_LINES[HERO_LINES.length - 1])[1];
     $('#heroTitle').innerHTML = heroLine;
-    $('#heroKicker').textContent = Netease.loggedIn ? 'DAILY MIX' : '今日推荐';
-    const h = new Date();
-    $('#heroSub').textContent = App._dailyCache && App._dailyCache.length
-      ? `${h.getMonth() + 1} 月 ${h.getDate()} 日 · ${App._dailyCache.length} 首 · 来自你的口味`
-      : '根据你最近的播放生成';
+    /*
+     * hero 现在是**漫游入口**：
+     *   · kicker 写「无限漫游」，明确这一块是干什么的
+     *   · 副标题放当前展示的这首歌（漫游推荐 / 种子），点进去就按它漫游
+     */
+    $('#heroKicker').textContent = roamSeed ? '无限漫游' : '还没有可漫游的歌';
+    $('#heroSub').textContent = hero && hero.title
+      ? `${hero.title}${hero.artist ? ' · ' + hero.artist : ''}`
+      : '先播一首在线歌曲，或收藏几首，这里会从它们出发';
+    /* 主按钮文案也跟着变：它现在是「开启漫游」而不是「播放今天推荐」 */
+    const heroPlayBtn = $('#btnHeroPlay');
+    if (heroPlayBtn) {
+      heroPlayBtn.innerHTML = '<svg width="13" height="13"><use href="#i-infinite"/></svg>'
+        + (roamSeed ? '无限漫游' : '先播一首');
+    }
 
     $('#gridView').innerHTML = list.map((t) => gridHTML(t, cur && cur.id === t.id)).join('');
     /*
@@ -447,6 +857,20 @@
     }
   }
 
+  /**
+   * 第 12 条：首屏骨架。
+   * 以前首屏是一片空白等到每日推荐回来，看起来像卡死。
+   * 只给两个在线横滑区铺占位 —— 下面的网格有本地「最近播放」可以立刻填，
+   * 铺骨架反而会闪一下。
+   */
+  function renderSkeletonHome() {
+    const card = `<div class="c-card sk-card"><div class="sk-box"></div>
+      <i class="sk-line" style="width:70%"></i><i class="sk-line" style="width:44%"></i></div>`;
+    $('#carousel').innerHTML = card + card + card;
+    const tl = $('#toplistCarousel');
+    if (tl) tl.innerHTML = card + card + card;
+  }
+
   /** 拉在线首页内容：每日推荐 + 排行榜 */
   async function loadHomeOnline() {
     if (!Netease.ready) {
@@ -454,6 +878,8 @@
       $('#toplistCarousel').innerHTML = '<div class="c-card ghost">填好接口后再来</div>';
       return;
     }
+    // 首次加载、还没有任何缓存时先铺骨架（有缓存就不要闪）
+    if (!App._dailyCache && !App._topCache) renderSkeletonHome();
     // 每日推荐（10 分钟缓存，避免每次切页都打接口）
     if (!App._dailyCache || Date.now() - App._dailyAt > 600000) {
       try {
@@ -465,9 +891,39 @@
           renderCarousel(songs.slice(0, 10).map((t) => ({
             id: t.id, title: t.title, sub: t.artist, cover: t.cover, kind: '推荐',
           })), '暂无推荐');
+          /*
+           * 关键：推荐数据回来了必须重刷首页。
+           *
+           * 以前这里只更新了下面的横滑卡片，**没有重绘 hero** ——
+           * 于是开始那张「和一点失真的暖意」大卡片会一直停在
+           * 启动瞬间的兜底图（一块灰色渐变色块），
+           * 直到用户切页面、切歌才碰巧重绘一次。
+           * 这就是「每次重进软件随机卡片都没有歌曲封面」。
+           */
+          App._homeSig = '';        // 清掉签名，强制 renderHome 真的跑
+          renderHome();
+          /*
+           * 推荐回来了 → 现在有稳定的种子了，顺手拉一次漫游 hero。
+           * 不 await：hero 换图是锦上添花，不该挡住下面的卡片渲染。
+           */
+          loadRoamHero(pickSeedForRoam()).catch(() => {});
+          /* 封面是网络图，回来再补一次：首帧可能还是占位 */
+          const artEl = $('#heroArt');
+          if (artEl && songs[0] && songs[0].cover) {
+            const want = coverOf(songs[0]);
+            artEl.onload = null;
+            if (artEl.getAttribute('src') !== want) artEl.src = want;
+          }
         }
       } catch (e) {
         renderCarousel([], e.needLogin ? '登录后可见每日推荐' : '推荐加载失败');
+        /*
+         * 推荐失败了，但 hero 不该停在那张渐变兜底图上 ——
+         * 只要本地有播放记录/曲库，就用它们的封面。
+         * 用户重进软件时大部分情况是有历史记录的，这样至少不会是一块灰。
+         */
+        App._homeSig = '';
+        renderHome();
       }
     } else if (App._dailyCache.length) {
       renderCarousel(App._dailyCache.slice(0, 10).map((t) => ({
@@ -488,6 +944,13 @@
     $('#toplistCarousel').innerHTML = App._topCache && App._topCache.length
       ? carouselHTML(App._topCache)
       : '<div class="c-card ghost">榜单加载失败<br>下拉重试</div>';
+    /*
+     * 每日推荐是在启动之后异步回来的，而 renderHome 的 hero 封面取的是
+     * App._dailyCache[0]。以前这里不重刷首页，于是首屏大图永远是「最近播放」
+     * 的封面，要等下一次切歌才换成每日推荐。现在签名的输入里已经包含
+     * _dailyCache 的长度，重刷一次很便宜（数据没变会直接短路）。
+     */
+    renderHome();
   }
 
   function renderCarousel(items, emptyText) {
@@ -508,6 +971,11 @@
     const list = libFiltered();
     const cur = Player.track;
     const seg = App._libSeg || 'songs';
+    // 数据签名没变就直接返回：切歌时只有「当前曲目高亮」会变，
+    // 曲目集合没变就不该重建几百行 DOM（平板上这是切歌卡顿的主因之一）
+    const sig = listSig(list, seg + '|' + (cur ? cur.id : '') + '|' + (App.filter || ''));
+    if (sig === App._libSig) return;
+    App._libSig = sig;
     if (seg !== 'songs') {
       renderLibGrouped(list, seg, cur);
       return;
@@ -533,7 +1001,7 @@
       const rows = [...map.values()];
       $('#libList').innerHTML = rows.length
         ? rows.map((e) => `<div class="row" data-album="${esc(e.album)}">
-            <div class="r-th art"><img src="${esc(coverOf(e.first))}" alt="" loading="lazy"></div>
+            <div class="r-th art"><img src="${safeCover(coverOf(e.first))}" alt="" loading="lazy"></div>
             <div class="r-tx"><b>${esc(e.album)}</b><span>${esc(e.artist)} · ${e.n} 首</span></div>
           </div>`).join('')
         : `<div class="empty"><b>还没有专辑</b><p>导入本地音乐或播放网易云曲目后会出现在这里</p></div>`;
@@ -550,7 +1018,7 @@
       const rows = [...map.values()];
       $('#libList').innerHTML = rows.length
         ? rows.map((e) => `<div class="row" data-artist="${esc(e.artist)}">
-            <div class="r-th art"><img src="${esc(coverOf(e.first))}" alt="" loading="lazy"></div>
+            <div class="r-th art"><img src="${safeCover(coverOf(e.first))}" alt="" loading="lazy"></div>
             <div class="r-tx"><b>${esc(e.artist)}</b><span>${e.n} 首</span></div>
           </div>`).join('')
         : `<div class="empty"><b>还没有艺人</b><p>导入本地音乐或播放网易云曲目后会出现在这里</p></div>`;
@@ -592,19 +1060,43 @@
   }
 
   function renderSearchDefaults() {
-    $('#hotWords').innerHTML = ['周杰伦', '草东没有派对', 'City Pop', '陈粒', 'Lofi', '钢琴']
+    /* B-1：回到默认态时把介绍区放出来、结果区清空 */
+    const intro = $('#searchIntro');
+    if (intro) intro.hidden = false;
+    const sbody = $('#searchBody');
+    if (sbody) sbody.innerHTML = '';
+    const hot = $('#hotWords');
+    if (!hot) return;                      // 结构被挪动时不再炸掉 renderAll()
+    hot.innerHTML = ['周杰伦', '草东没有派对', 'City Pop', '陈粒', 'Lofi', '钢琴']
       .map((w) => `<button class="chip" data-hot="${w}">${w}</button>`).join('');
     $('#recList').innerHTML = Store.all().slice(0, 4).map((t, i) => rowHTML(t, i, false)).join('');
   }
 
   /* ================= 账号 ================= */
+  /** 网络异常导致「查不到」时置 true —— 用于区分「真的没登录」和「没查成」 */
+  let _accountUnknown = false;
+
   async function refreshAccount() {
     if (!Netease.ready) { updateAccountCard(); return null; }
     try {
       const p = await Netease.status();
+      _accountUnknown = false;
       updateAccountCard();
       return p;
     } catch (e) {
+      /*
+       * 以前这里完全吞错，一失败就 updateAccountCard()。
+       * 而 status() 是 4 次串行请求，网络稍差就会超时 ——
+       * 结果是**登录态明明还有效，界面却显示「未登录网易云」**，
+       * 用户会以为被登出了，重新登录一次又「好了」，反复来回。
+       *
+       * 现在区分两种情况：
+       *   · 网络失败 → 保留上一次的 profile，只在卡片上标一句「状态未知」，
+       *     不把昵称抹成「未登录」；
+       *   · 真的 401 / 未登录 → status() 正常返回 null，走正常分支。
+       */
+      _accountUnknown = true;
+      Log.err('ACCOUNT', e, 'refreshAccount failed');
       updateAccountCard();
       return null;
     }
@@ -616,17 +1108,22 @@
     if (!card) return;
     const ava = $('#acctAva');
     if (p && p.avatar) {
-      ava.src = p.avatar;
+      // 走属性赋值本身不构成 XSS，但同样只放行 http/https，避免被塞进奇怪协议
+      ava.src = safeCoverUrl(p.avatar);
       ava.hidden = false;
     } else {
       ava.hidden = true;
     }
     $('#acctName').innerHTML = p
       ? esc(p.nickname) + (p.vip ? `<span class="badge">黑胶 VIP${p.vipLevel ? ' V' + p.vipLevel : ''}</span>` : '')
-      : '未登录网易云';
+      : (_accountUnknown ? '账号状态未知' : '未登录网易云');
     $('#acctSub').textContent = p
-      ? (p.signature || ('Lv.' + (p.level || 0) + ' · 已连接网易云账号'))
-      : '登录后可听会员曲目、同步我喜欢与每日推荐';
+      ? (_accountUnknown
+          ? '网络不好，暂时没拿到最新资料；你的登录仍然有效'
+          : (p.signature || ('Lv.' + (p.level || 0) + ' · 已连接网易云账号')))
+      : (_accountUnknown
+          ? '网络恢复后会自动重新查询'
+          : '登录后可听会员曲目、同步我喜欢与每日推荐');
     $('#statSongs').textContent = Math.round(Store.state.playedSec / 60);
     $('#statLikes').textContent = Store.state.liked.filter((id) => String(id).startsWith('ne_')).length
       || (p && p.likeIds ? p.likeIds.length : 0);
@@ -740,6 +1237,13 @@
 
   /* ================= 播放 ================= */
   let _resolvingId = null;
+  /*
+   * F-13：_resolvingId 是单槽位，只够回答「同一首是否正在解析」，
+   * 回答不了「这是不是最后一次请求」。解析 A 期间点 B，A 后返回时
+   * 仍会 Player.playAt() 把播放器抢回 A —— 用户点了 B 却听到 A。
+   * 这里改用递增序号：只有最新一次请求有权落地播放。
+   */
+  let _resolveSeq = 0;
 
   function playTrack(track, context) {
     if (!track) return;
@@ -755,21 +1259,48 @@
     if (list[i] !== track) list[i] = track;
     App.context = list;
     if (track.source === 'online') {
-      // 已经在解析同一首就不用重复发起（Player.playAt 会回调回来）
-      if (_resolvingId === track.id && !track.src) return;
+      /*
+       * 同一首已经在解析：给出明确反馈（以前是静默 return，用户以为没点上），
+       * 同时不重复发请求。
+       */
+      if (_resolvingId === track.id && !track.src) {
+        toast('正在解析这一首', '稍等一下，马上开始播放', 'cloud');
+        return;
+      }
       _resolvingId = track.id;
-      playOnline(track, list, i).finally(() => {
+      const seq = ++_resolveSeq;
+      playOnline(track, list, i, seq).finally(() => {
         if (_resolvingId === track.id) _resolvingId = null;
       });
       return;
     }
+    _resolveSeq++;                    // 本地曲目立即生效，作废所有在飞的在线解析
     Player.playAt(list, i);
     Store.set('lastTrackId', track.id);
     Store.set('lastIndex', i);
   }
 
-  async function playOnline(track, list, i) {
-    Log.add('ONLINE', 'resolve ' + track.title + ' neId=' + track.neId + ' cached=' + !!track.src);
+  /*
+   * 第 14 条：网易云直链大约 20 分钟就过期。
+   * 以前只判断 track.src 是否非空 —— 而 src 会被 rememberOnline() 写进
+   * onlineCache，下次启动恢复队列时带着上次的旧地址，直接拿去播就是
+   * 「no supported sources」，表现成「这首之前明明放过，现在却说放不了」。
+   * 现在给每个 src 记时间戳，超过 TTL 就丢掉重新解析。
+   */
+  const URL_TTL = 15 * 60 * 1000;
+
+  function srcFresh(track) {
+    return !!(track && track.src && (Date.now() - (track.srcAt || 0)) <= URL_TTL);
+  }
+
+  async function playOnline(track, list, i, seq) {
+    if (track.src && !srcFresh(track)) {
+      Log.add('ONLINE', 'src expired -> refetch: ' + track.title);
+      track.src = '';
+      track.srcAt = 0;
+    }
+    Log.add('ONLINE', 'resolve ' + track.title + ' neId=' + track.neId
+      + ' cached=' + !!track.src + ' level=' + qualityLevel() + ' trial=' + !!track.trial);
     try {
       if (!track.src) {
         toast('正在解析音源…', track.title, 'cloud');
@@ -788,6 +1319,7 @@
         if (!got) throw lastErr || new Error('无法获取播放地址');
         Log.add('ONLINE', 'url ok level=' + got.level + ' br=' + got.br + ' trial=' + got.trial);
         track.src = got.url;
+        track.srcAt = Date.now();
         track.format = (got.type || 'mp3').toUpperCase() + (got.br ? ' ' + Math.round(got.br / 1000) + 'k' : '');
         track.trial = got.trial;
         /* 双保险：ctx 里同 id 的另一份对象也写上 src，
@@ -795,12 +1327,27 @@
         const twin = (list || []).find((x) => x && x.id === track.id);
         if (twin && twin !== track) {
           twin.src = track.src;
+          twin.srcAt = track.srcAt;
           twin.format = track.format;
           twin.trial = track.trial;
         }
-        if (got.trial) toast('只能试听片段', '该曲目需要会员或已购', 'warn');
+        if (got.trial) {
+          /* 以前这里弹「只能试听片段 · 该曲目需要会员或已购」。
+             歌名右边已经有 VIP 角标了，同一件事说两遍是噪音，去掉提示，
+             只留日志。试听到 30 秒会自然停，用户看角标就知道原因。 */
+          Log.add('ONLINE', 'trial only: ' + (track.title || ''));
+        }
       }
       await ensureLyric(track);
+      /*
+       * F-13：await 期间用户可能已经点了别的歌（或换了音质）。
+       * 只有仍是「最后一次请求」才有权把播放器切到这首 ——
+       * 否则就是「最后解析完成的赢」，用户点了 B 却听到 A。
+       */
+      if (seq != null && seq !== _resolveSeq) {
+        Log.add('ONLINE', 'stale resolve dropped: ' + track.title);
+        return;
+      }
       if (!track.src) throw new Error('没有拿到播放地址');
       // 已经解析好了，直接播（这里不会再触发 defer）
       if (i >= 0) Player.playAt(list, i);
@@ -809,6 +1356,8 @@
       rememberOnline(track);
     } catch (e) {
       Log.err('ONLINE', e, (track && track.title) + ' neId=' + (track && track.neId));
+      // 过期请求的失败不该弹到用户脸上（他已经在听/在点别的歌了）
+      if (seq != null && seq !== _resolveSeq) return;
       if (e.needLogin) {
         toast('这首歌需要登录', '在「我的」里登录网易云账号后再试', 'warn');
         openNP();
@@ -869,16 +1418,65 @@
     return { standard: 0, higher: 1, exhigh: 2, lossless: 3, hires: 4 }[S().quality] ?? 2;
   }
 
+  /**
+   * F-12：切换音质后，为「正在播放/暂停中的在线曲目」重新解析地址。
+   *
+   * 旧做法是把 track.src 置成 null，等下一次播放时再解析 —— 问题是
+   * 暂停→播放会先撞上 Player.play() 里的空 src 检查，被当成音源失效并自动跳歌。
+   * 现在保持旧地址可继续播，同时静默取一档新地址替换；
+   * 取不到（会员不足/风控）就保留旧地址，用户还能继续听，只是音质没变。
+   */
+  let _qualitySeq = 0;
+  async function reResolveQuality() {
+    const t = Player.track;
+    if (!t || t.source !== 'online' || !t.neId) return;
+    const my = ++_qualitySeq;
+    try {
+      let got = null;
+      const lv = qualityLevel();
+      const floor = Math.max(0, lv - 2);
+      for (let k = lv; k >= floor; k--) {
+        try { got = await Netease.songUrl(t.neId, k); break; } catch (e) { /* 继续降档 */ }
+      }
+      // 期间又换了音质 / 已经切歌：丢弃这次结果，别覆盖新的
+      if (my !== _qualitySeq || Player.track !== t) return;
+      if (!got || !got.url) return;
+      const changed = got.url !== t.src;
+      t.src = got.url;
+      /* 必须同时写 srcAt：音源地址有 15 分钟 TTL（见 srcIsFresh），
+         只写 src 不写时间戳，TTL 判定会拿一个过期时间戳去算，
+         这套过期机制等于形同虚设 —— 用户会遇到「播到一半地址失效」。 */
+      t.srcAt = Date.now();
+      t.format = (got.type || 'mp3').toUpperCase() + (got.br ? ' ' + Math.round(got.br / 1000) + 'k' : '');
+      t.trial = got.trial;
+      const twin = (App.context || []).find((x) => x && x.id === t.id);
+      if (twin && twin !== t) { twin.src = t.src; twin.srcAt = t.srcAt; twin.format = t.format; twin.trial = t.trial; }
+      /*
+       * 刻意**不去**改 <audio> 当前已加载的地址。
+       * 换 src 会让元素重新加载，正在播的歌会顿一下、并从 0 开始 —— 为了换音质
+       * 打断收听是不划算的。新地址已经写进曲目对象，下一次 load（切歌/重播）
+       * 自然就用上新音质；已加载的旧地址仍然有效，暂停后恢复也不会再被误判失效。
+       */
+      if (changed) Log.add('ONLINE', 'quality re-resolve ok level=' + got.level + ' trial=' + got.trial);
+    } catch (e) {
+      Log.add('ONLINE', 'quality re-resolve failed: ' + e.message);
+    }
+  }
+
   function bindPlayer() {
     Player.on('track', (t) => {
       if (t) { S().lastPosition = 0; rememberProgress(true); }
       paletteFor(t);
       updateDock();
+      // renderNP() 内部已经把封面/背景/队列/歌词/模式按钮都刷过了，
+      // 这里再赋值一次 backgroundImage 是重复的样式写入（切歌时白做一遍重排）
       renderNP();
       renderHome();
       renderLibrary();
-      $('#npBg').style.backgroundImage = `url("${coverOf(t)}")`;
       $('#npCover img').style.opacity = 1;
+      syncNormalizeRow();
+      // F-5：切歌会改变「均衡器对当前音源是否可用」，面板/那一行要跟着说真话
+      refreshEQUI();
       /*
        * 兜底：任何途径让一首在线歌成为当前曲目，只要它还没歌词就补一次。
        * ensureLyric 内部有「已经是数组就不请求」的短路，
@@ -908,19 +1506,57 @@
       if (left > 3) return;
       if (!t || t.source !== 'online' || !t.neId) return;
       if (mode === 'heart') {
+        /*
+         * 审查 3.1：心动模式续队列以前**没有**并发保护，
+         * 而 extendRoam（漫游）一直有 _roamBusy。后果是快速切歌时
+         * 每次切歌都触发一次续队列请求，几个请求回来各自 concat 一遍，
+         * 队列里就出现重复歌曲，而且越切越重复。
+         *
+         * 这里补上同样的互斥：一次只允许一个续队列在飞。
+         */
+        if (_heartBusy) return;
+        _heartBusy = true;
         Netease.heartMode(t.neId, 0, 20).then((list) => {
           if (!list.length) return;
-          const queue = Player.queue.concat(list);
+          /* 回来时可能已经切歌了：只把「当前队列里还没有的」补进去 */
+          if (Player.track !== t) return;
+          const have = new Set(Player.queue.map((x) => x && x.id));
+          const add = list.filter((x) => x && !have.has(x.id));
+          if (!add.length) return;
+          const queue = Player.queue.concat(add);
           Player.queueSet(queue, Player.index);
           renderQueue();
-        }).catch(() => {});
+        }).catch(() => {}).then(() => { _heartBusy = false; });
       } else {
         extendRoam(t.neId, t);
       }
     });
+    /* 审查 3.2：缓冲状态可视化，至少让用户知道「在转圈」而不是死机 */
+    Player.on('buffering', (on) => {
+      const bar = document.querySelector('.np-seek .bar');
+      if (bar) bar.classList.toggle('buffering', !!on);
+      const dock = document.getElementById('dockInner');
+      if (dock) dock.classList.toggle('buffering', !!on);
+    });
     Player.on('error', () => toast('播放出错', '音源可能已失效，试试下一首', 'warn'));
     Player.on('sourcefail', (t) => {
-      Log.add('PLAY', 'sourcefail: ' + (t && t.title));
+      Log.add('PLAY', 'sourcefail: ' + (t && t.title) + ' neId=' + (t && t.neId)
+        + ' hasSrc=' + !!(t && t.src) + ' trial=' + !!(t && t.trial)
+        + ' age=' + (t && t.srcAt ? Math.round((Date.now() - t.srcAt) / 1000) + 's' : 'n/a'));
+      /*
+       * 第 14 条：第一次失败先别急着判死刑。
+       * 绝大多数「之前放过的歌现在放不了」都是直链过期，清掉重新解析一次
+       * 就能放；只有重取之后还失败才真的跳过。
+       */
+      if (t && t.source === 'online' && t.neId && !t._srcRetried) {
+        t._srcRetried = true;
+        t.src = '';
+        t.srcAt = 0;
+        Log.add('PLAY', 'retry with fresh src: ' + t.title);
+        playTrack(t, App.context);
+        return;
+      }
+      if (t) t._srcRetried = false;
       if (App._skipCount == null) App._skipCount = 0;
       App._skipCount++;
       if (App._skipCount > 3) {
@@ -967,20 +1603,37 @@
   function updateTimes() {
     const d = Player.duration(), c = Player.time();
     const p = d ? Math.min(1, c / d) : 0;
-    $('#dockProg').style.width = (p * 100) + '%';
-    $('#npFill').style.width = (p * 100) + '%';
-    $('#npKnob').style.left = (p * 100) + '%';
-    $('#npCur').textContent = fmtTime(c);
-    $('#npDur').textContent = fmtTime(d);
+    /*
+     * 播放进度是「每 100ms 一次、每次 6 个节点」的热路径，而它几乎总是
+     * 在 0.3% 的粒度内变化 —— 逐次写 style/textContent 会让平板上的
+     * 合成层一直重算。这里做值级短路：只有真的变了才碰 DOM。
+     */
+    const pct = Math.round(p * 1000) / 10;
+    if (pct !== App._lastPct) {
+      App._lastPct = pct;
+      const w = (p * 100) + '%';
+      /* H-17：底部进度条走 transform（合成层，不触发 layout） */
+      $('#dockProg').style.transform = 'scaleX(' + p.toFixed(4) + ')';
+      $('#npFill').style.width = w;
+      $('#npKnob').style.left = w;
+    }
+    const curTxt = fmtTime(c);
+    if (curTxt !== App._lastCur) { App._lastCur = curTxt; $('#npCur').textContent = curTxt; }
+    const durTxt = fmtTime(d);
+    if (durTxt !== App._lastDur) { App._lastDur = durTxt; $('#npDur').textContent = durTxt; }
     /*
      * 缓冲进度用真实的 audio.buffered，而不是「已播 + 18%」这种假数据。
      * 取不到（还没元数据、或浏览器不给 buffered）时就不画，别误导人。
      */
     const buf = Player.bufferedEnd();
     if (buf && d) {
-      $('#npBuf').style.width = Math.min(100, (buf / d) * 100) + '%';
+      const bp = Math.round(Math.min(100, (buf / d) * 100));
+      if (bp !== App._lastBufPct) {
+        App._lastBufPct = bp;
+        $('#npBuf').style.width = bp + '%';
+      }
     } else if (p <= 0.02) {
-      $('#npBuf').style.width = '0%';
+      if (App._lastBufPct !== 0) { App._lastBufPct = 0; $('#npBuf').style.width = '0%'; }
     }
   }
 
@@ -992,10 +1645,15 @@
       $('#npArtist').textContent = '从曲库挑一首开始';
       return;
     }
-    $('#npCover img').src = coverOf(t);
-    $('#npBg').style.backgroundImage = `url("${coverOf(t)}")`;
-    $('#npBg').style.backgroundSize = 'cover';
-    $('#npBg').style.backgroundPosition = 'center';
+    // 封面只在真的变了时才写（同一首歌 renderNP 会被多次调用）
+    const cover = coverOf(t);
+    if (App._npCover !== cover) {
+      App._npCover = cover;
+      $('#npCover img').src = cover;
+      $('#npBg').style.backgroundImage = cssUrl(cover);
+      $('#npBg').style.backgroundSize = 'cover';
+      $('#npBg').style.backgroundPosition = 'center';
+    }
     $('#npTitle').textContent = t.title;
     // VIP 角标：会员曲目 / 需要付费的曲目在歌名右边明确标注
     const isVip = t.source === 'online' && (t.vip || t.fee === 1 || t.fee === 4
@@ -1027,20 +1685,36 @@
   /* ---------- 三行歌词（播放页常驻） ---------- */
   let lyricIdx = -1;
 
+  /*
+   * H-3：renderLyric() 被 renderNP() 无条件调用，每次都把 40~80 个歌词节点
+   * 整体重建，还给每一行写行内 style.fontSize —— 播放页根本没打开时也在做。
+   * 这里用签名短路：曲子、行数、首尾时间、字号、译文开关没变就直接跳过。
+   */
+  let _lyricSig = '';
+
   function renderLyric() {
     const t = Player.track;
     if (!t) {
+      _lyricSig = '';
       $('#lyrPrev').textContent = '';
       $('#lyrCur').textContent = '—';
       $('#lyrNext').textContent = '';
       lyricLines = [];
       return;
     }
-    lyricLines = lyricOf(t);
+    const nextLines = lyricOf(t);
+    const sig = [t.id, nextLines.length,
+      nextLines.length ? nextLines[0].t : -1,
+      nextLines.length ? nextLines[nextLines.length - 1].t : -1,
+      S().lyricSize, S().showTrans ? 1 : 0].join('|');
+    if (sig === _lyricSig) return;          // 内容没变：连 DOM 都不碰
+    _lyricSig = sig;
+    lyricLines = nextLines;
     // 完整歌词（展开后在同一页面里显示）
     const box = $('#npLyric');
     if (!lyricLines.length) {
       box.innerHTML = `<div class="empty">暂无歌词<br><span style="opacity:.6">在线曲目会自动匹配</span></div>`;
+      _lyricSig = '';
     } else {
       box.innerHTML = lyricLines.map((l, i) =>
         `<div class="ln" data-i="${i}" data-t="${l.t}">${esc(l.text)}`
@@ -1058,40 +1732,157 @@
       });
     }
     lyricIdx = -2;
+    lyricFollow = true;
+    _lyricRecenter = true;
+    if (box) box.classList.remove('free');
+    bindLyricScroll();
     syncLyric();
+  }
+
+  /* ---------- 展开歌词的滚动（第 6、7 条） ----------
+   * 第 6 条：当前句要停在容器「垂直正中」，而不是原来那个 42% 的偏上位置。
+   * 第 7 条：用户主动往上/往下翻看时不能再被强制拉回来 ——
+   *   · 离开当前句超过一行 → 判定为用户在翻看，暂停跟随
+   *   · 停手 1 秒后再判断：离当前句在 2 行以内就自动回到跟随并居中，
+   *     否则继续保持脱离（继续翻不会被抢）
+   *   · 点任意歌词行（会跳转播放位置）时立刻恢复跟随
+   */
+  let lyricFollow = true;      // false = 用户在翻看，不许再自动校正
+  let _lyricIdle = null;
+  let _lyricAutoAt = 0;        // 程序自己滚动的时刻
+  let _lyricTouch = false;     // 手指还按在歌词上
+  let _lyricRecenter = true;   // 下一次 syncLyric 必须校正一次（展开/换歌/缩放后）
+
+  /** 让某一行停在滚动容器的垂直正中 */
+  function lyricCenterTarget(box, row) {
+    if (!box || !row) return 0;
+    const h = row.offsetHeight || 1;
+    return Math.max(0, row.offsetTop + h / 2 - box.clientHeight / 2);
+  }
+
+  /** 程序滚动：记时间戳，避免自己的滚动被当成用户操作 */
+  function scrollLyric(box, top, smooth) {
+    _lyricAutoAt = Date.now();
+    try { box.scrollTo({ top: top, behavior: smooth ? 'smooth' : 'auto' }); }
+    catch (e) { box.scrollTop = top; }
+  }
+
+  /** 停手 1 秒后判断：离当前句在 2 行以内就恢复跟随，否则继续保持脱离 */
+  function scheduleLyricReattach(box) {
+    clearTimeout(_lyricIdle);
+    _lyricIdle = setTimeout(() => {
+      if (_lyricTouch) return;                    // 手指还在屏幕上，别插手
+      const rows = box.children;
+      const c = rows[lyricIdx >= 0 ? lyricIdx : 0];
+      if (!c) return;
+      const t2 = lyricCenterTarget(box, c);
+      if (Math.abs(box.scrollTop - t2) <= (c.offsetHeight || 1) * 2) {
+        lyricFollow = true;
+        box.classList.remove('free');
+        scrollLyric(box, t2, true);
+      }
+    }, 1000);
+  }
+
+  function bindLyricScroll() {
+    const box = $('#npLyric');
+    if (!box || box._boundLyricScroll) return;
+    box._boundLyricScroll = true;
+
+    /*
+     * 关键：用 touchstart 立刻判定「用户在翻」，不要等 scroll 事件去猜。
+     *
+     * 上一版的错误：靠 scroll 事件 + 「离当前句超过一行才脱离」来判定，
+     * 但 syncLyric() 每 100ms 就会因为「还差 4px 以上」把位置拽回当前句，
+     * 而且每次校正都会刷新 _lyricAutoAt，让 scroll 监听以为这是程序滚的、
+     * 直接 return —— 结果 lyricFollow 永远变不成 false，手指滑多远都会被抢。
+     *
+     * 现在：手指一碰就脱离，松手 1 秒后再决定要不要回跟，
+     * syncLyric 只在「换句 / 明确要求」时才校正一次。
+     */
+    box.addEventListener('touchstart', () => {
+      _lyricTouch = true;
+      clearTimeout(_lyricIdle);
+      if (lyricFollow) {
+        lyricFollow = false;
+        box.classList.add('free');
+      }
+    }, { passive: true });
+    box.addEventListener('touchend', () => {
+      _lyricTouch = false;
+      scheduleLyricReattach(box);
+    }, { passive: true });
+    box.addEventListener('touchcancel', () => {
+      _lyricTouch = false;
+      scheduleLyricReattach(box);
+    }, { passive: true });
+
+    // 滚轮 / 键盘 / 拖动滚动条（桌面预览）走这条兜底
+    box.addEventListener('scroll', () => {
+      if (Date.now() - _lyricAutoAt < 700) return;   // 程序自己滚的
+      if (_lyricTouch) return;                       // 触摸路径已处理
+      if (lyricFollow) {
+        lyricFollow = false;
+        box.classList.add('free');
+      }
+      scheduleLyricReattach(box);
+    }, { passive: true });
+  }
+
+  /**
+   * 审查 3.1：歌词行索引以前在 syncLyric 和 pushSbText 里各做一遍线性全表扫描。
+   * 10Hz × 2 × 80 行 ≈ 每秒 2400 次迭代，而歌词本来就按时间升序排好，
+   * 二分是 log2(80)≈7 次。改成二分。
+   */
+  function lyricIndexAt(sec) {
+    let lo = 0, hi = lyricLines.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (lyricLines[mid].t <= sec) { ans = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return ans;
   }
 
   /** force=true 时即使还在同一句也会重新计算（改歌词偏移后需要用） */
   function syncLyric(force) {
     if (!lyricLines.length) {
-      $('#lyrPrev').textContent = '';
-      $('#lyrCur').textContent = '♪';
-      $('#lyrNext').textContent = '';
+      if (lyricIdx !== -1) {
+        lyricIdx = -1;
+        $('#lyrPrev').textContent = '';
+        $('#lyrCur').textContent = '♪';
+        $('#lyrNext').textContent = '';
+      }
       return;
     }
     const t = Player.time() + (S().lyricOffset || 0);
-    let i = -1;
-    for (let k = 0; k < lyricLines.length; k++) {
-      if (lyricLines[k].t <= t) i = k; else break;
+    const i = lyricIndexAt(t);
+    /*
+     * 三行歌词只在「当前句变了」时才写 DOM。
+     * 这个函数被 Player 的 time 事件每 100ms 调一次，
+     * 而一句歌词通常持续两三秒 —— 旧代码每次都在重写同样三个字符串，
+     * 白白产生每秒十几次文本节点变更（平板上的合成开销很实在）。
+     */
+    const lineChanged = force || i !== lyricIdx;
+    if (lineChanged) {
+      const prevTx = i - 1 >= 0 ? lyricLines[i - 1].text : '';
+      const curTx = i >= 0 ? lyricLines[i].text : '♪';
+      const nextTx = i + 1 < lyricLines.length ? lyricLines[i + 1].text : '';
+      $('#lyrPrev').textContent = prevTx || '';
+      $('#lyrCur').textContent = curTx;
+      $('#lyrNext').textContent = nextTx || '';
+      $('#lyrPrev').classList.toggle('blank', !prevTx);
+      $('#lyrNext').classList.toggle('blank', !nextTx);
+      // 状态栏浮层跟着走（内部有去重，同一行不会重复发）
+      if (S().sbLyric) pushSbText(false);
     }
-    // 三行：上一个 / 当前 / 下一个
-    const prevTx = i - 1 >= 0 ? lyricLines[i - 1].text : '';
-    const curTx = i >= 0 ? lyricLines[i].text : '♪';
-    const nextTx = i + 1 < lyricLines.length ? lyricLines[i + 1].text : '';
-    $('#lyrPrev').textContent = prevTx || '';
-    $('#lyrCur').textContent = curTx;
-    $('#lyrNext').textContent = nextTx || '';
-    // 状态栏浮层跟着走（内部有去重，同一行不会重复发）
-    if (S().sbLyric) pushSbText(false);
-    $('#lyrPrev').classList.toggle('blank', !prevTx);
-    $('#lyrNext').classList.toggle('blank', !nextTx);
 
     // 展开层：高亮 + 居中
     const box = $('#npLyric');
     if (!box || !box.children.length) return;
     const rows = box.children;
     const focus = i >= 0 ? i : 0;   // 第一句之前先把第一句顶上去
-    const changed = force || i !== lyricIdx;
+    const changed = lineChanged;
     if (changed) {
       lyricIdx = i;
       for (let k = 0; k < rows.length; k++) {
@@ -1100,26 +1891,82 @@
         rows[k].classList.toggle('near', false);
       }
     }
-    // 展开且可见时才滚动（每次调用都校正一次，防止刚展开时高度为 0）
-    if (rows[focus] && $('#np').classList.contains('expanded') && box.clientHeight > 0) {
-      const target = Math.max(0, rows[focus].offsetTop - box.clientHeight * 0.42);
-      if (changed || Math.abs(box.scrollTop - target) > 4) {
-        box.scrollTo({ top: target, behavior: changed ? 'smooth' : 'auto' });
+    /* 展开且可见时才滚动。
+       两个前置条件缺一不可：
+         · lyricFollow —— 用户在翻看时一次都不许动
+         · !_lyricTouch —— 手指按着的时候也别抢
+       而且只在「当前句真的变了」或「明确要求校正」时动一次。
+       以前末尾还带着 `|| Math.abs(scrollTop - target) > 4`，等于每 100ms
+       抢一次位置，用户根本翻不动歌词 —— 这条是那个 bug 的根源，已删除。 */
+    if (lyricFollow && !_lyricTouch && rows[focus]
+        && $('#np').classList.contains('expanded') && box.clientHeight > 0) {
+      if (changed || _lyricRecenter) {
+        _lyricRecenter = false;
+        scrollLyric(box, lyricCenterTarget(box, rows[focus]), true);
       }
     }
   }
 
   /* ---------- 播放列表 sheet ---------- */
-  function renderQueue() {
+  /**
+   * F-14：以前每次切歌都无条件 innerHTML 全量重建（300 首 = 300 个节点，
+   * 平板上非常明显），而且面板关着也重建、还把 scrollTop 冲回顶部。
+   * 现在：面板不可见时只登记「脏了」，等真正打开再渲染；
+   * 队列内容没变（签名相同）就跳过；渲染时保留滚动位置。
+   */
+  let _queueSig = '';
+  let _queueDirty = true;
+  let _queueCountTxt = '';
+
+  /** 队列条数只在文字真的变了时才写 DOM（切歌时会反复调用） */
+  function setQueueCount(n) {
+    const txt = n + ' 首';
+    if (txt === _queueCountTxt) return;
+    _queueCountTxt = txt;
+    const el = $('#npQueueCount');
+    if (el) el.textContent = txt;
+  }
+
+  function queueSignature(q) {
+    // 签名要覆盖「标题/歌手/时长/当前曲目」，任何一项变化都要重建
+    const cur = Player.track ? Player.track.id : '';
+    let h = 0;
+    for (let i = 0; i < q.length; i++) {
+      const s = q[i].id + '\u0001' + q[i].title + '\u0001' + q[i].artist + '\u0001' + q[i].duration;
+      for (let k = 0; k < s.length; k++) h = (h * 31 + s.charCodeAt(k)) | 0;
+      h = (h * 31 + i) | 0;
+    }
+    return cur + '|' + q.length + '|' + h;
+  }
+
+  function queueVisible() {
+    const sheet = $('#npQueueSheet');
+    return !!(sheet && sheet.classList.contains('on'));
+  }
+
+  function renderQueue(force) {
     const q = Player.queue.length ? Player.queue : Store.all();
-    $('#npQueueCount').textContent = q.length + ' 首';
-    $('#npQueue').innerHTML = q.map((t, i) =>
+    const sig = queueSignature(q);
+    // 面板没打开时不做 DOM 重建，只记个标记（打开时会强制渲染）
+    if (!force && !queueVisible()) {
+      if (sig !== _queueSig) _queueDirty = true;
+      return;
+    }
+    setQueueCount(q.length);
+    if (!force && !_queueDirty && sig === _queueSig) return;
+    _queueSig = sig;
+    _queueDirty = false;
+    const box = $('#npQueue');
+    if (!box) return;
+    const keep = box.scrollTop;                 // 保留滚动位置，切歌不再跳回顶部
+    box.innerHTML = q.map((t, i) =>
       `<div class="qitem${Player.track && Player.track.id === t.id ? ' on' : ''}"
             data-i="${i}" data-id="${esc(t.id)}">
         <div class="idx">${Player.track && Player.track.id === t.id ? '▮▮' : String(i + 1).padStart(2, '0')}</div>
         <div class="tx"><b>${esc(t.title)}</b><span>${esc(t.artist)}</span></div>
         <div class="du">${fmtTime(t.duration)}</div>
       </div>`).join('');
+    if (keep) box.scrollTop = keep;
   }
 
   /* ================= 播放设置面板（右上角 … 弹出） ================= */
@@ -1171,7 +2018,11 @@
             `<div class="sld"><input type="range" min="0" max="1" step="0.05" data-opt="volume"></div>`)}
           ${optRow('i-cloud', '音质偏好', Q_NAMES[s.quality] || '极高',
             `<div class="val">${Q_NAMES[s.quality] || '极高'} ›</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="quality"')}
-          ${optRow('i-eq', '音量归一化', '不同来源音量拉平', optSwitch('normalize'))}
+          ${optRow('i-eq', '音量归一化',
+            Player.normalizeUsable()
+              ? '按实测响度拉平（本地/同源音源）'
+              : '当前是在线流，对它不生效（只能在本机音源上用）',
+            optSwitch('normalize'))}
         </div>
       </div>
 
@@ -1246,6 +2097,23 @@
     setSub('quality', { standard: '标准', higher: '较高', exhigh: '极高', lossless: '无损', hires: 'Hi-Res' }[s.quality] || '极高');
     setSub('sleep', s.sleepMin ? s.sleepMin + ' 分钟' : '关闭');
     setSub('sbtune', s.sbLocked ? '已锁定 · 不可拖动' : '可拖动 · 点一下可调整');
+    /*
+     * F-1：归一化那一行的副标题也要跟着「当前音源能不能用」变。
+     * 播在线流时明确说要它不生效，而不是让用户反复开关找不到原因。
+     */
+    const nzSw = body.querySelector('[data-optsw="normalize"]');
+    if (nzSw) {
+      const r = nzSw.closest('.opt-row');
+      if (r) {
+        r.style.opacity = Player.normalizeUsable() ? '' : '0.55';
+        const t = r.querySelector('.tx span');
+        if (t) {
+          t.textContent = !s.normalize
+            ? '仅对本地/同源音源生效（在线流跨域不可测）'
+            : (Player.normalizeUsable() ? '已启用 · 按实测响度拉平' : '当前是在线流，对它不生效');
+        }
+      }
+    }
     const volSub = body.querySelector('[data-opt="volume"]');
     if (volSub) {
       const r = volSub.closest('.opt-row');
@@ -1421,8 +2289,14 @@
       const i = list.indexOf(S().quality);
       const next = list[(i + 1) % list.length];
       S().quality = next; Store.save();
-      // 换音质要重新解析地址
-      if (Player.track && Player.track.source === 'online') Player.track.src = null;
+      /*
+       * F-12：换音质不能把当前曲目的 src 置空。
+       * 旧代码 `Player.track.src = null`：<audio> 里已经加载的地址还能响，
+       * 但曲目对象已经没有地址 —— 用户暂停后再播放时 Player.play() 看到空 src，
+       * 判定「音源失效」→ 弹「这首放不了 · 已跳过」→ 自动跳到下一首。
+       * 正确做法是保持能播，同时在后台重新解析一档新音质的地址替换上去。
+       */
+      reResolveQuality();
       syncOptSheet(); syncSettingsUI();
       toast('音质偏好', names[list.indexOf(next)], 'cloud');
       return;
@@ -1616,14 +2490,42 @@
     $('#npOptSheet').classList.remove('on');
   }
 
+  /*
+   * H-20：按需提升合成层。
+   *
+   * will-change 常驻会让浏览器为元素永久保留合成层和显存 ——
+   * 播放页/面板这些铺满屏幕的元素，静止时也占着，纯属浪费。
+   * 正确做法是「动作开始时挂上、结束后摘掉」，这里就是那个开关。
+   *
+   * 用 setTimeout 而不是 transitionend：多个属性共用一次过渡时
+   * transitionend 会触发多次，还要自己判重；而这里的时长本来就知道。
+   */
+  const _liftTimers = new WeakMap();
+  function liftWhileAnimating(el, ms) {
+    if (!el) return;
+    el.classList.add('animating');
+    const prev = _liftTimers.get(el);
+    if (prev) clearTimeout(prev);
+    _liftTimers.set(el, setTimeout(() => {
+      el.classList.remove('animating');
+      _liftTimers.delete(el);
+    }, ms));
+  }
+
   function openQueue() {
     // 两个 sheet 会叠在一起，开一个先关掉另一个
     closeComments(); closeOptSheet(); closeEQ();
-    renderQueue();
+    /* H-20：面板滑出这段时间才需要合成层 */
+    liftWhileAnimating($('#npQueueSheet'), 520);
+    liftWhileAnimating($('#npMask'), 520);
     $('#npMask').classList.add('on');
     $('#npQueueSheet').classList.add('on');
+    // 面板可见之后再渲染（renderQueue 会据可见性决定是否重建，脏了才真重建）
+    renderQueue();
   }
   function closeQueue() {
+    liftWhileAnimating($('#npQueueSheet'), 520);
+    liftWhileAnimating($('#npMask'), 520);
     $('#npMask').classList.remove('on');
     $('#npQueueSheet').classList.remove('on');
   }
@@ -1651,30 +2553,205 @@
     const usable = !m.need || Netease.loggedIn;
     $('#npMode').classList.toggle('on', usable);
     $('#npMode').classList.toggle('off', !usable);
-    // 旧的 shuffle / repeat 设置与新模式同步，播放核心仍然只认这两个
-    S().shuffle = m.key === 'rand';
-    S().repeat = m.key === 'one' ? 'one' : (m.key === 'seq' ? 'off' : 'all');
-    Store.save();
+    /*
+     * H-2：这里以前无条件 Store.save()，而它被 renderNP() 调用 ——
+     * 每切一次歌就把 history(200) + onlineCache(60) 全量序列化写盘一次，
+     * 是切歌卡顿的固定来源。现在只在值真的变了时才存。
+     */
+    const nextShuffle = m.key === 'rand';
+    const nextRepeat = m.key === 'one' ? 'one' : (m.key === 'seq' ? 'off' : 'all');
+    if (S().shuffle !== nextShuffle || S().repeat !== nextRepeat) {
+      S().shuffle = nextShuffle;
+      S().repeat = nextRepeat;
+      Store.save();
+    }
   }
 
-  /** 封面始终正方形：取容器宽高较小值（容器由 flex 吸收剩余高度） */
-  function sizeCover() {
-    const wrap = $('.cover-wrap');
-    const cover = $('#npCover');
-    if (!wrap || !cover) return;
+
+  /*
+   * ============ 封面尺寸：单一来源，只发布不补偿 ============
+   *
+   * 唯一职责：在**收起稳定态**把封面边长算出来，写到 :root 的 --cover-size。
+   * CSS 那边 .np-cover 直接用 width/height:var(--cover-size)，
+   * 不再有任何 max-height:100% 之类的自适应 —— 所以动画期间它不可能变。
+   *
+   * 为什么用 ResizeObserver 而不是手动绑一堆事件：
+   *   以前 sizeCover() 有 6 个触发点（resize / orientationchange /
+   *   打开播放页 / __rippleViewport / 动画结束 / 滑动结束），
+   *   每个都在赌「此刻布局已经稳定」。只要有一个跑在容器还没长开的时候，
+   *   就会把小值写进 inline style 并一直错着 —— 这就是「偶见封面变小」。
+   *   ResizeObserver 只在容器**真的**改变尺寸时回调，且回调时机是布局完成后，
+   *   天然不会量到半成品。
+   *
+   * 展开态一律跳过：此时容器高度已经塌了，量出来必然偏小。
+   */
+  function publishCoverSize() {
+    const wrap = document.querySelector('.cover-wrap');
+    const np = $('#np');
+    if (!wrap || !np) return;
+    /* 展开态 / 播放页没打开：不发布，保持上一次的值 */
+    if (np.classList.contains('expanded')) return;
+    if (!np.classList.contains('open')) return;
     const cs = getComputedStyle(wrap);
+    const padL = parseFloat(cs.paddingLeft) || 0;
+    const padR = parseFloat(cs.paddingRight) || 0;
+    const r = wrap.getBoundingClientRect();
+    const availW = r.width - padL - padR;
+    if (availW < 2) return;
+    /*
+     * ⚠️ 封面边长**只跟宽度走，绝不读容器高度**。
+     *
+     * 这是「偶见封面变小」的最终修法。旧实现是
+     *   size = Math.max(120, Math.min(r.width, availH))
+     * —— 只要某一刻 cover-wrap 的高度比宽度小（比如歌词占位多了一个瞬时状态、
+     * 键盘弹出、小窗切换、或者切歌时歌名从一行变两行），
+     * Math.min 就会取到那个高度值，算出 185 这种小尺寸并**写进 inline style**，
+     * 之后一直错着，直到下一次测量才纠正。用户看到的就是「偶见封面缩小」。
+     *
+     * 现在改成只由宽度决定，并给一个「不超过视口高度的一部分」的上限来兜底：
+     *   · 宽度是稳定的（左右内边距固定，不随内容变化）
+     *   · 高度只作为上限参与一次性的钳制，且用视口高度算，不读容器高度
+     * 于是同一台设备上，无论歌词/歌名怎么变，算出来的边长恒定不变。
+     */
+    /*
+     * 边长 = min(容器可用宽度, 容器可用高度)，但高度那一侧要「稳」。
+     *
+     * 这里踩过三个坑，记录清楚免得再来一次：
+     *
+     * ① 直接用容器高度 → 它会随歌词/歌名/键盘瞬时变化，
+     *    量到一次小值就被写死 → 用户看到的「偶见封面缩小」。
+     * ② 用屏高固定比例（46%）→ 横屏 411 高时算出 189px，像个小图标，
+     *    因为横屏是两栏布局，纵向根本没被挤占。
+     * ③ 取 max(容器空间, 屏高×92%) → 等于永远用屏高兜底，
+     *    **容器被压扁时封面不肯缩**。小窗 411×685 实测：容器只有 251px，
+     *    封面仍是 367px，顶出屏幕 18px，把歌名、歌词、进度条全挤乱了。
+     *
+     * 现在的做法：老老实实取 min(宽, 容器高)，但**只在容器高度稳定时更新**。
+     * 「稳定」的判据是：本次算出的值与上次相差超过 4px 才采纳 ——
+     * 这样瞬时抖动（动画中间帧、一次性的布局重排）不会改尺寸，
+     * 而窗口真的变小（小窗/横屏/键盘）时尺寸会跟着缩，不会溢出。
+     *
+     * 另外加一条硬约束：封面绝不允许超过容器可用高度，这是「不溢出」的底线。
+     */
     const padTop = parseFloat(cs.paddingTop) || 0;
     const padBottom = parseFloat(cs.paddingBottom) || 0;
-    const r = wrap.getBoundingClientRect();
-    const availH = r.height - padTop - padBottom;
-    if (r.width < 2 || availH < 2) return;
-    const size = Math.max(120, Math.floor(Math.min(r.width, availH)));
-    cover.style.width = size + 'px';
-    cover.style.height = size + 'px';
+    const wrapRoom = Math.max(0, r.height - padTop - padBottom);
+    if (wrapRoom < 2) return;
+    const size = Math.floor(Math.min(availW, wrapRoom));
+    /* 尺寸已经稳定在同一个值上：不重复写（写 CSS 变量会触发全树 style 重算） */
+    if (size === App._coverSize) return;
+    /*
+     * 抖动抑制：只有当变化足够大时才采纳。
+     * 阈值 4px 远大于一次布局重排的误差，又远小于「小窗把容器压掉一半」这种
+     * 真实变化，所以既能挡住抖动，又不会让封面在小窗里溢出。
+     */
+    if (App._coverSize && Math.abs(size - App._coverSize) <= 4) return;
+    App._coverSize = size;
+    document.documentElement.style.setProperty('--cover-size', size + 'px');
   }
 
-  window.addEventListener('resize', () => { if ($('#np').classList.contains('open')) sizeCover(); });
-  window.addEventListener('orientationchange', () => setTimeout(sizeCover, 140));
+  (function initCoverSize() {
+    const wrap = document.querySelector('.cover-wrap');
+    if (!wrap || typeof ResizeObserver !== 'function') return;
+    let queued = false;
+    const ro = new ResizeObserver(() => {
+      /* 合并到下一帧，避免同一批布局变化里连续回调多次 */
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; publishCoverSize(); });
+    });
+    ro.observe(wrap);
+    /*
+     * 打开播放页时容器从「隐藏」变成「有尺寸」，ResizeObserver 会回调；
+     * 但 --lyric-size（歌词字号）变化会改兄弟元素高度、间接影响可用高度，
+     * 那种变化 observer 也能捕捉到，所以不需要额外监听设置项。
+     */
+    /* 对外暴露一个「强制发布」入口，供 openNP() 在打开动画结束后调用一次 */
+    App._publishCoverSize = publishCoverSize;
+  })();
+
+  /*
+   * 窗口信息（设置页里的只读诊断行）。
+   *
+   * 为什么加它：平板上反馈「中间还是一条窄栏」时，三种原因在画面上几乎一样，
+   * 但修法完全不同 ——
+   *   a) 装的不是新包          → 「关于」里的版本号对不上
+   *   b) 系统把窗口限成了窄窗    → 视口宽度明显小于屏幕宽度（letterbox / 分屏 / 兼容模式），
+   *                              这种情况 CSS 怎么改都没用，得去系统侧放开
+   *   c) 断点判据没命中        → 视口够宽、但 --rail-w 还是 0，那才是 CSS 的问题
+   * 没有这行信息的时候只能对着截图猜，来回改好几轮都打不中。
+   *
+   * 注意：这里不重算断点，直接读 responsive.css 算出来的最终值（--rail-w / --content-max）。
+   * 重写一遍判据迟早会和 CSS 漂移，那样这行字反而会骗人。
+   */
+  /* H-12：#winHint 独立 DOM 已并进「软件日志」，不再需要同步函数 */
+
+
+  /*
+   * 小窗 / 分屏：原生侧在窗口尺寸变化时会把新的逻辑尺寸推过来。
+   * WebView 在小窗里不会自己重算视口，所以这里显式同步一次，
+   * 并重算封面尺寸与断点相关的量。第三参数是 dpr，暂时只用于日志，
+   * 但留着可以让以后做「按物理像素选画质」时少改一处桥。
+   */
+  window.__rippleViewport = function (w, h, dpr) {
+    try {
+      App._vp = { w: w, h: h, dpr: dpr };
+      Log.add('VIEW', 'viewport ' + w + 'x' + h + ' @' + dpr);
+      requestAnimationFrame(() => {
+        /* 断点切换后 carousel / 网格列数都会变，滚动位置可能越界，钳一下 */
+        $$('.page').forEach((p) => {
+          if (p.scrollTop > p.scrollHeight) p.scrollTop = 0;
+        });
+      });
+    } catch (e) {}
+  };
+  /*
+   * 返回键（第 11 条）：优先级从高到低 ——
+   *   1. 任何弹出的面板（播放列表 / 音质选项 / 评论 / 均衡器 / 选曲 / 状态栏歌词）
+   *   2. 歌词展开态（先收回三行，不是整个关掉播放页）
+   *   3. 播放页
+   *   4. 搜索框聚焦（先收键盘）
+   *   5. 都没有 → 交回系统（退出 App）
+   *
+   * 这段逻辑以前写死在 Java 的 onBackPressed 里，只认识「歌词展开」和「播放页」，
+   * 所以列表还开着的时候按返回，先收起来的是播放页，列表挂在后面 —— 用户要按两次
+   * 才能把列表收掉，而且中间播放页已经跳下去了。
+   */
+  window.__rippleBack = function () {
+    try {
+      const sheet = $('.np-sheet.on');
+      if (sheet) {
+        const id = sheet.id || '';
+        if (id === 'npQueueSheet') closeQueue();
+        else if (id === 'npOptSheet') closeOptSheet();
+        else if (id === 'cmtSheet') closeComments();
+        else {
+          // eq / pick / sb 这些没有专门 close 函数的，统一摘类 + 收遮罩
+          sheet.classList.remove('on');
+          $$('.sheet-mask.on').forEach((m) => m.classList.remove('on'));
+          const nm = $('#npMask');
+          if (nm) nm.classList.remove('on');
+        }
+        return 'handled';
+      }
+      const np = $('#np');
+      if (np && np.classList.contains('expanded')) { collapseLyric(); return 'handled'; }
+      if (np && np.classList.contains('open')) { closeNP(); return 'handled'; }
+      const si = $('#searchInput');
+      if (si && document.activeElement === si) { si.blur(); return 'handled'; }
+      /*
+       * 第 2 条：返回键两次确认退出。
+       * 没有可收的东西时不再直接退出，先在底部胶囊提示一次，
+       * 2.5 秒内再按一次才真的交回系统去 finish()。
+       */
+      const now = Date.now();
+      if (now - _exitHintAt < 2500) { _exitHintAt = 0; return 'exit'; }
+      _exitHintAt = now;
+      // H-10：判定窗口是 2500ms，提示也必须显示同样久，否则「提示没了却还能退出」
+      toastBottom('再按一次返回退出', '2 秒内再按一次就退出', 'info', 2500);
+      return 'handled';
+    } catch (e) { return 'exit'; }
+  };
 
   function openNP() {
     if (!Player.track) {
@@ -1685,14 +2762,25 @@
     closeQueue();
     closeComments();
     if (isLyricExpanded()) collapseLyric();
+    /* H-20：播放页推入的 0.52s 里才提升合成层 */
+    liftWhileAnimating($('#np'), 560);
+    liftWhileAnimating($('#npBg'), 560);
     $('#np').classList.add('open');
     refreshSystemBars();
-    requestAnimationFrame(sizeCover);
-    setTimeout(sizeCover, 220);
+    /*
+     * 打开播放页时强制发布一次封面尺寸 —— 这时播放页刚变成可见，
+     * 容器第一次有了真实高度，是该发布的时候。
+     * 只调用一次，且 publishCoverSize() 内部有「展开态跳过」和
+     * 「值没变不重复写」两道保护，不会在动画中乱改。
+     */
+    if (App._publishCoverSize) App._publishCoverSize();
     updatePlayIcons(Player.playing);
     $('#np').setAttribute('aria-hidden', 'false');
   }
   function closeNP() {
+    /* H-20：收起同样是 0.52s */
+    liftWhileAnimating($('#np'), 560);
+    liftWhileAnimating($('#npBg'), 560);
     $('#np').classList.remove('open');
     $('#np').setAttribute('aria-hidden', 'true');
     if (isLyricExpanded()) collapseLyric();
@@ -1705,6 +2793,38 @@
     return $('#np').classList.contains('expanded');
   }
 
+  /**
+   * 歌词区高度过渡（FLIP 思路）。
+   *
+   * 直接给 `flex-grow` 写过渡有两个坑，都实测过：
+   *   ① 收起态 flex:none（basis auto）→ 展开态 flex:1（basis 0%），
+   *      basis 不能插值，高度会先塌成 0 再长回来，开头抖一下；
+   *   ② 用 min-height 托底也不行：实测 126 → 109 → 170 → 452，
+   *      min-height 掉得比 flex-grow 涨得快，开头仍有 17px 下跌。
+   * 所以改成先量起始高度、切类后量目标高度，再用显式 height 过渡，
+   * 结束后清掉内联样式交还给 CSS。这样高度是严格单调的。
+   */
+  function animateLyricBox(expand) {
+    /*
+     * 1.2.23：整个函数现在只剩一次 class 切换。
+     *
+     * 以前这里有一整套「冻结封面尺寸 / 到点解冻 / 结束后重算」的补偿逻辑，
+     * 是围绕 JS 量尺寸那套架构长出来的。现在封面尺寸完全由 CSS 的
+     * width:100% + aspect-ratio + max-height 决定，浏览器在布局阶段自己算，
+     * 动画过程中它只会跟着容器一起变，不存在需要冻结的 inline 值，
+     * 也就不需要任何计时器去「事后修正」。
+     *
+     * 这同时消掉了两个老问题：
+     *   · 偶见封面变小 —— 某次测量在容器还没长开时跑了一遍，把 120px 那样
+     *     的小值写进 inline style，之后一直错着；
+     *   · 收回时歌名「再往下闪一下」—— 解冻后立刻重算尺寸，
+     *     在动画刚结束的那一刻又改了一次布局。
+     */
+    const np = $('#np');
+    if (!np) return;
+    np.classList.toggle('expanded', !!expand);
+  }
+
   function expandLyric() {
     const t = Player.track;
     if (!t) return;
@@ -1712,7 +2832,7 @@
       toast('暂无歌词', '这首歌还没匹配到歌词', 'info');
       return;
     }
-    $('#np').classList.add('expanded');
+    animateLyricBox(true);
     // 展开时信息都还在，只是封面收走、歌词长高
     lyricIdx = -2;
     syncLyric();
@@ -1729,10 +2849,7 @@
   }
 
   function collapseLyric() {
-    $('#np').classList.remove('expanded');
-    // 收回后重新算一次封面尺寸
-    setTimeout(sizeCover, 60);
-    setTimeout(sizeCover, 420);
+    animateLyricBox(false);
     Log.add('LYRIC', 'collapsed');
   }
 
@@ -1776,6 +2893,8 @@
 
   /* ================= 无限漫游 ================= */
   let _roamBusy = false;
+  /* 审查 3.1：心动模式的续队列互斥锁（漫游那边的 _roamBusy 已有） */
+  let _heartBusy = false;
   async function applyRoamMode() {
     const t = Player.track;
     if (!t || t.source !== 'online' || !t.neId) {
@@ -1845,6 +2964,14 @@
     if (!Netease.ready) return toast('在线功能不可用', '评论需要联网', 'warn');
 
     /*
+     * L-17：拉评论要一两秒，期间用户可能已经切歌。
+     * 之前 `t` 在 await 之前捕获、之后没有任何复核，
+     * 于是上一首歌的评论会直接覆盖到新歌的评论面板里。
+     * 现在请求回来先核对「当前曲目还是不是这首歌」，不是就整段丢弃。
+     */
+    const wantId = t.id;
+
+    /*
      * 拉评论要一两秒，之前这里只有一句「正在读取评论…」，
      * 打开面板时是一块空白，观感上像卡住了。
      * 现在先铺一层骨架屏（头像圆点 + 两行灰条），数据回来再换掉。
@@ -1860,15 +2987,21 @@
         + ' hot=' + data.hot.length + ' list=' + data.list.length);
     } catch (e) {
       Log.err('CMMT', e, t.title);
+      if (!Player.track || Player.track.id !== wantId) return;   // 已经切歌，别污染新面板
       $('#cmtCount').textContent = '失败';
       $('#cmtBody').innerHTML = `<div class="empty" style="padding:30px 0">
         <b>评论读取失败</b><p>${esc(e.message)}</p></div>`;
       return;
     }
+    // 切歌了就丢弃这次结果（面板可能已经为新歌清空/重填）
+    if (!Player.track || Player.track.id !== wantId) {
+      Log.add('CMMT', 'stale comments dropped for ' + t.title);
+      return;
+    }
 
     const fmtN = (n) => (n >= 10000 ? (n / 10000).toFixed(1) + ' 万' : String(n));
     const line = (c) => `<div class="cmt">
-        <div class="ava"><img src="${c.avatar || ''}" alt="" loading="lazy"></div>
+        <div class="ava"><img src="${safeCover(c.avatar)}" alt="" loading="lazy"></div>
         <div class="bd">
           <b>${esc(c.user)}</b>
           <p>${esc(c.content)}</p>
@@ -1921,6 +3054,7 @@
       try {
         const got = await Netease.songUrl(t.neId, qualityLevel());
         t.src = got.url;
+        t.srcAt = Date.now();          // 与 src 成对写入，否则 TTL 判定失效
         t.format = (got.type || 'mp3').toUpperCase();
       } catch (e) {
         return toast('取不到下载地址', e.message, 'warn');
@@ -1936,7 +3070,14 @@
       document.body.appendChild(a);
       a.click();
       a.remove();
-      toast('已开始下载', name, 'download');
+      /*
+       * F-16：这里必须说真话。
+       * 网易云音频在 m*.music.126.net（跨域），浏览器会忽略 download 属性；
+       * 同时 MainActivity 的 shouldOverrideUrlLoading 会把 http(s) 链接交给系统浏览器。
+       * 所以文件根本不会进 App 存储，「曲库 → 下载」筛选也永远看不到它。
+       * 旧文案「已开始下载」是带着成功提示的静默失败。
+       */
+      toast('已交给系统处理', '受网易云 CDN 限制，文件不会存进 Ripple 曲库；请到浏览器下载列表里找', 'download');
     } catch (e) {
       toast('下载失败', e.message, 'warn');
     }
@@ -2027,6 +3168,12 @@
 
   /* ================= 歌单详情 ================= */
   async function openPlaylist(plId, meta) {
+    /*
+     * H-1：#plPlay / #plShuffle 读的是 App._plCurrent。
+     * 失败时不清空就会保留「上一张歌单」，点播放全部会播上一张的歌，
+     * 标题却是新歌单 —— 张冠李戴。请求前先置空，成功后再赋值。
+     */
+    App._plCurrent = null;
     go('playlist');
     $('#plTitle').textContent = (meta && meta.title) || '歌单';
     $('#plSub').textContent = (meta && meta.sub) || '读取中…';
@@ -2057,7 +3204,16 @@
     $('#plTitle').textContent = data.title;
     $('#plSub').textContent = [data.creator, data.sub, data.desc].filter(Boolean).join(' · ');
     $('#plArt img').src = coverOf(data);
-    $('#plCount').textContent = data.tracks.length + ' 首';
+    /*
+     * H-7：再兜一层上限。上游虽然已经降到 300，但缓存/别的入口也可能塞进超长数组；
+     * 一次 innerHTML 上万个节点会把主线程卡死。
+     */
+    const PL_MAX = 300;
+    const total = data.tracks.length;
+    if (total > PL_MAX) data.tracks = data.tracks.slice(0, PL_MAX);
+    $('#plCount').textContent = total > PL_MAX
+      ? `前 ${PL_MAX} 首（共 ${total} 首）`
+      : total + ' 首';
     const cur = Player.track;
     $('#plTracks').innerHTML = data.tracks.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
       || '<div class="empty"><b>空歌单</b></div>';
@@ -2082,9 +3238,22 @@
       const v = (typeof RIPPLE_VERSION !== 'undefined' && RIPPLE_VERSION) || {};
       av.textContent = (v.name || '?') + ' · build ' + (v.code == null ? '?' : v.code);
     }
+    /* 窗口信息跟着设置页一起刷新：断点/方向变了以后这一行要跟着变 */
     $$('#themeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.theme === s.theme));
     $$('#fadeSeg button').forEach((b) => b.classList.toggle('on', +b.dataset.fade === +s.fade));
     $$('#qualitySeg button').forEach((b) => b.classList.toggle('on', b.dataset.q === s.quality));
+    /* 画面性能档位：读 RipplePerf 的真实状态（它还有一档是「实测帧率后自动降级」，
+       所以不能只看 localStorage，要看 html 上实际挂着的类）。 */
+    const perfMode = (window.RipplePerf && RipplePerf.mode()) || 'auto';
+    const perfLow = !!(window.RipplePerf && RipplePerf.isLow());
+    $$('#perfSeg button').forEach((b) => b.classList.toggle('on', b.dataset.perf === perfMode));
+    const perfHint = $('#perfHint');
+    if (perfHint) {
+      perfHint.textContent = perfMode === 'high' ? '高画质（始终开启毛玻璃与模糊）'
+        : perfMode === 'low' ? '省电（关闭毛玻璃、减少模糊）'
+        : perfLow ? '自动 · 已降级（实测帧率偏低）'
+        : '自动 · 当前高画质';
+    }
     const EQ_LABELS = { off: '关闭', pop: '流行', rock: '摇滚', vocal: '人声', bass: '低频', night: '夜间', custom: '自定义' };
     $('#eqVal').textContent = (EQ_LABELS[s.eq] || '关闭') + ' ›';
     $('#eqHint').textContent = s.eq === 'off'
@@ -2115,9 +3284,42 @@
       : (('mediaSession' in navigator) ? '锁屏 / 通知中心显示' : '此环境不支持');
     $('#sleepVal').textContent = (s.sleepMin ? s.sleepMin + ' 分钟 ›' : '关闭 ›');
     syncConnectionUI();
-    refreshSystemBars();
-    Log.add('BOOT', 'ready, logPath=' + Log.path());
-    setTimeout(refreshSystemBars, 400);
+    /*
+     * F-15：这两行是从 boot() 复制过来忘了删的。
+     * syncSettingsUI() 被 renderAll() 调用，而 renderAll() 又被点赞、导入、
+     * 清空、重置等每一个用户动作触发 —— 于是日志里塞满假的「BOOT: ready」，
+     * 每次还要多排一个 refreshSystemBars 定时器（启动期日志里那 3 次 BOOT: ready、
+     * 8 次 BARS: send 有一半来自这里）。
+     * 状态栏颜色已经由 applyTheme()/paletteFor() 负责，这里不需要再刷。
+     */
+    syncNormalizeRow();
+  }
+
+  /**
+   * F-1：让「音量归一化」这一行诚实反映它到底有没有效果。
+   * 归一化靠 gainNode，只有能接进音频图的音源（本地/同源）才走这条链路；
+   * 在线流是跨域直连，进了图会被判污染而静音，所以对在线曲目不生效。
+   * 播在线歌时把这一行置灰 + 换副标题说明，而不是让用户反复开关找不到原因。
+   */
+  function syncNormalizeRow() {
+    const sw = $('[data-set="normalize"]');
+    if (!sw) return;
+    const row = sw.closest('.set-row');
+    const sub = row && row.querySelector('.tx span');
+    const usable = Player.normalizeUsable ? Player.normalizeUsable() : false;
+    /*
+     * 播在线流时这一行置灰（点击仍然允许 —— 用户可以先开着，
+     * 切到本地歌就自动生效，没必要强制他先播本地歌才能设置）。
+     * CSS 不能改，所以用行内样式做视觉降级。
+     */
+    if (row) row.style.opacity = usable ? '' : '0.55';
+    if (sub) {
+      sub.textContent = !S().normalize
+        ? '仅对本地/同源音源生效（在线流跨域不可测）'
+        : (usable
+          ? '已启用 · 正在按实测响度拉平'
+          : '当前是在线流，对它不生效（CDN 不允许跨域读取）');
+    }
   }
 
   function syncConnectionUI() {
@@ -2202,19 +3404,63 @@
       toast('主题已切换', { dark: '深色', light: '浅色', auto: '跟随系统' }[next], 'theme');
     });
 
-    // 首页
-    $('#btnHeroPlay').addEventListener('click', () => {
-      const list = (App._dailyCache && App._dailyCache.length) ? App._dailyCache : Store.all();
-      if (!list.length) return toast('还没有可播的歌', '先导入音乐或搜索网易云', 'info');
-      playTrack(list[0], list);
-      openNP();
+    // 首页 · hero 是「无限漫游」入口
+    /*
+     * 主按钮：从 hero 当前展示的歌出发，开启漫游。
+     *
+     * 行为与播放页那个「无限漫游」模式一致：把相似歌曲灌进队列并立刻播放，
+     * 之后队列见底时会自动续（tail 里有 extendRoam 的钩子）。
+     */
+    $('#btnHeroPlay').addEventListener('click', async () => {
+      const seed = App._roamHero || pickSeedForRoam();
+      if (!seed || !seed.neId) {
+        return toast('还没有可漫游的歌', '先播一首在线歌，或在「我的」里收藏几首', 'info');
+      }
+      if (!Netease.ready) {
+        return toast('在线功能不可用', '漫游需要联网', 'warn');
+      }
+      toast('正在开启漫游…', seed.title, 'cloud');
+      try {
+        let list = await Netease.roamSongs(seed.neId, 30);
+        if (!list.length) list = await Netease.personalFm();
+        if (!list.length) throw new Error('没有拿到相似歌曲');
+        /*
+         * 队列顺序：**先播 hero 当前展示的那首**，再是它的相似歌曲。
+         *
+         * 以前这里是 [seed].concat(rest) —— 而 seed 是「种子歌」
+         * （当前播放 / 我喜欢的第一首 / 每日推荐随机），
+         * hero 卡片上写的却是另一首（漫游推荐）。
+         * 于是用户点了「无限漫游」，播出来的不是卡片上那首，
+         * 视觉和数据对不上。
+         *
+         * 现在以 hero 那首为起点：它既是第一首播的，也是这一轮漫游的种子。
+         */
+        const startTrack = App._roamHero && App._roamHero.neId ? App._roamHero : seed;
+        const rest = list.filter((x) => x && x.neId !== startTrack.neId);
+        const queue = [startTrack].concat(rest);
+        S().playMode = 'roam'; Store.save(); syncModeButtons();
+        App.context = queue;
+        playTrack(queue[0], queue);
+        openNP();
+        toast('漫游已开启', queue.length + ' 首 · 会一直续下去', 'infinite');
+      } catch (e) {
+        toast('漫游开启失败', e.message, 'warn');
+        Log.err('ROAM', e, 'hero play');
+      }
     });
-    $('#btnHeroShuffle').addEventListener('click', () => {
-      const list = (App._dailyCache && App._dailyCache.length) ? App._dailyCache : Store.all();
-      if (!list.length) return;
-      S().playMode = 'rand'; Store.save(); syncModeButtons();
-      playTrack(list[Math.floor(Math.random() * list.length)], list);
-      openNP();
+    /*
+     * 副按钮：换一首。
+     * 不重播、只换 hero 展示的那首（重新拉一批相似歌曲再挑一首）。
+     */
+    $('#btnHeroShuffle').addEventListener('click', async () => {
+      const seed = pickSeedForRoam();
+      if (!seed || !seed.neId) {
+        return toast('还没有可漫游的歌', '先播一首在线歌，或收藏几首', 'info');
+      }
+      if (!Netease.ready) return toast('在线功能不可用', '漫游需要联网', 'warn');
+      const got = await loadRoamHero(seed, true);
+      if (got) toast('换了一首', got.title, 'shuffle');
+      else toast('没拿到新的推荐', '稍后再试', 'warn');
     });
     $('#dailyMore').addEventListener('click', () => {
       if (!App._dailyCache || !App._dailyCache.length) return;
@@ -2319,10 +3565,45 @@
       const t = {
         id: 'url_' + Date.now(), source: 'local', title: url.split('/').pop().split('?')[0] || '网络音频',
         artist: '链接导入', album: '', duration: 0, cover: '', src: url, format: 'URL',
+        /*
+         * B-4：标记成跨域直链。
+         * 这类地址不返回 CORS 头，而 source:'local' 会把它路由到带
+         * crossOrigin='anonymous' 的 elB → 媒体加载按 CORS 判失败，
+         * 用户只看到「音源可能已失效」。remoteUrl 让 _pickEl 走不带
+         * crossOrigin 的 elC。
+         */
+        remoteUrl: true,
       };
+      /*
+       * 审查 3.3：以前只 unshift 进内存数组 Store.localTracks ——
+       * 既不写 IndexedDB、也不写 state.imports，**重启即消失**。
+       * 用户加了一首歌，下次打开发现没了，而且没有任何提示，
+       * 只会以为「软件坏了」。
+       *
+       * 现在：
+       *   · 记进 state.imports（这是持久化的清单，localStorage 里）
+       *   · 立刻 save() 落盘
+       *   · 同时尝试写 IndexedDB（元数据），失败也不影响使用
+       *     —— 直链曲目的音频本身在远端，不需要存文件，
+       *     但把元数据存下来可以让「曲库」列表在重启后完整恢复。
+       */
       Store.localTracks.unshift(t);
+      const imps = Store.state.imports = Store.state.imports || [];
+      if (!imps.some((x) => x && x.id === t.id)) {
+        imps.unshift({
+          id: t.id, source: 'local', title: t.title, artist: t.artist,
+          album: t.album, duration: t.duration, cover: t.cover,
+          src: t.src, format: t.format, remoteUrl: true,
+          at: Date.now(),
+        });
+      }
+      Store.save();
+      /* IndexedDB 写元数据：失败只记日志，不影响「本次会话可用」 */
+      if (!Store._volatile) {
+        Promise.resolve(Store.dbPut(t)).catch((e) => Log.err('IMPORT', e, 'url import dbPut'));
+      }
       renderAll();
-      toast('已添加', t.title, 'check');
+      toast('已添加', '重启后仍在曲库里', 'check');
     });
 
     // 歌单详情返回
@@ -2347,24 +3628,32 @@
       const v = e.target.value.trim();
       $('#searchClear').hidden = !v;
       clearTimeout(searchTimer);
-      if (!v) { renderSearchDefaults(); return; }
+      // 清空输入时也作废在飞的搜索，否则旧结果会盖回空搜索页
+      if (!v) { resetSearchSeq(); renderSearchDefaults(); return; }
       searchTimer = setTimeout(() => doSearch(v), 420);
     });
     $('#searchClear').addEventListener('click', () => {
       $('#searchInput').value = '';
       $('#searchClear').hidden = true;
+      clearTimeout(searchTimer);
+      resetSearchSeq();                       // F-3：清空后旧请求不得再写回结果
       renderSearchDefaults();
     });
     $$('#searchScope .chip').forEach((c) => c.addEventListener('click', () => {
       $$('#searchScope .chip').forEach((x) => x.classList.remove('on'));
       c.classList.add('on');
       App.scope = c.dataset.scope;
+      clearTimeout(searchTimer);
+      resetSearchSeq();                       // 换范围也作废上一范围的在飞请求
       const v = $('#searchInput').value.trim();
       if (v) doSearch(v);
       else if (App.scope === 'online') showOnlineIntro();
       else renderSearchDefaults();
     }));
     $('#searchBody').addEventListener('click', (e) => {
+      /* H-6：加载更多（按钮自己会 disabled，这里再挡一次重复点击） */
+      const more = e.target.closest('#searchMore');
+      if (more) { if (!more.disabled) loadMoreSearch(); return; }
       const hot = e.target.closest('[data-hot]');
       if (hot) {
         $('#searchInput').value = hot.dataset.hot;
@@ -2372,6 +3661,21 @@
         doSearch(hot.dataset.hot);
       }
     });
+    /*
+     * H-6：滚到底自动续取。
+     * 滚动容器是 .page[data-page="search"]（#searchBody 自己不是滚动容器），
+     * 距离底部 240px 内就预取下一页，loadMoreSearch 内部有 loading 锁，
+     * 连续滚动不会打出一串重复请求。
+     */
+    const searchPage = $('.page[data-page="search"]');
+    if (searchPage) {
+      searchPage.addEventListener('scroll', () => {
+        if (!_searchSession || _searchSession.loading) return;
+        if (_searchSession.loaded >= (_searchSession.total || 0)) return;
+        const rest = searchPage.scrollHeight - searchPage.scrollTop - searchPage.clientHeight;
+        if (rest < 240) loadMoreSearch();
+      }, { passive: true });
+    }
 
     // 播放页
     $('#npClose').addEventListener('click', closeNP);
@@ -2421,12 +3725,62 @@
     $('#cmtMask').addEventListener('click', closeComments);
     $('#cmtClose').addEventListener('click', closeComments);
 
+    /* ---------- 第 16 条：发表评论 ---------- */
+    const _cmtBtn = $('#cmtSend'), _cmtIn = $('#cmtInput');
+    if (_cmtBtn && _cmtIn) {
+      const doSendComment = async () => {
+        const t = Player.track;
+        if (!t || t.source !== 'online' || !t.neId) {
+          return toast('只能给在线歌曲评论', '', 'info');
+        }
+        if (!Netease.loggedIn) {
+          return toast('先登录网易云', '登录后才能发表评论', 'warn');
+        }
+        const text = _cmtIn.value.trim();
+        if (!text) return;
+        _cmtBtn.disabled = true;
+        _cmtBtn.textContent = '发送中';
+        try {
+          await Netease.addComment(t.neId, text);
+          _cmtIn.value = '';
+          toast('评论已发布', '', 'check');
+          // 重新拉一次，让刚发的评论立刻出现（接口有延迟就等它自己刷）
+          showComments();
+        } catch (e) {
+          toast('发表失败', e.message || '', 'warn');
+          if (e.needLogin) Log.add('CMT', 'need login to post');
+        } finally {
+          _cmtBtn.disabled = false;
+          _cmtBtn.textContent = '发送';
+        }
+      };
+      _cmtBtn.addEventListener('click', doSendComment);
+      _cmtIn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); doSendComment(); }
+      });
+    }
+
     // 歌词：点三行 → 页内展开；展开后再点行 → 跳转播放位置
-    $('#npLyricMini').addEventListener('click', expandLyric);
+    $('#npLyricMini').addEventListener('click', () => {
+      lyricFollow = true;
+      _lyricTouch = false;
+      _lyricRecenter = true;
+      const b = $('#npLyric');
+      if (b) b.classList.remove('free');
+      expandLyric();
+    });
     $('#npLyric').addEventListener('click', (e) => {
       const ln = e.target.closest('.ln');
-      if (ln && ln.dataset.t) Player.seek(+ln.dataset.t);
+      if (!ln || !ln.dataset.t) return;
+      // 用户点某一句 = 明确想回到这一句，恢复跟随
+      lyricFollow = true;
+      const box = $('#npLyric');
+      if (box) box.classList.remove('free');
+      Player.seek(+ln.dataset.t);
     });
+    /* 滚动监听是挂在 #npLyric 容器上的，启动时绑一次就够；
+       以前只在 renderLyric 里绑，没有歌词时完全没监听。 */
+    bindLyricScroll();
     // 展开态下：点歌名区域收起；返回键/下滑也能收
     $('#npMeta').addEventListener('click', () => {
       if (isLyricExpanded()) collapseLyric();
@@ -2460,7 +3814,25 @@
 
     // 设置
     $('#acctRow').addEventListener('click', () => {
-      if (!Netease.loggedIn) chooseLoginMode();
+      if (!Netease.loggedIn) { chooseLoginMode(); return; }
+      /* 登录之后这张卡右边的 › 以前是纯装饰，点了什么都不发生（空实现）。
+         现在打开账号详情：昵称 / VIP / 签名，外加刷新资料。 */
+      const p = Netease.profile || {};
+      modal(`
+        <h3>${esc(p.nickname || '我的账号')}</h3>
+        <p style="margin-bottom:14px">${esc(p.vip ? '黑胶 VIP' : '普通账号')}${p.signature ? ' · ' + esc(p.signature) : ''}</p>
+        <div class="modal-btns">
+          <button class="btn ghost" data-cancel>关闭</button>
+          <button class="btn solid" id="acctReload">刷新资料</button>
+        </div>
+      `);
+      $('#acctReload').onclick = async () => {
+        App._myPl = null;
+        await refreshAccount();
+        loadMyPlaylists();
+        loadHomeOnline();
+        toast('已刷新', (Netease.profile && Netease.profile.nickname) || '已重新拉取账号信息', 'check');
+      };
     });
     $('#themeSeg').addEventListener('click', (e) => {
       const b = e.target.closest('button[data-theme]');
@@ -2478,8 +3850,18 @@
       const b = e.target.closest('button[data-q]');
       if (!b) return;
       S().quality = b.dataset.q; Store.save(); syncSettingsUI();
-      // 换音质要重新解析地址
-      if (Player.track && Player.track.source === 'online') Player.track.src = null;
+      // F-12：同上 —— 不置空 src，改为后台重新解析地址
+      reResolveQuality();
+    });
+    /* 画面性能档位：自动 / 高画质 / 省电。改完立刻生效，不用重进 App。 */
+    $('#perfSeg').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-perf]');
+      if (!b) return;
+      const m = b.dataset.perf;
+      const low = (window.RipplePerf ? RipplePerf.set(m) : false);
+      syncSettingsUI();
+      toast(m === 'high' ? '已切到高画质' : m === 'low' ? '已切到省电' : '已交给自动判断',
+        low ? '当前：关闭毛玻璃、减少模糊' : '当前：毛玻璃与模糊全部开启', 'info');
     });
     $$('[data-set]').forEach((el) => {
       if (el.classList.contains('sw')) {
@@ -2559,7 +3941,10 @@
       renderAll();
       toast('已清空', '本地导入的音乐已删除', 'trash');
     });
-    $('#rowClearHistory').addEventListener('click', () => {
+    $('#rowClearHistory').addEventListener('click', async () => {
+      /* H-9：相邻的「清空已导入的音乐」有二次确认，这条却没有 ——
+         两个按钮长得一样，误触就永久删掉记录。补齐确认。 */
+      if (!(await confirmDialog('清除播放记录？', '已听时长与最近播放都会被清空，不影响已导入的音乐'))) return;
       Store.state.history = [];
       Store.state.playedSec = 0;
       Store.save(); renderAll();
@@ -2621,8 +4006,8 @@
     });
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) return;
-      // 用户可能刚从系统设置里授权回来，回前台就刷新一次真实状态
-      syncNotifyPermUI();
+      // 用户可能刚从系统设置里授权回来，回前台就强制重问一次真实状态
+      syncNotifyPermUI(true);
       if (S().theme !== 'auto') return;
       const want = systemPrefersDark() ? 'dark' : 'light';
       if (document.documentElement.dataset.theme !== want) {
@@ -2661,7 +4046,7 @@
       Player.setVolume(v);
       const h = $('#volHint'); if (h) h.textContent = Math.round(v * 100) + '%';
     }
-    if (k === 'normalize') Player.setNormalize(v);
+    if (k === 'normalize') { Player.setNormalize(v); syncNormalizeRow(); }
     if (k === 'gapless') { Player.setGapless(v); if (v) Player._prefetchNext(); }
     if (k === 'notifyQuiet') { /* 只是偏好，发通知时读取 */ }
     if (k === 'sbLyric') {
@@ -2744,17 +4129,127 @@
   }
 
   /* ================= 搜索 ================= */
+  /*
+   * F-3：搜索请求序号。
+   * 输入框只有 420ms 防抖，没有请求序号：输入「周杰伦」后马上改成「林俊杰」，
+   * 两个请求并发，先发的（周杰伦）如果后返回，会把林俊杰的结果覆盖掉 ——
+   * 输入框写着林俊杰，列表却是周杰伦。这里只接受最新一次请求的结果。
+   */
+  let _searchSeq = 0;
+  function resetSearchSeq() { _searchSeq++; }
+
+  /*
+   * ============ 搜索分页 ============
+   *
+   * H-6：以前固定只取 30 条，`offset` 参数在 Netease.searchSongs 里定义了却
+   * 全项目没人传 —— 界面还显示 songs.total（比如「单曲 · 3127」），
+   * 用户以为只有 30 首，剩下 99% 的结果永远取不到。
+   *
+   * 现在维护一份搜索会话（关键词 + 已取条数 + 总数），
+   * 滚到底或点「加载更多」时按 offset 继续取，并把结果**追加**到列表末尾。
+   * 换关键词/换范围都会重置会话，旧的在飞请求由 _searchSeq 作废。
+   */
+  const SEARCH_PAGE = 30;
+  let _searchSession = null;   // { kw, loaded, total, plLoaded }
+
+  /** 单曲行 + 末尾的「加载更多 / 已全部加载」提示 */
+  function searchSongsTailHTML(sess) {
+    if (!sess) return '';
+    const total = sess.total || sess.loaded;
+    if (sess.loaded >= total) {
+      return total > SEARCH_PAGE
+        ? `<div class="search-done">已经到底了 · 共 ${total} 首</div>` : '';
+    }
+    return `<button class="search-more" id="searchMore" type="button">
+      加载更多<span>${sess.loaded} / ${total}</span></button>`;
+  }
+
+  /** 把一批新单曲追加到现有列表（不重建已有节点，滚动位置不变） */
+  function appendSearchSongs(list, startIndex) {
+    const body = $('#searchBody');
+    const more = body.querySelector('#searchMore');
+    const done = body.querySelector('.search-done');
+    const host = more ? more.parentElement : (done ? done.parentElement : null);
+    if (!host) return;
+    /* 新行的 data-index 要接在已有行后面，否则点击播放会拿错曲目 */
+    const frag = document.createElement('div');
+    frag.innerHTML = list.map((t, i) => rowHTML(t, startIndex + i, false)).join('');
+    const listEl = host.querySelector('.list') || host;
+    while (frag.firstChild) listEl.insertBefore(frag.firstChild, more || done || null);
+  }
+
+  async function loadMoreSearch() {
+    const sess = _searchSession;
+    if (!sess || sess.loading) return;
+    if (sess.loaded >= (sess.total || 0)) return;
+    sess.loading = true;
+    const btn = $('#searchMore');
+    if (btn) { btn.disabled = true; btn.classList.add('loading'); }
+    const my = _searchSeq;
+    try {
+      const r = await Netease.searchSongs(sess.kw, SEARCH_PAGE, sess.loaded);
+      if (my !== _searchSeq) return;            // 期间换了关键词，丢弃
+      const got = (r && r.list) || [];
+      if (r && typeof r.total === 'number') sess.total = r.total;
+      if (!got.length) {
+        /* 上游给不出更多了：把总数收口到已取条数，尾巴换成「到底了」 */
+        sess.total = sess.loaded;
+        const more = $('#searchMore');
+        if (more) more.outerHTML = `<div class="search-done">已经到底了 · 共 ${sess.loaded} 首</div>`;
+        return;
+      }
+      appendSearchSongs(got, sess.loaded);
+      sess.loaded += got.length;
+      App.onlineResults = (App.onlineResults || []).concat(got);
+      const more = $('#searchMore');
+      if (more) {
+        if (sess.loaded >= sess.total) {
+          more.outerHTML = `<div class="search-done">已经到底了 · 共 ${sess.total} 首</div>`;
+        } else {
+          more.disabled = false;
+          more.classList.remove('loading');
+          const sp = more.querySelector('span');
+          if (sp) sp.textContent = sess.loaded + ' / ' + sess.total;
+        }
+      }
+    } catch (e) {
+      const more = $('#searchMore');
+      if (more) {
+        more.disabled = false;
+        more.classList.remove('loading');
+        const sp = more.querySelector('span');
+        if (sp) sp.textContent = '加载失败，点这里重试';
+      }
+      Log.err('SEARCH', e, 'loadMoreSearch');
+    } finally {
+      sess.loading = false;
+    }
+  }
+
   async function doSearch(kw) {
     const body = $('#searchBody');
+    /* B-1：有搜索结果时收起热搜/推荐介绍区，避免它们挂在结果上面 */
+    const intro = $('#searchIntro');
+    if (intro) intro.hidden = true;
+    const my = ++_searchSeq;                 // 每次调用都占一个序号（本地/在线都算）
+    _searchSession = null;                   // 新搜索：作废旧会话
     if (App.scope === 'online') {
       if (!Netease.ready) { showOnlineIntro(); return; }
       body.innerHTML = `<div class="empty"><b>搜索中…</b><p>${esc(kw)}</p></div>`;
       try {
         const [songs, pls] = await Promise.all([
-          Netease.searchSongs(kw, 30),
+          Netease.searchSongs(kw, SEARCH_PAGE, 0),
           Netease.searchPlaylists(kw, 8).catch(() => ({ list: [] })),
         ]);
+        if (my !== _searchSeq) return;         // 已有更新的请求，丢弃这次结果
         App.onlineResults = songs.list;
+        /* H-6：记下这次搜索的会话，供「加载更多」继续取 */
+        _searchSession = {
+          kw: kw,
+          loaded: songs.list.length,
+          total: typeof songs.total === 'number' ? songs.total : songs.list.length,
+          loading: false,
+        };
         let html = '';
         if (pls.list.length) {
           html += `<div class="sec-head"><span class="n">PL</span><h2>歌单 · ${pls.list.length}</h2></div>
@@ -2762,10 +4257,12 @@
         }
         html += `<div class="sec-head"><span class="n">NE</span><h2>单曲 · ${songs.total || songs.list.length}</h2></div>`;
         html += songs.list.length
-          ? `<div class="list">${songs.list.map((t, i) => rowHTML(t, i, false)).join('')}</div>`
+          ? `<div class="list">${songs.list.map((t, i) => rowHTML(t, i, false)).join('')}</div>
+             ${searchSongsTailHTML(_searchSession)}`
           : `<div class="empty"><b>没有找到</b><p>换个关键词试试</p></div>`;
         body.innerHTML = html;
       } catch (e) {
+        if (my !== _searchSeq) return;         // 过期请求的失败也不该覆盖新结果
         body.innerHTML = `<div class="empty"><b>搜索失败</b><p>${esc(e.message)}</p></div>`;
       }
       return;
@@ -2775,6 +4272,7 @@
       (t.title || '').toLowerCase().includes(q)
       || (t.artist || '').toLowerCase().includes(q)
       || (t.album || '').toLowerCase().includes(q));
+    if (my !== _searchSeq) return;
     App.onlineResults = null;
     body.innerHTML = res.length
       ? `<div class="sec-head"><span class="n">LOCAL</span><h2>本机 · ${res.length} 个结果</h2></div>
@@ -2785,6 +4283,8 @@
   function showOnlineIntro() {
     App.onlineResults = null;
     const ok = Netease.ready;
+    const intro = $('#searchIntro');
+    if (intro) intro.hidden = false;
     $('#searchBody').innerHTML = `<div class="empty">
       <svg><use href="#i-cloud"/></svg>
       <b>${ok ? '搜索你想听的歌' : '在线搜索不可用'}</b>
@@ -2811,6 +4311,7 @@
    * 这里负责：开关、把当前歌词行推过去、锁定、以及未锁定时弹出的调整面板。
    */
   let _sbNativeReady = false;
+  let _sbHidden = false;      // 已经确认隐藏过（避免重复跨桥，同时不误判页面重载后的状态）
   let _lastSbText = '';
 
   function sbNative() {
@@ -2823,10 +4324,20 @@
   }
 
   /** 把配置推给原生并（重新）显示 */
-  function applySbOverlay() {
+  let _sbApplySig = '';
+  function applySbOverlay(force) {
     const N = window.RippleNative;
     if (!N || typeof N.showLyricOverlay !== 'function') return;
     const s = S();
+    /*
+     * 跨桥幂等：syncSettingsUI() 每次用户动作都会走到这里，
+     * 而这里的参数（颜色/位置/字号/填充）九成没变。
+     * 参数签名没变且浮层已经在显示，就不再跨桥，省一次主线程 JNI 往返。
+     */
+    const sig = [!!s.sbLocked, s.sbColor, s.sbSize, s.sbAlpha, s.sbX, s.sbY,
+      !!s.sbBold, !!s.sbShadow, !!s.sbFill, s.sbFillColor].join('|');
+    if (!force && _sbNativeReady && sig === _sbApplySig) return;
+    _sbApplySig = sig;
     try {
       N.showLyricOverlay(
         String(!!s.sbLocked), s.sbColor || '#FFFFFF', String(s.sbSize || 12),
@@ -2836,6 +4347,7 @@
         String(!!s.sbFill), s.sbFillColor || '#7DE3D0'
       );
       _sbNativeReady = true;
+      _sbHidden = false;
       Log.add('LYRIC', 'overlay apply locked=' + s.sbLocked + ' color=' + s.sbColor);
     } catch (e) {
       Log.err('LYRIC', e, 'showLyricOverlay failed');
@@ -2846,8 +4358,16 @@
   function stopSbOverlay() {
     const N = window.RippleNative;
     if (!N || typeof N.hideLyricOverlay !== 'function') return;
+    /*
+     * 幂等但保守：只有在「上一次已确认隐藏成功」时才跳过跨桥。
+     * 不能用 _sbNativeReady 反推 —— 页面重载后它是 false，而原生那边的
+     * 浮层可能还留着，那种情况必须真的发一次 hide，否则浮层会卡在屏幕上。
+     */
+    if (_sbHidden) return;
     try { N.hideLyricOverlay(); } catch (e) {}
+    _sbHidden = true;
     _sbNativeReady = false;
+    _sbApplySig = '';
     _lastSbText = '';
   }
 
@@ -2859,10 +4379,7 @@
     let line = '';
     if (Player.track && lyricLines && lyricLines.length) {
       const t = Player.time() + (S().lyricOffset || 0);
-      let i = -1;
-      for (let k = 0; k < lyricLines.length; k++) {
-        if (lyricLines[k].t <= t) i = k; else break;
-      }
+      const i = lyricIndexAt(t);          // 二分，见 lyricIndexAt
       if (i >= 0) line = lyricLines[i].text || '';
     }
     if (!force && line === _lastSbText) return;
@@ -2872,6 +4389,7 @@
   }
 
   /** 把播放进度（0..1）推给浮层，用于文字填充效果 */
+  let _sbProgLast = -1;
   function pushSbProgress() {
     const N = window.RippleNative;
     if (!N || typeof N.setLyricProgress !== 'function') return;
@@ -2879,6 +4397,9 @@
     const d = Player.duration();
     if (!d || !isFinite(d)) return;
     const p = Math.max(0, Math.min(1, (Player.time() || 0) / d));
+    // 每 1% 才推一次：进度填充肉眼看不出更细的差别，没必要每秒跨桥
+    if (Math.abs(p - _sbProgLast) < 0.01) return;
+    _sbProgLast = p;
     try { N.setLyricProgress(String(p)); } catch (e) {}
   }
 
@@ -2950,10 +4471,10 @@
             `<div class="sld"><input type="range" min="9" max="22" step="1" data-sb="sbSize"></div>`)}
           ${optRow('i-eq', '不透明度', Math.round((s.sbAlpha == null ? 0.92 : s.sbAlpha) * 100) + '%',
             `<div class="sld"><input type="range" min="0.2" max="1" step="0.05" data-sb="sbAlpha"></div>`)}
-          ${optRow('i-eq', '加粗', '让歌词更醒目', `<label class="sw" data-sbsw="sbBold"></label>`)}
-          ${optRow('i-eq', '描边阴影', '深色壁纸上更清楚', `<label class="sw" data-sbsw="sbShadow"></label>`)}
+          ${optRow('i-eq', '加粗', '让歌词更醒目', `<label class="sw${s.sbBold ? ' on' : ''}" data-sbsw="sbBold"></label>`)}
+          ${optRow('i-eq', '描边阴影', '深色壁纸上更清楚', `<label class="sw${s.sbShadow ? ' on' : ''}" data-sbsw="sbShadow"></label>`)}
           ${optRow('i-play', '跟随进度填充', '已播放部分用另一种颜色',
-            `<label class="sw" data-sbsw="sbFill"></label>`)}
+            `<label class="sw${s.sbFill ? ' on' : ''}" data-sbsw="sbFill"></label>`)}
           ${s.sbFill ? `<div class="sb-custom-row">
             <span>填充色</span>
             <button class="sb-swatch" id="sbFillPickBtn" style="--c:${s.sbFillColor || '#7DE3D0'}"></button>
@@ -3306,6 +4827,8 @@
     return !!(N && typeof N.mediaState === 'function');
   }
 
+  let _mediaProgressKey = '';
+
   function pushMediaState(force) {
     const N = window.RippleNative;
     if (!N || typeof N.mediaState !== 'function') return;
@@ -3317,10 +4840,19 @@
     // 曲目信息没变就只推进度，省掉每次重设 metadata 的开销
     const key = [t.id, t.title, t.artist, t.album, cover, dur].join('|');
     if (!force && key === _mediaPushedKey) {
+      /*
+       * 进度也做值级幂等：暂停时每秒推同一个位置毫无意义，
+       * 而跨桥调用（JNI）正是启动/后台卡顿的主要来源之一。
+       * 位置变化不到 1 秒、播放态也没变，就整条跳过。
+       */
+      const pkey = pos + '|' + (Player.playing ? 1 : 0);
+      if (pkey === _mediaProgressKey) return;
+      _mediaProgressKey = pkey;
       try { N.mediaProgress(String(pos), String(dur), !!Player.playing); } catch (e) {}
       return;
     }
     _mediaPushedKey = key;
+    _mediaProgressKey = pos + '|' + (Player.playing ? 1 : 0);
     try {
       N.mediaState(t.title || '', t.artist || '', t.album || '', cover,
         String(dur), String(pos), !!Player.playing);
@@ -3339,6 +4871,13 @@
     else if (cmd === 'next') Player.next();
     else if (cmd === 'prev') Player.prev();
     else if (cmd === 'stop') { Player.pause(); }
+    /* 第 8 条：通知栏的「喜欢」。
+       直接借用播放页那个心形按钮的点击处理 —— 收藏/取消收藏、未登录提示、
+       与云端的同步都在那一个处理函数里，不重复实现一遍。 */
+    else if (cmd === 'like') {
+      const b = document.getElementById('npLike');
+      if (b) b.click();
+    }
     setTimeout(() => pushMediaState(true), 60);
   };
   window.__rippleMediaSeek = function (ms) {
@@ -3350,13 +4889,26 @@
 
   /* ================= 通知 ================= */
   /** 问原生「通知权限到底有没有」，并刷新设置页那一行 */
-  function syncNotifyPermUI() {
+  /** 上次问到的通知权限状态；null = 还没问过 */
+  let _notifyPermCache = null;
+  function syncNotifyPermUI(force) {
     const N = window.RippleNative;
     const h = $('#permHint'), v = $('#permVal');
     if (!h || !v) return;
     if (N && typeof N.notifyGranted === 'function') {
-      let ok = false;
-      try { ok = !!N.notifyGranted(); } catch (e) {}
+      /*
+       * notifyGranted() 是一次跨桥调用，而 syncSettingsUI() 会被每个用户动作触发。
+       * 权限状态平时不会变，只有「从系统设置回来」或原生回调才会变 ——
+       * 所以这里缓存结果，只在 force 时才真的跨桥问一次（省 JNI 往返）。
+       */
+      let ok;
+      if (!force && _notifyPermCache !== null) {
+        ok = _notifyPermCache;
+      } else {
+        ok = false;
+        try { ok = !!N.notifyGranted(); } catch (e) {}
+        _notifyPermCache = ok;
+      }
       h.textContent = ok ? '已授权 · 静默通知' : '未授权';
       v.textContent = ok ? '已开启' : '授权 ›';
       return ok;
@@ -3374,7 +4926,8 @@
 
   /* 原生申请权限后会回调这里，让设置页立刻显示真实状态 */
   window.__rippleNotifyPerm = function (ok) {
-    syncNotifyPermUI();
+    _notifyPermCache = null;
+    syncNotifyPermUI(true);
     toast(ok ? '通知权限已开启' : '通知权限被拒绝', '', ok ? 'check' : 'warn');
   };
   function nativeNotify() {
@@ -3439,7 +4992,7 @@
   /* ================= 手势 ================= */
   function bindGestures() {
     const np = $('#np');
-    let sx = 0, sy0 = 0, dragging = false, fromTop = false;
+    let sx = 0, sy0 = 0, dragging = false, fromTop = false, onCoverStart = false;
 
     /*
      * 下拉关闭只在「顶部空白 / 关闭键 / 封面」上生效。
@@ -3454,6 +5007,82 @@
      */
     const inSheet = (el) => !!(el && el.closest
       && el.closest('.np-sheet, .sheet-mask, .queue, .opt-body, .cmt-body, .sb-colors'));
+    /* ---------- 第 4 条：封面横向跟手 + 下一首封面滑入 ----------
+     * 交互约定：
+     *   · 手指按在封面上横向拖 → 当前封面跟手位移并轻微缩小，
+     *     下一首（往左拖）或上一首（往右拖）的封面从对面滑进来
+     *   · 松手超过封面宽度 30% → 完成切换并播完滑入动画
+     *   · 没到 30% → 弹回原位
+     *   · 竖向为主的拖动仍然交给「下滑关闭播放页」那条老逻辑，
+     *     两套手势在第一帧按主轴方向分流，互不抢
+     */
+    const _cv = $('#npCover');
+    const _cvPeek = $('#npCoverPeek');
+    const _cvPeekImg = $('#npCoverPeekImg');
+    let _cvArmed = false;      // 起点在封面上，等方向判断
+    let _cvActive = false;     // 已判定为横向，接管手势
+    let _cvW = 240;
+    let _cvSign = 1;           // +1 = 下一首从右侧进；-1 = 上一首从左侧进
+
+    function _cvNeighbor(next) {
+      const q = (Player && Player.queue) || [];
+      if (!q.length) return null;
+      const n = q.length;
+      const i = (Player.index == null ? 0 : Player.index);
+      return next ? q[(i + 1) % n] : q[(i - 1 + n) % n];
+    }
+    function _cvUrl(t) {
+      return (t && (t.cover || t.picUrl || (t.al && t.al.picUrl))) || '';
+    }
+    function _cvPeekAt(offset, opacity) {
+      if (!_cvPeek) return;
+      _cvPeek.style.transform = 'translate(-50%,-50%) translateX(' + offset + 'px)';
+      _cvPeek.style.opacity = String(opacity);
+    }
+    function _cvBegin(dx) {
+      if (!_cv) return;
+      _cvW = _cv.getBoundingClientRect().width || 240;
+      _cvSign = dx < 0 ? 1 : -1;                 // 往左拖 → 下一首
+      const nb = _cvNeighbor(_cvSign === 1);
+      const url = _cvUrl(nb);
+      if (_cvPeekImg) _cvPeekImg.src = url;
+      if (_cvPeek) _cvPeek.style.visibility = url ? '' : 'hidden';
+      _cv.style.transition = 'none';
+      if (_cvPeek) _cvPeek.style.transition = 'none';
+    }
+    function _cvDrag(dx) {
+      if (!_cv) return;
+      const gap = _cvW + 14;
+      const p = Math.min(1, Math.abs(dx) / (_cvW * 0.45));
+      _cv.style.transform = 'translateX(' + dx + 'px) scale('
+        + (1 - Math.min(0.05, Math.abs(dx) / _cvW * 0.05)).toFixed(3) + ')';
+      _cvPeekAt(_cvSign * gap + dx, p);
+    }
+    function _cvEnd(commit) {
+      if (!_cv) return;
+      const w = _cvW || 240;
+      const gap = w + 14;
+      const tr = 'transform .24s var(--ease-soft),opacity .24s var(--ease-soft)';
+      _cv.style.transition = tr;
+      if (_cvPeek) _cvPeek.style.transition = tr;
+      if (commit) {
+        // 当前封面飞出，预览封面归位 → 再真正切歌，然后无动画复位
+        _cv.style.transform = 'translateX(' + (-_cvSign * (w + 40)) + 'px) scale(.94)';
+        _cvPeekAt(0, 1);
+        setTimeout(() => {
+          try { _cvSign === 1 ? Player.next() : Player.prev(); } catch (e) {}
+          _cv.style.transition = 'none';
+          if (_cvPeek) _cvPeek.style.transition = 'none';
+          _cv.style.transform = '';
+          _cvPeekAt(_cvSign * gap, 0);
+          void _cv.offsetWidth;   // 强制 reflow，避免复位被当成一次动画
+        }, 230);
+      } else {
+        _cv.style.transform = '';
+        _cvPeekAt(_cvSign * gap, 0);
+      }
+    }
+
     np.addEventListener('touchstart', (e) => {
       const t = e.targetTouches[0];
       sy0 = t.clientY; sx = t.clientX;
@@ -3463,9 +5092,18 @@
         return;
       }
       const onScroll = inScrollable(e.target);
-      fromTop = !onScroll && (
-        t.clientY < 220 || e.target.closest('#npClose') || e.target.closest('.np-cover'));
-      dragging = !onScroll || !!e.target.closest('.np-cover');
+      /*
+       * H-5：以前「播放页顶部 220px 内横滑 60px」就切歌，顶部误触很容易换掉歌。
+       * 现在竖向下滑关闭仍允许从顶部区域开始（<120px），
+       * 但横向切歌只在封面起手时才生效。
+       */
+      const onCover = !!e.target.closest('.np-cover');
+      onCoverStart = onCover;            // H-5：只有封面起手才允许横向切歌
+      fromTop = !onScroll && (t.clientY < 120 || e.target.closest('#npClose') || onCover);
+      dragging = !onScroll || onCover;
+      // 起点在封面上：可能是横切封面、也可能是纵向下滑关闭，等第一帧定方向
+      _cvArmed = !inSheet(e.target) && !!e.target.closest('.np-cover');
+      _cvActive = false;
     }, { passive: true });
 
     np.addEventListener('touchmove', (e) => {
@@ -3473,6 +5111,16 @@
       const t = e.targetTouches[0];
       const dy = t.clientY - sy0;
       const dx = t.clientX - sx;
+      /* 第一帧按主轴方向分流：横向 = 封面跟手切歌，纵向 = 下滑关闭 */
+      if (_cvArmed && !_cvActive) {
+        if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+          _cvActive = true;
+          _cvBegin(dx);
+        } else if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) {
+          _cvArmed = false;
+        }
+      }
+      if (_cvActive) { _cvDrag(dx); return; }
       if (dy > 8 && fromTop && Math.abs(dy) > Math.abs(dx)) {
         np.style.transform = `translateY(${Math.max(0, dy)}px)`;
         np.style.transition = 'none';
@@ -3485,10 +5133,18 @@
       const t = e.changedTouches[0];
       const dy = t.clientY - sy0;
       const dx = t.clientX - sx;
+      if (_cvActive) {
+        _cvActive = false;
+        _cvArmed = false;
+        // 超过封面宽度 30% 才算切歌，否则弹回
+        _cvEnd(Math.abs(dx) > (_cvW || 240) * 0.3);
+        return;
+      }
+      _cvArmed = false;
       np.style.transition = '';
       np.style.transform = '';
       if (fromTop && dy > 90) { closeNP(); return; }
-      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.6) {
+      if (onCoverStart && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.6) {
         dx < 0 ? Player.next() : Player.prev();
       }
     });
@@ -3554,6 +5210,16 @@
       document.body.appendChild(wrap);
       requestAnimationFrame(() => wrap.classList.add('on'));
       const close = (v) => {
+        /*
+         * L-19：关闭弹窗前必须 blur() 里面的输入框。
+         * Android WebView 里 input 失去 DOM 后焦点不会自动释放，
+         * 软键盘会一直盖在页面上、挡住底部按钮（用户只能手动按返回）。
+         * 先 blur 再移除节点，键盘才会真的收起。
+         */
+        const active = document.activeElement;
+        if (active && (wrap.contains(active) || active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+          try { active.blur(); } catch (e) {}
+        }
         wrap.classList.remove('on');
         setTimeout(() => wrap.remove(), 260);
         resolve(v);
@@ -3585,8 +5251,34 @@
     `, { confirm: true });
   }
 
+  /**
+   * 第 4 条：窗口信息并入「软件日志」。
+   * 以前它单独占一行，但它的用途只是排查（窄栏/断点没命中），
+   * 和日志是同一类东西；合在一起以后复制日志时窗口信息会一起带出去。
+   */
+  function winInfoText() {
+    const w = Math.round(innerWidth || 0), h = Math.round(innerHeight || 0);
+    const d = Math.round((window.devicePixelRatio || 1) * 100) / 100;
+    let railW = 0, cmax = '';
+    try {
+      const cs = getComputedStyle(document.documentElement);
+      railW = parseFloat(cs.getPropertyValue('--rail-w')) || 0;
+      cmax = (cs.getPropertyValue('--content-max') || '').trim();
+    } catch (e) {}
+    let out = '视口 ' + w + '×' + h + ' · dpr ' + d
+      + ' · ' + (railW > 0 ? '竖排导航' : '底部导航')
+      + (cmax ? ' · 内容上限 ' + cmax : '');
+    try {
+      const sw = Math.round(screen.width || 0), sh = Math.round(screen.height || 0);
+      const full = w > h ? Math.max(sw, sh) : Math.min(sw, sh);
+      if (full > 0 && w < full * 0.8) out += ' · 窗口被系统限宽（屏幕 ' + full + '）';
+    } catch (e) {}
+    const v = (typeof RIPPLE_VERSION !== 'undefined' && RIPPLE_VERSION) || {};
+    return '[设备] ' + out + '\n[版本] ' + (v.name || '?') + ' · build ' + (v.code == null ? '?' : v.code);
+  }
+
   function showLog() {
-    const text = Log.nativeDump() || '(日志为空)';
+    const text = winInfoText() + '\n\n' + (Log.nativeDump() || '(日志为空)');
     const where = Log.path();
     $('#logHint').textContent = where || '记录中';
     modal(`
@@ -3646,7 +5338,13 @@
   function toast(title, desc, icon) {
     const wrap = $('#toasts');
     if (!wrap) return;
-    const key = title + '\u0000' + (desc || '');
+    /*
+     * L-15：去重键必须带上 type。
+     * 旧键只有「标题+正文」，不同事件撞键就会被吞掉 ——
+     * 例如 1.2 秒内连点两首歌，两条「正在解析音源…」只弹一条，
+     * 用户以为第二次没点上（也正是 F-13 反馈里那种「点了没反应」）。
+     */
+    const key = (icon || '') + '\u0000' + title + '\u0000' + (desc || '');
     const now = Date.now();
     // 同一内容 1.2 秒内不重复弹
     if (key === _lastToastKey && now - _lastToastAt < 1200) return;
@@ -3670,31 +5368,63 @@
     setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 320); }, 3200);
   }
 
+  /* ---------- 第 5 条：底部 dock 胶囊提示 + 两次下拉退出 ----------
+   * 顶部 toasts 表达「通知」，底部这个表达「操作确认」：
+   * 只保留一条、短、贴着 dock 上方，做成胶囊形状。
+   */
+  let _toastBottomTimer = null;
+  let _exitHintAt = 0;
+
+  function toastBottom(title, desc, icon, ms) {
+    const wrap = $('#toastsBottom');
+    if (!wrap) return;
+    wrap.innerHTML = '';            // 底部只留一条，避免堆叠盖住 dock
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.innerHTML = `<div class="ic"><svg><use href="#${ICONS[icon] || 'i-info'}"/></svg></div>
+      <div class="ti"><b>${esc(title)}</b>${desc ? `<p>${esc(desc)}</p>` : ''}</div>`;
+    wrap.appendChild(el);
+    clearTimeout(_toastBottomTimer);
+    _toastBottomTimer = setTimeout(() => {
+      el.classList.add('out');
+      setTimeout(() => el.remove(), 300);
+    }, ms || 1800);
+  }
+
   /* ================= 杂项 ================= */
   /* ================= 记忆上次播放（歌曲 + 进度 + 队列） ================= */
 
   /** 节流保存进度，避免每秒写 localStorage */
   let _progressAt = 0;
+  /*
+   * L-16：两个层面的降频。
+   * ① 时间：从 4 秒放宽到 12 秒（进度是用来「续播」的，秒级精度没有意义）。
+   * ② 数据量：不再 Store.save() 序列化整个 state（history 200 + onlineCache 60），
+   *    改走 Store.saveProgress() 只写 4 个进度字段（几十字节）。
+   */
+  const PROGRESS_EVERY = 12000;
   function rememberProgress(force) {
     const t = Player.track;
     if (!t) return;
     const now = Date.now();
-    if (!force && now - _progressAt < 4000) return;
+    if (!force && now - _progressAt < PROGRESS_EVERY) return;
     /* 「已听分钟」统计：顺手把两次调用之间真正在播的秒数累加进去。
        以前 Store.addPlayed() 定义了却从没人调用，统计永远显示 0。 */
     if (Player.playing && _progressAt) {
       const dt = (now - _progressAt) / 1000;
-      if (dt > 0 && dt < 30) Store.addPlayed(dt);   // 超过 30s 视为挂起/后台，不计入
+      if (dt > 0 && dt < 40) Store.addPlayed(dt);   // 超过 40s 视为挂起/后台，不计入
     }
     _progressAt = now;
-    S().lastTrackId = t.id;
-    S().lastPosition = Math.max(0, Player.time() || 0);
-    // 队列只存 id，重启后重新映射到曲目对象
+    const pos = Math.max(0, Player.time() || 0);
     const q = (Player.queue && Player.queue.length ? Player.queue : [t])
       .slice(0, 200).map((x) => x.id);
+    S().lastTrackId = t.id;
+    S().lastPosition = pos;
     S().lastQueue = q;
     S().queueIndex = Player.index;
-    Store.save();
+    Store.saveProgress({
+      lastTrackId: t.id, lastPosition: pos, lastQueue: q, queueIndex: Player.index,
+    });
   }
 
   /** 把 id 列表还原成曲目对象（本地曲目、在线缓存、搜索结果都能找回来） */
@@ -3749,6 +5479,7 @@
           const got = await Netease.songUrl(t.neId, k);
           if (got && got.url) {
             t.src = got.url;
+            t.srcAt = Date.now();      // 与 src 成对写入
             t.format = (got.type || 'mp3').toUpperCase();
             Log.add('RESTORE', 'resolve ok level=' + got.level + ' trial=' + got.trial);
             break;

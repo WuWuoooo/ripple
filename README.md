@@ -11,19 +11,28 @@
 
 ## 它长什么样
 
-> 截图占位 —— 欢迎提 PR 补充（放在 `docs/screenshots/`，然后在这里引用）
+| 首页 | 播放页 |
+|:---:|:---:|
+| <img src="docs/screenshots/home.png" width="300"> | <img src="docs/screenshots/player.png" width="300"> |
 
-<!--
-| 首页 | 播放页 | 播放设置 | 均衡器 |
-|---|---|---|---|
-| ![](docs/screenshots/home.png) | ![](docs/screenshots/player.png) | ![](docs/screenshots/options.png) | ![](docs/screenshots/eq.png) |
--->
+| 完整歌词 | 播放设置 |
+|:---:|:---:|
+| <img src="docs/screenshots/lyrics.png" width="300"> | <img src="docs/screenshots/options.png" width="300"> |
+
+| 均衡器 | 状态栏歌词 |
+|:---:|:---:|
+| <img src="docs/screenshots/eq.png" width="300"> | <img src="docs/screenshots/sblyric.png" width="300"> |
+
+<img src="docs/screenshots/notification.png" width="640">
+
+> 真机截图：vivo V2425A / Android 17。通知与原子岛由系统按 MediaSession 渲染。
 
 ## 特点
 
 **播放**
 
 - 双 `<audio>` 元素架构：在线流直连解码（避开 CORS 污染），本机导入走 WebAudio（可接均衡器）
+- 多尺寸适配：小屏手机 / 常规手机 / 大屏手机 / 折叠屏 / 平板 / 桌面各有一套布局，支持小窗与分屏
 - 淡入淡出、播放速度、睡眠定时（跨重启恢复）、无缝预加载、音量归一化
 - 断点续播：退出后重进自动恢复上次的歌与进度，**歌词也会一起恢复**
 
@@ -114,7 +123,7 @@ app/                    ← 网页版，同时是 APK 里的 assets/www
 └── sw.js               ← Service Worker
 
 android/                ← Java 外壳（8 个类，见 BUILD-ANDROID.md）
-server.js               ← 浏览器模式的本地服务（静态 + /ncm + /audio 代理）
+server.js               ← 浏览器模式的本地服务（静态 + /ncm 代理）
 version.json            ← 版本号唯一来源
 ```
 
@@ -124,12 +133,17 @@ version.json            ← 版本号唯一来源
 
 | 数据 | 存在哪 |
 |---|---|
-| 网易云登录态 | APK：应用私有配置；浏览器模式：`.ripple-cookie`（0600） |
+| 网易云登录态 | APK：应用私有配置；浏览器模式：`.ripple-cookie`（权限 0600，但 Android 外部存储不实现 POSIX 权限位，实际不生效） |
 | 本机导入的音频 | IndexedDB / 应用私有目录 |
 | 播放记录、设置 | localStorage / SharedPreferences |
 | 运行日志 | `Download/Ripple-log.txt`（不含密码） |
 
 `.ripple-cookie`、`.ripple-token` 都在 `.gitignore` 里，不会被提交。
+
+> **关于 0600 的说明**：本项目常跑在 `/sdcard/DSHBox/ripple`（Android 内部存储，
+> fuseblk 挂载）。该挂载不实现 POSIX 权限位，`chmod 0600` 是空操作。
+> 服务启动时会读回文件 mode 校验，不符即打印醒目警告。
+> 如果这台机器上还有其它 App 能读你的内部存储，请把项目移到应用私有目录再运行。
 
 安全相关请读 [SECURITY.md](SECURITY.md)。
 

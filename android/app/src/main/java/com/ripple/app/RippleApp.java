@@ -22,16 +22,32 @@ public class RippleApp extends Application {
         super.onCreate();
         LogBridge.add(this, "APP", "onCreate start, sdk=" + Build.VERSION.SDK_INT
                 + " " + Build.MANUFACTURER + " " + Build.MODEL
-                + " version=1.0.0(100)");
+                + " version=1.1.0(110)");
         CrashLog.installQuietly(this);
         readPreviousExit(this);
 
-        // 连续两次没走到前台就重启 → 关掉边缘到边缘和 inset 注入（保守模式）
+        /*
+         * 崩溃自保护：连续多次「没走到前台就重启」才关掉 edge-to-edge。
+         *
+         * 这里原来是 streak >= 1，等于「只要重启过一次就永久降级」——
+         * 而清零逻辑挂在 MainActivity 的 pageLoaded 回调里（延迟 2.6 秒），
+         * 用户如果在 2.6 秒内退出（试完就关、切走再回、点错就退），
+         * streak 永远清不掉，于是**下次启动又进 safeMode**，越用越容易中。
+         *
+         * 症状很有辨识度：视口变矮约 60px、状态栏不被背景覆盖、
+         * 整个页面下移、顶部内容被压在状态栏下方。
+         *
+         * 改成 3 次：真的连续崩 3 次才降级，偶发退出不受影响。
+         * 同时把「清零」也提前到 onCreate 之后只要没崩就清（见 MainActivity）。
+         */
         try {
             android.content.SharedPreferences sp = getSharedPreferences(SP, Context.MODE_PRIVATE);
             int streak = sp.getInt(KEY_BOOT_STREAK, 0);
             sp.edit().putInt(KEY_BOOT_STREAK, streak + 1).apply();
-            StrictModes.safeMode = streak >= 1;
+            StrictModes.safeMode = streak >= 3;
+            if (StrictModes.safeMode) {
+                LogBridge.add(this, "APP", "safeMode ON (streak=" + streak + ")，已关闭 edge-to-edge");
+            }
         } catch (Throwable ignored) {
         }
     }

@@ -151,6 +151,17 @@ public class LyricOverlay {
             } else {
                 view.setVisibility(View.VISIBLE);
                 view.setText(v);
+                /*
+                 * 窗口宽度是「包住文字」的，所以每换一句歌词窗口宽度都会变。
+                 * 如果当前是默认位置（没手动拖过），必须重新居中，
+                 * 否则长句会从中间开始、短句还停在上一句的左边。
+                 */
+                if (posX < 0) {
+                    view.post(() -> {
+                        if (view == null || lp == null || !added) return;
+                        centerHorizontally();
+                    });
+                }
             }
         });
     }
@@ -178,6 +189,17 @@ public class LyricOverlay {
                 view.setHorizontallyScrolling(true);
                 view.setIncludeFontPadding(false);
                 view.setPadding(dp(2), dp(1), dp(2), dp(1));
+                /*
+                 * 文字在窗口内居中。
+                 * 以前这里没有设 gravity，配合 MATCH_PARENT 宽度的窗口，
+                 * 文字永远从屏幕最左边开始 —— 用户拖动时看到的「锚点」是左边缘，
+                 * 拖到屏幕中间文字就整体偏左。现在窗口改成包住文字（WRAP_CONTENT），
+                 * 窗口走到哪文字就在哪，视觉锚点就是文字本身。
+                 */
+                view.setGravity(Gravity.CENTER);
+                /* 长歌词别把窗口撑出屏幕：给一个上限，超了走跑马灯 */
+                final int screenW = ctx.getResources().getDisplayMetrics().widthPixels;
+                view.setMaxWidth(Math.max(dp(120), screenW - dp(24)));
 
                 lp = new WindowManager.LayoutParams();
                 lp.type = Build.VERSION.SDK_INT >= 26
@@ -185,7 +207,13 @@ public class LyricOverlay {
                         : WindowManager.LayoutParams.TYPE_PHONE;
                 lp.format = PixelFormat.TRANSLUCENT;
                 lp.gravity = Gravity.TOP | Gravity.START;
-                lp.width = WindowManager.LayoutParams.MATCH_PARENT;
+                /*
+                 * 从 MATCH_PARENT 改成 WRAP_CONTENT：
+                 *  · 窗口正好包住文字 → 拖动时「拖的是文字」，不会出现拖到中间还偏左；
+                 *  · 默认位置改成「屏幕水平居中」，见 applyPosition()。
+                 * 长歌词由 TextView 的 maxWidth 兜住，超出部分走跑马灯。
+                 */
+                lp.width = WindowManager.LayoutParams.WRAP_CONTENT;
                 lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
                 // 默认不拦触摸：锁定态就是纯展示，绝不影响用户操作别的 App
                 lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -303,7 +331,14 @@ public class LyricOverlay {
         applyPosition();
     }
 
-    /** 按 posX/posY 摆放；负值表示回到默认位置 */
+    /**
+     * 按 posX/posY 摆放；负值表示回到默认位置。
+     *
+     * 默认位置 = 屏幕水平居中 + 状态栏下沿。
+     * 保存过的位置按「窗口左边缘」还原，再钳进屏幕范围内 ——
+     * 以前这里写的是 lp.x = Math.max(0, posX)，既不让负值出现，
+     * 也从不考虑窗口宽度，于是窗口右侧经常被屏幕裁掉一截。
+     */
     private void applyPosition() {
         if (lp == null) return;
         try {
@@ -319,12 +354,57 @@ public class LyricOverlay {
             } else {
                 lp.y = posY;
             }
-            lp.x = Math.max(0, posX);
+            if (posX < 0) {
+                centerHorizontally();          // 默认：居中（要等窗口量出宽度）
+            } else {
+                lp.x = clampX(posX);
+            }
             LogBridge.add(ctx, "LYRIC", "position x=" + lp.x + " y=" + lp.y
                     + " (saved " + posX + "," + posY + ")");
         } catch (Throwable e) {
             CrashLog.record(ctx, "lyric-pos", e);
             if (lp != null) lp.y = dp(26);
+        }
+    }
+
+    /** 把窗口放到屏幕水平正中（窗口宽度取自上一次测量结果） */
+    private void centerHorizontally() {
+        final View v = view;
+        if (lp == null) return;
+        if (v == null) { lp.x = 0; return; }
+        Runnable place = () -> {
+            try {
+                if (lp == null) return;
+                int vw = v.getWidth();
+                int sw = ctx.getResources().getDisplayMetrics().widthPixels;
+                /* 还没量出来时先按内容宽度估一个，量完 applyPosition 会再来一次 */
+                if (vw <= 0 && v instanceof TextView) {
+                    vw = Math.min(sw, (int) ((TextView) v).getPaint().measureText(
+                            text == null ? "" : text) + dp(6));
+                }
+                if (vw <= 0) vw = sw;
+                lp.x = Math.max(0, (sw - vw) / 2);
+                if (added && view != null && wm != null) {
+                    try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
+                }
+            } catch (Throwable e) {
+                CrashLog.record(ctx, "lyric-center", e);
+            }
+        };
+        if (v.getWidth() > 0) place.run();
+        else v.post(place);
+    }
+
+    /** 把 x 钳到「窗口完全落在屏幕内」的范围 */
+    private int clampX(int x) {
+        try {
+            int sw = ctx.getResources().getDisplayMetrics().widthPixels;
+            int vw = view != null ? view.getWidth() : 0;
+            if (vw <= 0) vw = sw;
+            int max = Math.max(0, sw - vw);
+            return Math.max(0, Math.min(x, max));
+        } catch (Throwable e) {
+            return Math.max(0, x);
         }
     }
 
@@ -367,7 +447,7 @@ public class LyricOverlay {
                     float dx = ev.getRawX() - down[0];
                     float dy = ev.getRawY() - down[1];
                     if (Math.abs(dx) > dp(3) || Math.abs(dy) > dp(3)) moved[0] = true;
-                    lp.x = origin[0] + (int) dx;
+                    lp.x = clampX(origin[0] + (int) dx);
                     lp.y = Math.max(0, origin[1] + (int) dy);
                     try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
                     return true;

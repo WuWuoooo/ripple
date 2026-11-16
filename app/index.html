@@ -9,12 +9,65 @@
 <meta name="apple-mobile-web-app-title" content="Ripple">
 <meta name="description" content="Ripple 涟漪 · 一个会呼吸的手机音乐播放器">
 <title>Ripple 涟漪</title>
+<!--
+  第 12 条：首帧之前就把主题定下来。
+  <html data-theme="dark"> 是写死的，浅色模式下会先画一帧深色、JS 跑起来才换成浅色，
+  表现为「从黑色加载成白色」。这段必须内联、必须早于样式表 —— 样式表一解析就会上色，
+  等 app.js 再去改就晚了。顺便把 html 的底色和 meta[theme-color] 一起设好，
+  避免系统状态栏比内容慢半拍。
+-->
+<script>
+(function () {
+  try {
+    var theme = 'dark';
+    var raw = localStorage.getItem('ripple.state.v1');
+    if (raw) {
+      var st = JSON.parse(raw);
+      theme = (st && st.settings && st.settings.theme) || 'dark';
+    }
+    if (theme === 'auto') {
+      theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+        ? 'light' : 'dark';
+    }
+    if (theme !== 'light') theme = 'dark';
+    var root = document.documentElement;
+    root.dataset.theme = theme;
+    root.style.backgroundColor = theme === 'light' ? '#F1EEEA' : '#07070b';
+    var m = document.querySelector('meta[name="theme-color"]');
+    if (m) m.setAttribute('content', theme === 'light' ? '#F1EEEA' : '#07070b');
+  } catch (e) {}
+})();
+</script>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="assets/icons/icon-180.png">
 <link rel="icon" href="assets/icons/icon-192.png">
 <link rel="stylesheet" href="css/base.css">
 <link rel="stylesheet" href="css/layouts.css">
 <link rel="stylesheet" href="css/components.css">
+<link rel="stylesheet" href="css/responsive.css">
+<!--
+  性能档位的「首屏前粗判」：必须内联、必须在 <body> 之前跑完。
+  如果等 perf.js（在 body 末尾）再判断，首屏会先按高画质渲染一帧
+  （十几个 backdrop-filter + 整屏模糊），然后才挂上 perf-low 类降级，
+  用户会看到明显一闪。这里提前把类挂上，样式表直接就按低配渲染。
+  判断逻辑与 app/js/perf.js 里的 guessLow() 保持一致。
+-->
+<script>
+(function(){try{
+  var dpr=window.devicePixelRatio||1, sc=window.screen||{};
+  var phys=(sc.width||0)*(sc.height||0)*dpr*dpr;
+  var cores=navigator.hardwareConcurrency||0, mem=navigator.deviceMemory||0;
+  var low = phys>2000000 || (cores&&cores<=4) || (mem&&mem<=3);
+  if(!low && window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) low=true;
+  var m=null; try{ m=localStorage.getItem('ripple.perf.v1'); }catch(e){}
+  if(m==='high') low=false; else if(m==='low') low=true;
+  else { try{ if(localStorage.getItem('ripple.perf.auto')==='1') low=true; }catch(e){} }
+  if(low){
+    document.documentElement.classList.add('perf-low');
+    document.documentElement.setAttribute('data-perf','low');
+  } else document.documentElement.setAttribute('data-perf','high');
+}catch(e){}})();
+</script>
 </head>
 <body>
 
@@ -57,6 +110,44 @@
   <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-qr" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><rect x="10" y="10" width="4" height="4" fill="currentColor"/></symbol>
+
+  <!--
+    ============ 液态玻璃：折射滤镜 ============
+    这是「真液态玻璃」和「普通毛玻璃」的区别所在。
+
+    普通毛玻璃只做 backdrop-filter:blur() —— 背后的内容是**均匀模糊**的，
+    看起来像一块磨砂塑料。而 iOS 26 的 Liquid Glass 关键特征是
+    **边缘折射**：玻璃有厚度，靠近边缘的背景会被弯曲、错位，
+    中间区域则相对清晰（不是整体糊成一片）。
+
+    实现原理：backdrop-filter 除了 blur()/saturate() 这些函数，
+    还接受 url(#filterId) —— 指向一个 SVG 滤镜。
+    在 SVG 里用 feTurbulence 生成噪声、feDisplacementMap 按噪声位移像素，
+    就能让背后的内容真的「扭一下」，而不是单纯模糊。
+
+    warp-lg：大尺寸元素（底部 dock、tab 栏、设置卡片）
+    warp-sm：小尺寸元素（按钮、角标）—— 噪声频率更高，位移更小，
+             否则小元素上会被扭成噪点。
+
+    baseFrequency 控制纹理疏密：值越小，起伏越宽缓（更像玻璃的曲面）。
+    scale 控制位移幅度（px）：越大越夸张，太大就变成哈哈镜。
+    -->
+  <filter id="lg-warp" x="0" y="0" width="100%" height="100%"
+          filterUnits="objectBoundingBox" primitiveUnits="userSpaceOnUse">
+    <feTurbulence type="fractalNoise" baseFrequency="0.0032 0.0058"
+                  numOctaves="2" seed="17" result="noise"/>
+    <feGaussianBlur in="noise" stdDeviation="1.6" result="softNoise"/>
+    <feDisplacementMap in="SourceGraphic" in2="softNoise" scale="52"
+                       xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+  <filter id="lg-warp-sm" x="0" y="0" width="100%" height="100%"
+          filterUnits="objectBoundingBox" primitiveUnits="userSpaceOnUse">
+    <feTurbulence type="fractalNoise" baseFrequency="0.008 0.012"
+                  numOctaves="1" seed="29" result="noise"/>
+    <feGaussianBlur in="noise" stdDeviation="0.9" result="softNoise"/>
+    <feDisplacementMap in="SourceGraphic" in2="softNoise" scale="26"
+                       xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
 </svg>
 
 <div class="ambient"><i></i><i></i><i></i></div>
@@ -65,7 +156,7 @@
 <div class="app">
   <header class="topbar">
     <div class="hello">
-      <small id="helloDate">20:47 · 星期六</small>
+      <small id="helloDate">—</small>
       <h1 id="helloTitle">晚上好，欢迎回来</h1>
     </div>
 
@@ -156,12 +247,20 @@
         <button class="chip on" data-scope="online">网易云</button>
         <button class="chip" data-scope="local">本机导入</button>
       </div>
-      <div id="searchBody">
+      <!--
+        B-1：热搜/推荐必须放在 #searchBody **外面**。
+        以前它们是 #searchBody 的子节点，而 doSearch() 用 body.innerHTML 整体替换，
+        搜一次就把这两个节点抹掉；紧接着 renderSearchDefaults() 往 null 写 innerHTML
+        抛错 —— 而它在 renderAll() 里排在 syncSettingsUI/renderNP 之前，
+        于是搜过一次以后播放页和设置页整体停止刷新。
+      -->
+      <div id="searchIntro">
         <div class="sec-head"><span class="n">HOT</span><h2>热搜</h2></div>
         <div class="chiprow" id="hotWords"></div>
         <div class="sec-head"><span class="n">REC</span><h2>试试这些</h2></div>
         <div class="list" id="recList"></div>
       </div>
+      <div id="searchBody"></div>
     </section>
 
     <!-- ============ 歌单详情 ============ -->
@@ -238,6 +337,21 @@
             <div class="tx"><b>列表密度</b><span>紧凑 / 标准</span></div>
             <label class="sw" data-set="compactList"></label>
           </div>
+          <div class="set-row" id="rowPerf">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>画面性能</b><span id="perfHint">自动</span></div>
+            <div class="segmini" id="perfSeg">
+              <button data-perf="auto">自动</button><button data-perf="high">高画质</button><button data-perf="low">省电</button>
+            </div>
+          </div>
+          <!--
+            窗口信息：只读诊断行。
+            平板上出「中间一条窄栏」时，一行字就能分辨三种完全不同的原因：
+              1. 跑的不是新包        → 上面的「关于」版本号和预期对不上
+              2. 系统把窗口限窄了    → 视口宽度明显小于屏幕宽度（letterbox / 分屏 / 兼容模式）
+              3. 断点没命中         → 视口明明够宽，档位却还是「手机」
+            这三种的修法完全不同，先看清是哪一种再改，别靠猜。
+          -->
         </div>
       </div>
 
@@ -467,6 +581,12 @@
       <div class="np-cover art" id="npCover">
         <img alt=""><div class="gloss"></div><div class="ripple"></div>
       </div>
+      <!--
+        第 4 条：横向拖动封面时，下一首（或上一首）的封面从这里滑进来。
+        它平时 opacity:0 + pointer-events:none，只在拖动过程中被 JS 驱动，
+        所以不会影响任何点击，也不会被当成拖动目标。
+      -->
+      <div class="np-cover peek" id="npCoverPeek" aria-hidden="true"><img id="npCoverPeekImg" alt=""></div>
     </div>
 
     <div class="np-meta" id="npMeta">
@@ -525,6 +645,12 @@
       <button class="x" id="cmtClose">收起</button>
     </div>
     <div class="cmt-body" id="cmtBody"></div>
+    <!-- 第 16 条：评论列表下方的发布框 -->
+    <div class="cmt-send">
+      <input id="cmtInput" class="cmt-in" type="text" maxlength="140"
+             placeholder="说点什么…（登录后可发）" autocomplete="off">
+      <button class="cmt-go" id="cmtSend">发送</button>
+    </div>
   </div>
 
   <!-- 播放列表 -->
@@ -585,18 +711,23 @@
   </div>
 
 
-<div class="toasts" id="toasts"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<!-- 第 5 条：底部 dock 胶囊提示（下拉退出的确认等） -->
+<div class="toasts bottom" id="toastsBottom"></div>
 
 <input type="file" id="filePicker" accept="audio/*,.mp3,.flac,.m4a,.wav,.ogg,.aac" multiple hidden>
 
 <!-- 同源 server.js 托管时这里会返回访问令牌；APK/file:// 下 404 不影响（原生通道不需要） -->
 <script src="/ripple-token.js" onerror="void 0"></script>
 <script src="js/version.js"></script>
+<script src="js/perf.js"></script>
 <script src="js/log.js"></script>
 <script src="js/lrc.js"></script>
 <script src="js/netease.js"></script>
 <script src="js/store.js"></script>
 <script src="js/player.js"></script>
 <script src="js/app.js"></script>
+<!-- 内置动画调参器（临时工具，调好后删这一行和 js/animtune.js） -->
+<script src="js/animtune.js"></script>
 </body>
 </html>
