@@ -6,9 +6,9 @@
  * 2. POST /ncm/<cmd>  —— 真·网易云代理：Node 侧做 weapi 加密 + 带登录 cookie，
  *    和 APK 里 Java 的 NeteaseClient 是同一套协议（见 app/js/netease.js）
  *    鉴权：同源 + X-Ripple-Token，另按 IP 做令牌桶限流
- * 3. /ripple-token.js —— 访问令牌，只在同源请求下才下发
+ * 3. /ripple-token.js —— 页面加载时下发一次性短期令牌（见 settlePageNonce）
  *
- * 用法：node server.js [PORT]
+ * 用法：node server.js [PORT] [--data-dir <目录>]
  * 手机与电脑同一 Wi-Fi 时，用打印出来的局域网地址访问即可。
  */
 const http = require('http');
@@ -19,11 +19,49 @@ const os = require('os');
 const crypto = require('crypto');
 
 /*
- * 端口必须是 1-65535 的整数。以前直接 Number() 后丢给 listen()：
- * 传 abc 会得到 NaN → listen 抛 RangeError → 被 uncaughtException 兜住 →
- * 进程以退出码 0 结束，用户以为服务已经起来了。这里显式校验并 exit(1)。
+ * R-30：数据目录（.ripple-cookie / .ripple-token）默认仍是脚本所在目录，
+ * 但允许 --data-dir <路径> 指到别处。默认目录在 /sdcard 这类 fuse 挂载上
+ * chmod 是空操作（实测 0660），想真正 0600 就得把数据放进私有目录。
+ * 解析放在最前面：后面的 COOKIE_FILE / TOKEN_FILE 都依赖它。
  */
-const RAW_PORT = process.argv[2] || process.env.PORT || '8080';
+let DATA_DIR = __dirname;
+const POSITIONAL = [];
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === '--data-dir') {
+    const v = process.argv[++i];
+    if (!v) {
+      console.error('\n  --data-dir 缺少目录路径，例如：'
+        + 'node server.js 8080 --data-dir /data/data/<pkg>/files/ripple\n');
+      process.exit(1);
+    }
+    DATA_DIR = path.resolve(v);
+  } else if (a.startsWith('--data-dir=')) {
+    DATA_DIR = path.resolve(a.slice('--data-dir='.length));
+  } else {
+    POSITIONAL.push(a);
+  }
+}
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e) {
+  console.error('\n  数据目录不可用：' + DATA_DIR + '\n  ' + (e && e.message) + '\n');
+  process.exit(1);
+}
+
+/*
+ * 端口必须是 1-65535 的纯数字。
+ * 以前直接 Number() 后丢给 listen()：传 abc 会得到 NaN → listen 抛 RangeError
+ * → 被 uncaughtException 兜住 → 进程以退出码 0 结束，用户以为服务已经起来了。
+ * 但只判 Number.isInteger 还不够：Number('0x50')=80、Number('8e3')=8000，
+ * 与「1-65535 的整数」这句提示不符，所以先用正则限定十进制写法。
+ */
+const RAW_PORT = String(POSITIONAL[0] || process.env.PORT || '8080');
+if (!/^\d+$/.test(RAW_PORT)) {
+  console.error('\n  端口参数非法：' + RAW_PORT + '\n'
+    + '  需要一个 1-65535 的十进制整数，例如：node server.js 8081\n');
+  process.exit(1);
+}
 const PORT = Number(RAW_PORT);
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   console.error('\n  端口参数非法：' + RAW_PORT + '\n'
@@ -79,26 +117,104 @@ function weapiForm(obj) {
 
 /* ================= 会话 cookie ================= */
 
+/* ================= 访问令牌（R-13：页面加载时轮换的短期令牌） ================= */
+
 /*
- * 访问令牌：/ncm/ 会带着你的网易云登录态，绝不能对任意网页敞开。
+ * /ncm/ 会带着你的网易云登录态，绝不能对任意网页敞开。
  *
- * 做法（不破坏同源使用）：
- *  · token 落在 .ripple-token，页面由本服务托管时自动带同源头；
- *  · /ripple-token.js 只对「确实同源」的请求下发（见 tokenEndpointAllowed），
- *    否则令牌可被同网段任意网页读走，「同源 + 令牌」双校验就没有意义了；
- *  · 关键是把 CORS 从 '*' 改成「只回同源」，于是别的站点既读不到响应、
- *    也不能靠 fetch 直接调用（浏览器会拦）；
- *  · 再用自定义请求头 X-Ripple-Token 做一次显式校验，双击保险。
+ * 旧做法有两处问题（R-13）：
+ *  · 令牌是一份长期有效的固定值，一旦泄露就永久可用；
+ *  · /ripple-token.js 只看 Sec-Fetch-Site，而这个头客户端可以随便伪造，
+ *    任何能在同机执行 curl 的程序加一个 -H 就能把令牌拿走（已实测）。
+ *
+ * 现在改成「页面加载时签发的短期令牌」：
+ *  · 令牌 = 16 字节随机数，默认 30 分钟 TTL，并且绑定签发时的客户端 IP；
+ *  · 每次页面请求 /ripple-token.js 就轮换一次：新令牌入列，只保留 2 个旧令牌
+ *    当灰度窗口（正在飞的在途请求不至于立刻 401），更早的立即失效；
+ *  · 令牌表落在 .ripple-token（0600，JSON），服务重启后已打开的页面还能继续用；
+ *  · 签发端保留 Host 白名单 + Sec-Fetch-Site，并追加
+ *    「Sec-Fetch-Mode 或 Origin/Referer 必须是本站」这一条（见 browserSignalOk）。
+ *    这层能挡掉盲发的跨站请求，但对同机伪造请求头的程序只是礼貌层 ——
+ *    真正的约束是 TTL + IP 绑定 + 轮换。
+ *
+ * 前端协议保持不变：仍然请求 /ripple-token.js，仍然读 window.RIPPLE_TOKEN。
  */
-const TOKEN_FILE = path.join(__dirname, '.ripple-token');
-let ACCESS_TOKEN = '';
-try {
-  ACCESS_TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
-} catch (e) {}
-if (!ACCESS_TOKEN) {
-  ACCESS_TOKEN = crypto.randomBytes(16).toString('hex');
-  try { fs.writeFileSync(TOKEN_FILE, ACCESS_TOKEN, { encoding: 'utf8', mode: 0o600 }); } catch (e) {}
+const TOKEN_FILE = path.join(DATA_DIR, '.ripple-token');
+/* 测试/调试时可覆盖（例如 RIPPLE_TOKEN_TTL_MS=20000 观察过期后的 401） */
+const TOKEN_TTL_MS = (() => {
+  const raw = Number(process.env.RIPPLE_TOKEN_TTL_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return 30 * 60 * 1000;
+  return Math.min(Math.max(raw, 10 * 1000), 24 * 60 * 60 * 1000);
+})();
+const TOKEN_KEEP_PREV = 2;          // 轮换时保留的旧令牌个数
+const TOKEN_ISSUE_PER_MIN = 30;     // 每个 IP 每分钟最多签发多少个（防刷爆轮换窗口）
+
+/** 当前有效令牌：新的在前，每项 { t, ip, exp } */
+let tokenList = [];
+
+/** loopback 的 IPv4 映射写法会以 ::ffff: 前缀出现，统一成同一个键 */
+function normIp(ip) {
+  return String(ip || '').replace(/^::ffff:/, '').toLowerCase() || 'unknown';
 }
+
+function pruneTokens(now) {
+  const keep = tokenList.filter((e) => e && e.t && now < e.exp);
+  if (keep.length !== tokenList.length) tokenList = keep;
+}
+
+function loadTokenStore() {
+  let raw = '';
+  try { raw = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch (e) { return; }
+  if (!raw) return;
+  try {
+    const j = JSON.parse(raw);
+    const arr = (j && Array.isArray(j.tokens)) ? j.tokens : [];
+    tokenList = arr
+      .filter((e) => e && typeof e.t === 'string' && /^[a-f0-9]{32}$/.test(e.t))
+      .map((e) => ({ t: e.t, ip: normIp(e.ip), exp: Number(e.exp) || 0 }))
+      .slice(0, TOKEN_KEEP_PREV + 1);
+    pruneTokens(Date.now());
+  } catch (e) {
+    /* 旧版本文件里就是一行裸令牌，直接丢弃，按新格式重建（下次签发时写盘） */
+    tokenList = [];
+  }
+}
+
+function saveTokenStore() {
+  /* R-14 同款：先写临时文件再 rename，写到一半被杀不会留下半截 JSON */
+  const tmp = TOKEN_FILE + '.tmp-' + process.pid;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ v: 2, tokens: tokenList }), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, TOKEN_FILE);
+    try { fs.chmodSync(TOKEN_FILE, 0o600); } catch (e) {}
+  } catch (e) {
+    console.warn('[ripple] 令牌表写入失败（' + TOKEN_FILE + '）：' + (e && e.message));
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+  }
+}
+
+/** 签发新令牌并旋转：新令牌在前，只留 TOKEN_KEEP_PREV 个旧的 */
+function issueToken(ip) {
+  const now = Date.now();
+  pruneTokens(now);
+  const t = crypto.randomBytes(16).toString('hex');
+  tokenList.unshift({ t: t, ip: normIp(ip), exp: now + TOKEN_TTL_MS });
+  tokenList = tokenList.slice(0, TOKEN_KEEP_PREV + 1);
+  saveTokenStore();
+  return t;
+}
+
+/** 令牌是否有效：必须存在、未过期、且来源 IP 与签发时一致 */
+function tokenValid(got, ip) {
+  const v = String(got || '');
+  if (!v) return false;
+  pruneTokens(Date.now());
+  const me = normIp(ip);
+  /* 令牌本身是 128 位随机值，用普通比较即可：猜中的概率与穷举相同 */
+  return tokenList.some((e) => e.t === v && e.ip === me);
+}
+
+loadTokenStore();
 try { if (fs.existsSync(TOKEN_FILE)) fs.chmodSync(TOKEN_FILE, 0o600); } catch (e) {}
 checkSecretMode(TOKEN_FILE);
 
@@ -116,7 +232,8 @@ function checkSecretMode(file) {
     + '，不是预期的 0600。\n'
     + '     chmod 在当前文件系统（如 /sdcard 的 fuse 挂载）上是空操作，\n'
     + '     同机其它应用可能读到这个文件里的登录态 / 访问令牌。\n'
-    + '     建议把项目放到应用私有目录（如 /data/data/<pkg>/files）再跑。\n');
+    + '     建议用 --data-dir 把数据目录指到应用私有目录再跑，例如：\n'
+    + '       node server.js 8080 --data-dir /data/data/<pkg>/files/ripple\n');
 }
 
 /*
@@ -127,28 +244,86 @@ function checkSecretMode(file) {
  * /ripple-token.js 直接把令牌吐给恶意页面。Sec-Fetch-Site 还必然是 same-origin，
  * 所以它也不能单独当判据。
  *
- * 修法：启动时把「本机实际可达的 Host」收进白名单（localhost / 127.0.0.1 / 本机网卡 IP），
- * 白名单之外的 Host 一律 421，连静态文件都不给。
+ * 修法：只接受「本机实际可达的 Host」（localhost / 127.0.0.1 / 本机网卡 IP / .local 主机名），
+ * 其余一律 421，连静态文件都不给。
+ *
+ * R-26：以前是启动时把网卡 IP 拷进 Set，手机切 Wi-Fi 或 IP 变了之后新地址一律 421，
+ * 只能重启服务。现在改成**实时查询**网卡，带 5 秒短缓存（同一页面会连发几十个请求，
+ * 不缓存的话每个请求都要枚举一次网卡）。
  */
-const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+const LOCAL_HOST_NAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
+const HOST_CACHE_MS = 5 * 1000;
 
-function collectAllowedHosts() {
+let hostCache = { at: 0, set: new Set(LOCAL_HOST_NAMES) };
+
+/** 当前本机可达的 Host 集合（5 秒缓存） */
+function allowedHosts() {
+  const now = Date.now();
+  if (now - hostCache.at < HOST_CACHE_MS) return hostCache.set;
+  const set = new Set(LOCAL_HOST_NAMES);
   try {
     const ifs = os.networkInterfaces();
     Object.keys(ifs).forEach((name) => {
       (ifs[name] || []).forEach((i) => {
-        if (i && i.address) ALLOWED_HOSTS.add(String(i.address).toLowerCase());
+        if (i && i.address) set.add(String(i.address).toLowerCase());
       });
     });
   } catch (e) {}
+  hostCache = { at: now, set: set };
+  return set;
 }
 
+/** 取 Host 的比较键：IPv6 保留 [..] 形式，其余砍掉端口 */
+function hostKey(host) {
+  const h = String(host || '').toLowerCase().trim();
+  if (!h) return '';
+  return h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0];
+}
+
+/**
+ * Host 是否被接受。
+ * 额外放行 `.local`（mDNS 主机名，如 dshgo.local）：
+ * 这类名字只能由同一局域网内的设备解析到本机，与「本机网卡 IP」同一信任级别，
+ * 且 README 里就是用 http://<主机名>:8080 这种写法访问的。
+ */
 function hostAllowed(req) {
   const raw = String(req.headers.host || '').toLowerCase().trim();
   if (!raw) return false;                       // HTTP/1.1 必须有 Host
-  if (ALLOWED_HOSTS.has(raw)) return true;
-  const bare = raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.split(':')[0];
-  return ALLOWED_HOSTS.has(bare);
+  const set = allowedHosts();
+  if (set.has(raw)) return true;
+  const bare = hostKey(raw);
+  if (set.has(bare)) return true;
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)*\.local$/.test(bare);
+}
+
+/** 421 响应体：把当前允许的 Host 列表带上，用户自己就能判断该怎么访问 */
+function hostRejectBody(req) {
+  const raw = String(req.headers.host || '').toLowerCase().trim();
+  const list = [];
+  try {
+    allowedHosts().forEach((h) => {
+      if (h === '0.0.0.0') return;
+      /* 当前请求的 Host 已经实际可用，没必要再列一遍（它被拒说明不在白名单里） */
+      list.push(h);
+    });
+  } catch (e) {}
+  /* IPv4 / localhost 排在前面；IPv6 裸地址拼 URL 要加方括号，否则出来的链接是废的 */
+  const urlFor = (h) => {
+    if (h.startsWith('[')) return 'http://' + h + ':' + PORT + '/';
+    if (h === '::1') return 'http://[::1]:' + PORT + '/';
+    if (h.includes(':')) return 'http://[' + h + ']:' + PORT + '/';
+    return 'http://' + h + ':' + PORT + '/';
+  };
+  const v4 = list.filter((h) => !h.includes(':') || h === 'localhost').sort();
+  const v6 = list.filter((h) => h.includes(':') && h !== 'localhost').sort();
+  return 'misdirected request: host not allowed\n'
+    + '\n'
+    + '  请求的 Host: ' + (raw || '(空)') + '\n'
+    + '  当前允许的 Host（每 5 秒自动刷新，换网络/IP 变了不用重启）:\n'
+    + v4.concat(v6).map((h) => '    ' + h + '\n      → ' + urlFor(h) + '\n').join('')
+    + '    <主机名>.local       （mDNS，同一局域网内可直接用）\n'
+    + '\n'
+    + '  若确实要用别的域名（如反向代理），请让代理把 Host 改成上面某个值。\n';
 }
 
 /** 把 candidate（Origin / Referer）与白名单比对（不再用可伪造的 Host 当基准） */
@@ -157,9 +332,9 @@ function hostMatches(req, candidate) {
   try {
     const u = new URL(candidate);
     const host = String(u.host || '').toLowerCase();
-    const bare = host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : host.split(':')[0];
+    const bare = hostKey(host);
     // 必须同时满足：来源 Host 在白名单里，且和请求的 Host 一致
-    return ALLOWED_HOSTS.has(host) || ALLOWED_HOSTS.has(bare)
+    return allowedHosts().has(host) || allowedHosts().has(bare)
       ? host === String(req.headers.host || '').toLowerCase()
       : false;
   } catch (e) {
@@ -182,23 +357,49 @@ function originAllowed(req) {
 }
 
 /*
- * /ripple-token.js 的门槛：只允许同源请求取令牌。
- * 优先看 Sec-Fetch-Site；缺失该头（老浏览器 / 非浏览器客户端）时退化为
- * 用 Origin 或 Referer 与 Host 比对；两者都没有就一律拒绝。
+ * R-13：/ripple-token.js 现在的门槛是三段。
+ *
+ *  ① Host 白名单 —— DNS rebinding 挡在这里（Sec-Fetch-Site 在那种场景下必然是
+ *     same-origin，所以它只能当辅助，不能当判据）；
+ *  ② 浏览器信号 —— Sec-Fetch-Site 必须是 same-origin，且
+ *     Sec-Fetch-Mode（这是 <script> 加载，真浏览器会带 'no-cors'/'cors'）
+ *     或 Origin/Referer 至少有一个能对上本站。真浏览器发 <script src> 一定带
+ *     这三样里的至少两样；`curl -H 'Sec-Fetch-Site: same-origin'` 只伪造了一样，
+ *     会被 browserSignalOk 挡掉。
+ *  ③ 令牌本身是短期 + IP 绑定 + 每次加载轮换（见 issueToken），
+ *     所以即便有人把① ② 都伪造齐了，拿到的也只是一份很短命的令牌。
+ *
+ * 注意：这里不做「只允许一次」——index.html 与 SW 都可能重复取同一个脚本，
+ * 一次性会导致页面刷新后立刻失效。用 TTL + 轮换达到同样的目标。
  */
-function tokenEndpointAllowed(req) {
-  /*
-   * B-3：Sec-Fetch-Site 只能当「辅助」。
-   * 在 DNS rebinding 场景下它必然是 same-origin（浏览器眼里确实是同源），
-   * 所以先过 Host 白名单，再看同源信号。
-   */
-  if (!hostAllowed(req)) return false;
+function browserSignalOk(req) {
   const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
-  if (site) return site === 'same-origin';
-  return hostMatches(req, req.headers.origin) || hostMatches(req, req.headers.referer);
+  const mode = String(req.headers['sec-fetch-mode'] || '').toLowerCase();
+  const sameOriginRef = hostMatches(req, req.headers.origin) || hostMatches(req, req.headers.referer);
+  /* 三者全无 —— 既不是浏览器导航/子资源加载，也没有来源，拒绝 */
+  if (!site && !mode && !sameOriginRef) return false;
+  /* 有 Sec-Fetch-Site 就必须是 same-origin（cross-site/same-site 都不行） */
+  if (site && site !== 'same-origin') return false;
+  /* Sec-Fetch-Mode 是浏览器专有的 fetch 元数据，真浏览器必带；带了就认为可信 */
+  if (mode && mode !== 'navigate' && mode !== 'no-cors' && mode !== 'cors') return false;
+  /* 走 <script src> 的加载是 no-cors；navigate 是地址栏直开；两者都没有时看来源 */
+  if (mode === 'no-cors' || mode === 'cors') return true;
+  if (mode === 'navigate') return true;
+  return sameOriginRef;
 }
 
-const COOKIE_FILE = path.join(__dirname, '.ripple-cookie');
+function tokenEndpointAllowed(req) {
+  if (!hostAllowed(req)) return false;
+  return browserSignalOk(req);
+}
+
+/* 每个 IP 的令牌签发限流：轮换窗口只有 3 个槽位，不限制的话别人能把它刷没 */
+function issueTokenLimited(req) {
+  const waitS = rateLimitTake(normIp(clientIp(req)) + '|tok', TOKEN_ISSUE_PER_MIN);
+  return waitS;
+}
+
+const COOKIE_FILE = path.join(DATA_DIR, '.ripple-cookie');
 let cookieJar = '';
 /** 串行化 Set-Cookie 合并，避免并发响应互相覆盖 */
 let cookieWriteChain = Promise.resolve();
@@ -263,8 +464,23 @@ function cookieMap(raw) {
 function cookieStr(m) {
   return Object.entries(m).map(([k, v]) => k + '=' + v).join('; ');
 }
+/*
+ * R-14：以前直接 writeFileSync 原地截断重写。
+ * 进程在写一半时被杀 / 磁盘满，会留下半截 cookie，下次启动读到残值 → 「莫名掉登录」，
+ * 而且 catch (e) {} 连一行日志都没有。改成「写临时文件 + rename 原子替换」，
+ * 失败时明确 warn 一条，用户至少能在控制台看见。
+ */
 function saveCookie() {
-  try { fs.writeFileSync(COOKIE_FILE, cookieJar, { encoding: 'utf8', mode: 0o600 }); } catch (e) {}
+  const tmp = COOKIE_FILE + '.tmp-' + process.pid;
+  try {
+    fs.writeFileSync(tmp, cookieJar, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, COOKIE_FILE);
+    /* rename 不会改权限，重新 align 一次；在某些挂载上（如 /sdcard）这一步是空操作 */
+    try { fs.chmodSync(COOKIE_FILE, 0o600); } catch (e) {}
+  } catch (e) {
+    console.warn('[ripple] 会话 cookie 写入失败（' + COOKIE_FILE + '）：' + (e && e.message));
+    try { fs.unlinkSync(tmp); } catch (e2) {}
+  }
 }
 function csrfToken() {
   return cookieMap(cookieJar).__csrf || '';
@@ -292,11 +508,11 @@ const UPSTREAM_PATH_RE = /^\/weapi\/[a-z0-9/_-]+$/i;
 
 function assertUpstreamPath(rawPath, url) {
   if (typeof rawPath !== 'string' || !SAFE_PATH_SEG_RE.test(rawPath) || rawPath.includes('..')) {
-    throw new Error('bad upstream path');
+    throw badRequest('bad upstream path');
   }
   const p = url.pathname;
   if (p.includes('..') || !UPSTREAM_PATH_RE.test(p)) {
-    throw new Error('bad upstream path: ' + p);
+    throw badRequest('bad upstream path: ' + p);
   }
 }
 
@@ -363,6 +579,25 @@ function ncmPost(path, body) {
   });
 }
 
+/**
+ * E-18：参数校验错误统一构造。
+ * 以前只靠错误信息前缀正则判断「是不是客户端的问题」，漏一条就变成 502（上游失败）。
+ * 现在改成带 err.badRequest = true 标记，错误处理优先看这个标记。
+ * 正则兜底仍然保留（兼容历史上直接 throw new Error 的路径）。
+ */
+function badRequest(msg) {
+  const e = new Error(msg);
+  e.badRequest = true;
+  return e;
+}
+
+/** 把可选的分页参数收敛成整数：非法就用默认值，再 clamp 到 [min, max] */
+function clampInt(v, min, max, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
 /** 与 NeteaseClient.call 的命令表一一对应 */
 async function ncmCall(cmd, p = {}) {
   switch (cmd) {
@@ -386,23 +621,56 @@ async function ncmCall(cmd, p = {}) {
       return ncmPost('login/qrcode/unikey', { type: 3 });
     case 'login_qr_check':
       return ncmPost('login/qrcode/client/login', { key: p.key, type: 3 });
-    case 'logout':
+    case 'logout': {
+      /*
+       * E-14：顺序不能反（与 NeteaseClient.java:174-184 一致）。
+       * 必须**先**带着当前 cookie 请求上游 logout，让服务端会话真正失效，
+       * 之后再清本地 jar。反过来的话是「带空 cookie 去注销」：
+       * 界面显示已退出，但那个 MUSIC_U 在服务端依然有效。
+       */
+      let r = '';
+      try { r = await ncmPost('logout', {}); } catch (e) { r = ''; }
       cookieJar = '';
       saveCookie();
-      return ncmPost('logout', {});
+      /* 上游失败也照样清本地（用户点了退出，界面必须回到未登录），
+         但回一个合法 JSON，别让前端 JSON.parse 炸掉 */
+      return r || JSON.stringify({ code: 200 });
+    }
     case 'search': {
       const body = { s: p.keywords, type: p.type || 1, limit: p.limit || 30, offset: p.offset || 0, total: true };
       const r = await ncmPost('cloudsearch/pc', body);
+      /*
+       * E-15：兜底判据与 NeteaseClient.java:331-341 保持一致 ——
+       * 只有「拿不到 result.songs」**且**「code != 200」时才回落老接口。
+       * 以前是「没有 result.songs 就回落」，于是云搜索被限流但返回
+       * {"result":{},"code":200} 时，APK 给空结果、网页版却回落出另一批数据。
+       */
       try {
         const j = JSON.parse(r);
-        if (!j.result || !j.result.songs) throw new Error('fallback');
+        const has = !!(j.result && j.result.songs);
+        const code = typeof j.code === 'number' ? j.code : 200;
+        if (!has && code !== 200) throw new Error('fallback');
       } catch (e) {
         return ncmPost('search/get', body);
       }
       return r;
     }
     case 'song_detail': {
-      const c = (p.ids || '').split(',').filter(Boolean).map((id) => ({ id: Number(id) }));
+      /*
+       * E-35：ids 必须是非空的「数字逗号串」（Java 侧用 Long.parseLong 也是这个强度）。
+       * 以前 ids="abc" 会构造出 [{"id":null}] 发给上游，既查不到也看不出是谁的错。
+       * 参数错误带 badRequest 标记，由错误处理回 400 而不是 502。
+       */
+      const c = [];
+      String(p.ids == null ? '' : p.ids).split(',').forEach((part) => {
+        const t = part.trim();
+        if (!t) return;
+        if (!/^\d+$/.test(t) || !Number.isSafeInteger(Number(t))) {
+          throw badRequest('song_detail: ids 必须是数字逗号串');
+        }
+        c.push({ id: Number(t) });
+      });
+      if (!c.length) throw badRequest('song_detail: ids 不能为空');
       return ncmPost('v3/song/detail', { c: JSON.stringify(c) });
     }
     case 'song_url':
@@ -412,10 +680,25 @@ async function ncmCall(cmd, p = {}) {
     case 'lyric':
       return ncmPost('song/lyric', { id: p.id, tv: -1, lv: -1, rv: -1, kv: -1, _nmclfl: 1 });
     case 'playlist':
-      return ncmPost('v6/playlist/detail', { id: p.id, n: 100000, s: 8 });
+      /* E-16：与 NeteaseClient.java:194-204 一致，只要 300 首（以前是 100000） */
+      return ncmPost('v6/playlist/detail', { id: p.id, n: 300, s: 8 });
     case 'playlist_tracks': {
-      const detail = JSON.parse(await ncmPost('v6/playlist/detail', { id: p.id, n: 100000, s: 8 }));
-      const ids = ((detail.playlist && detail.playlist.trackIds) || []).slice(0, p.limit || 200).map((t) => t.id);
+      /*
+       * E-16：与 NeteaseClient.java:366-383 对齐 —— 上游只取 n=300 条 trackIds，
+       * 页内按 offset/limit 取窗口（limit 默认 200，收敛到 1..1000，防一次要一万首）。
+       * 以前这里是 n=100000、limit 默认 200 且完全忽略 offset：
+       * 同一个万人歌单，APK 显示 300 首，网页版把 10 万条 trackIds 全拉下来再截前 N 条，
+       * 而且前端传 offset 也无效（翻页永远拿第一页）。
+       */
+      const detail = JSON.parse(await ncmPost('v6/playlist/detail', { id: p.id, n: 300, s: 8 }));
+      const all = (detail.playlist && detail.playlist.trackIds) || [];
+      const offset = clampInt(p.offset, 0, 300, 0);
+      const limit = clampInt(p.limit, 1, 1000, 200);
+      const ids = all.slice(offset, offset + limit)
+        .map((t) => (t && t.id != null ? t.id : null))
+        .filter((id) => id != null);
+      /* 翻到末尾（或上游没给 trackIds）时回 detail 本身，与 Java「trackIds 为空就 return detail」一致 */
+      if (!ids.length) return JSON.stringify(detail);
       return ncmCall('song_detail', { ids: ids.join(',') });
     }
     case 'toplist':
@@ -451,10 +734,10 @@ async function ncmCall(cmd, p = {}) {
     case 'comment_add': {
       /* 第 16 条：发评论，和 Java 侧 NeteaseClient 的 comment_add 保持一致 */
       const cid2 = String(p.id == null ? '' : p.id);
-      if (!/^\d+$/.test(cid2)) throw new Error('comment_add: id 必须是数字');
+      if (!/^\d+$/.test(cid2)) throw badRequest('comment_add: id 必须是数字');
       const txt = String(p.content == null ? '' : p.content).trim();
-      if (!txt) throw new Error('comment_add: 内容不能为空');
-      if (txt.length > 140) throw new Error('comment_add: 最多 140 字');
+      if (!txt) throw badRequest('comment_add: 内容不能为空');
+      if (txt.length > 140) throw badRequest('comment_add: 最多 140 字');
       return ncmPost('v1/resource/comments/add', {
         threadId: 'R_SO_4_' + cid2, content: txt,
       });
@@ -466,7 +749,7 @@ async function ncmCall(cmd, p = {}) {
        * 抛错而不是返回 {code:-1}，让 /ncm/ 回 4xx，攻击/手误在状态码上就看得见。
        */
       const cid = String(p.id == null ? '' : p.id);
-      if (!/^\d+$/.test(cid)) throw new Error('comments: id 必须是数字');
+      if (!/^\d+$/.test(cid)) throw badRequest('comments: id 必须是数字');
       return ncmPost('v1/resource/comments/R_SO_4_' + cid, {
         rid: cid, limit: p.limit || 20, offset: p.offset || 0,
         beforeTime: p.before || 0,
@@ -481,19 +764,41 @@ async function ncmCall(cmd, p = {}) {
 
 /* ================= HTTP 服务 ================= */
 
+/*
+ * R-25：以前缺 woff2/woff/ttf/gif/webp，实测 .woff2 被当成 application/octet-stream，
+ * 而 ASSET_EXT 又会给这些扩展名打「一天」的强缓存 —— 类型错了还会被缓存一整天。
+ * 这里补齐常见静态类型；缺了也只会回 octet-stream，不会出错，但浏览器行为不标准。
+ */
 const MIME = {
   '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
-  '.mp3': 'audio/mpeg',
-  '.wav': 'audio/wav',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
   '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.aac': 'audio/aac',
+  '.wav': 'audio/wav',
   '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
 };
 
 function json(res, code, obj) {
@@ -572,7 +877,17 @@ function serveStatic(req, res) {
     headers['Content-Length'] = st.size;
     res.writeHead(200, headers);
     if (req.method === 'HEAD') return res.end();
-    fs.createReadStream(file).pipe(res);
+    /*
+     * R-19：stat 到 open 之间文件可能被删 / 权限变了。
+     * pipe 不会转发源流的 'error'，没人监听就会走成 uncaughtException，
+     * 而这个响应已经写了 200 头 —— 只能销毁连接，否则客户端会挂到超时。
+     */
+    const stream = fs.createReadStream(file);
+    stream.on('error', (err) => {
+      console.warn('[ripple] 静态文件读取失败（' + ext + '）：' + (err && err.message));
+      try { res.destroy(); } catch (_) {}
+    });
+    stream.pipe(res);
   });
 }
 
@@ -592,8 +907,14 @@ const server = http.createServer((req, res) => {
 function handleRequest(req, res) {
   /* B-3：Host 白名单。DNS rebinding 的请求在这里就被挡掉，连静态文件都拿不到。 */
   if (!hostAllowed(req)) {
-    res.writeHead(421, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('misdirected request: host not allowed');
+    /* R-26：把当前允许的 Host 列表一起回出去，换网络后用户自己就能找到该用哪个地址 */
+    const body = Buffer.from(hostRejectBody(req), 'utf8');
+    res.writeHead(421, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Content-Length': body.length,
+    });
+    return res.end(body);
   }
   /* new URL 对畸形请求目标（如 'http://['）会抛 TypeError，同样要接住 */
   let u;
@@ -619,6 +940,20 @@ function handleRequest(req, res) {
 
   if (u.pathname.startsWith('/ncm/')) {
     /*
+     * E-34：/ncm/* 是「POST 命令」接口，必须限定方法。
+     * 以前只校验前缀和令牌，没有任何方法检查：带令牌的 GET /ncm/logout
+     * 会真的把用户注销、GET /ncm/comment_add 也能发评论（实测均成立）。
+     * 预检 OPTIONS 在上面已经放行，这里只允许 POST，其余 405 + Allow。
+     */
+    if (req.method !== 'POST') {
+      res.writeHead(405, {
+        'Allow': 'POST, OPTIONS',
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      return res.end('method not allowed: use POST');
+    }
+    /*
      * 这个接口用着你的网易云登录态：未登录时是公开搜索，
      * 一旦 .ripple-cookie 里有 MUSIC_U，它就能读你喜欢、改收藏、甚至把你登出。
      * 所以必须「同源 + 令牌」双校验，不能像以前那样对任意 Origin 开 '*'。
@@ -627,13 +962,21 @@ function handleRequest(req, res) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('origin not allowed');
     }
+    const ip = clientIp(req);
+    /* R-13：令牌短期 + 绑定 IP；过期/换 IP 都算无效，前端会因 401 提示重新打开页面 */
     const got = String(req.headers['x-ripple-token'] || '');
-    if (got !== ACCESS_TOKEN) {
-      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-      return res.end(JSON.stringify({ code: 401, msg: 'missing or bad X-Ripple-Token' }));
+    if (!tokenValid(got, ip)) {
+      res.writeHead(401, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      return res.end(JSON.stringify({
+        code: 401,
+        msg: 'missing or expired X-Ripple-Token',
+        hint: '令牌按来源 IP 绑定且有有效期，刷新页面即可重新签发',
+      }));
     }
     /* 限流放在鉴权之后：没令牌的扫描不该消耗用户自己的配额 */
-    const ip = clientIp(req);
     const waitS = rateLimitTake(ip + '|ncm', RATE_LIMIT_PER_MIN);
     if (waitS > 0) {
       res.writeHead(429, {
@@ -645,6 +988,7 @@ function handleRequest(req, res) {
     }
     const cmd = u.pathname.slice(5);
     let body = '';
+    let bodyBytes = 0;
     let tooBig = false;
     /* 客户端提前断开（关页面 / 快速连点）后，await 回来的结果不该再写出去 */
     let closed = false;
@@ -653,9 +997,16 @@ function handleRequest(req, res) {
     req.setEncoding('utf8');
     req.on('data', (c) => {
       if (tooBig) return;
+      /*
+       * R-20：setEncoding('utf8') 之后 body.length 是 UTF-16 码元数，
+       * 一个中文 3 字节、一个 emoji 4 字节 —— 按 length 计数，256KB 的上限
+       * 实际能吃到约 700KB。改按真实字节累计。
+       */
+      bodyBytes += Buffer.byteLength(c, 'utf8');
       body += c;
-      if (body.length > MAX_BODY) {
+      if (bodyBytes > MAX_BODY) {
         tooBig = true;
+        body = '';
         try { json(res, 413, { code: 413, msg: 'body too large' }); } catch (e) {}
         try { req.destroy(); } catch (e) {}
       }
@@ -680,8 +1031,14 @@ function handleRequest(req, res) {
         /* 客户端已经走了就别再写，否则又是 write-after-end 噪音 */
         if (closed) return;
         const msg = String(e.message || e);
-        /* 参数/路径不合法是 400（客户端的问题），上游失败才是 502 */
-        const bad = /^bad upstream path|^comments: id 必须是数字/.test(msg);
+        /*
+         * 参数/路径不合法是 400（客户端的问题），上游失败才是 502。
+         * E-18：优先看显式的 err.badRequest 标记（badRequest() 统一打上），
+         * 保留原来那两条正则当兜底 —— 万一有路径还在直接 throw new Error。
+         */
+        const bad = e && e.badRequest === true
+          || /^bad upstream path/.test(msg)
+          || /^(comments|comment_add|song_detail): /.test(msg);
         json(res, bad ? 400 : 502, { code: bad ? 400 : 502, msg: msg });
       }
     });
@@ -689,16 +1046,29 @@ function handleRequest(req, res) {
   }
 
   /*
-   * 同源托管时把访问令牌交给页面（动态生成，不落盘到 app/ 里）。
-   * 只对确实同源的请求下发 —— 否则令牌本身是公开的，
-   * 「同源 + 令牌」双校验就退化成只剩同源一层。
+   * R-13：页面加载时签发一份**新的**短期令牌（30 分钟、绑定来源 IP、每次加载轮换）。
+   * 协议不变：前端仍然请求 /ripple-token.js，仍然只读 window.RIPPLE_TOKEN。
+   * 旧令牌保留 2 个在灰度窗口内，正在飞的在途请求不会立刻 401。
    */
   if (u.pathname === '/ripple-token.js') {
     if (!tokenEndpointAllowed(req)) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end('forbidden: token is only served to same-origin requests');
+      return res.end('forbidden: token is only served to same-origin browser requests');
     }
-    const body = 'window.RIPPLE_TOKEN=' + JSON.stringify(ACCESS_TOKEN) + ';\n';
+    /* 轮换窗口只有 3 个槽位，不对签发做限流的话别人能把它一直刷掉 */
+    const waitS = issueTokenLimited(req);
+    if (waitS > 0) {
+      res.writeHead(429, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Retry-After': String(waitS),
+      });
+      return res.end('too many token requests, retry after ' + waitS + 's');
+    }
+    const token = issueToken(clientIp(req));
+    const body = '/* Ripple 临时令牌：绑定来源 IP，有效期 '
+      + Math.round(TOKEN_TTL_MS / 1000) + ' 秒，每次页面加载轮换 */\n'
+      + 'window.RIPPLE_TOKEN=' + JSON.stringify(token) + ';\n';
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
       'Cache-Control': 'no-store',
@@ -732,7 +1102,45 @@ process.on('uncaughtException', (e) => {
   console.error('[ripple] uncaught:', e && (e.stack || e.message || e));
 });
 
-collectAllowedHosts();
+/*
+ * O-06：Node ≥15 对未处理的 Promise rejection 默认直接抛（进程退出）。
+ * 现在 req.on('end', async …) / ncmPost 的错误都包在 try-catch 或 .catch 里，
+ * 但「某个分支漏了 await」就会让服务静默死掉。与上面的策略保持一致：
+ * 记录、不退出。
+ */
+process.on('unhandledRejection', (reason) => {
+  console.error('[ripple] unhandled rejection:',
+    reason && (reason.stack || reason.message || reason) || reason);
+});
+
+/** 启动时打印数据目录与两个状态文件的真实权限（R-30） */
+function reportDataDir() {
+  console.log('  数据目录   ' + DATA_DIR + (DATA_DIR === __dirname ? '（默认，脚本所在目录）' : ''));
+  let bad = false;
+  [COOKIE_FILE, TOKEN_FILE].forEach((f) => {
+    let mode = null;
+    try { mode = fs.statSync(f).mode & 0o777; } catch (e) { mode = null; }
+    if (mode === null) {
+      console.log('    ' + path.basename(f) + '  尚未创建');
+      return;
+    }
+    const str = '0' + mode.toString(8);
+    if (mode === 0o600) {
+      console.log('    ' + path.basename(f) + '  ' + str + '  ✓');
+    } else {
+      bad = true;
+      console.log('    ' + path.basename(f) + '  ' + str + '  ✗ 不是 0600');
+    }
+  });
+  if (!bad) return;
+  console.warn('\n  ⚠️⚠️  权限告警：数据文件的权限不是 0600，服务却在 0.0.0.0 上监听。\n'
+    + '     这通常是因为数据目录在 /sdcard 这类 fuse 挂载上 —— chmod 在那里是空操作。\n'
+    + '     同机的其它应用可能读到你的网易云登录态与访问令牌。\n'
+    + '     想真正收紧权限，把数据目录指到应用私有目录：\n'
+    + '       node server.js ' + PORT + ' --data-dir /data/data/<pkg>/files/ripple\n'
+    + '     （详见 README 的「安全与隐私」一节。）\n');
+}
+
 server.listen(PORT, '0.0.0.0', () => {
   const nets = os.networkInterfaces();
   const ips = [];
@@ -746,5 +1154,8 @@ server.listen(PORT, '0.0.0.0', () => {
   ips.forEach((ip) => console.log('  手机访问   http://' + ip + ':' + PORT + '   （需同一 Wi-Fi）'));
   console.log('\n  网易云真接口已就绪：POST /ncm/<cmd>（weapi 加密，可带登录态）');
   console.log('  未登录也能搜索/试听；登录请用 APK，或在 .ripple-cookie 里放 MUSIC_U');
-  console.log('  按 Ctrl+C 停止\n');
+  console.log('  访问令牌  每次页面加载轮换，绑定来源 IP，有效期 '
+    + Math.round(TOKEN_TTL_MS / 60000) + ' 分钟');
+  reportDataDir();
+  console.log('\n  按 Ctrl+C 停止\n');
 });

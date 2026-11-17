@@ -15,10 +15,19 @@
   background:var(--panel2);color:var(--text3)}
 
 /* 关于 */
-.about-note{font-size:10px;line-height:1.8;color:var(--text3);padding:22px 6px 30px;text-align:center;
-  opacity:.8}
+/* 不要再叠 opacity —— --text3 本身已经是低对比度的次要色，
+   再乘 0.8 后浅色主题实算只有 2.6:1，说明文字会糊成一片灰。 */
+.about-note{font-size:10px;line-height:1.8;color:var(--text3);padding:22px 6px 30px;text-align:center}
 
-/* 弹窗 */
+/* 弹窗
+ *
+ * 这个容器由 app.js 的 modal() 在打开时动态创建、关掉时整体移除，
+ * 所以 index.html 里没有对应的静态结构 —— role="dialog" / aria-modal 要由
+ * 创建节点的那一端负责写（CSS 管不了语义）。
+ *
+ * 层级：toasts 是 90，这里必须压过它，否则弹窗内容会被通知条挡住。
+ * z-index:120 已经比所有 sheet（80~89）和 toasts（90）都高，保持不动。
+ */
 .modal-wrap{position:fixed;inset:0;z-index:120;display:flex;align-items:center;justify-content:center;
   padding:24px;background:rgba(0,0,0,.42);
   -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:0;transition:opacity .24s var(--ease)}
@@ -109,8 +118,8 @@ body.compact .qitem{padding-top:3px;padding-bottom:3px}
 .drow span{flex:1;min-width:0;word-break:break-all}
 
 /* 评论弹窗 */
-/* .cmt-wrap / .modal:has(.cmt-wrap) 已删除：评论改成了 sheet 方案，
-   评论内容挂在 #cmtBody 上，这两个类名已经没有任何元素使用 */
+/* 评论已经改成底部 sheet 方案（内容挂在 #cmtBody 上），
+   所以这里不再需要 .cmt-wrap 那套弹窗样式。 */
 .cmt-hd{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--text3);
   padding:10px 0 6px;position:sticky;top:0;background:color-mix(in srgb,var(--bg) 82%,transparent);
   -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);z-index:1}
@@ -137,7 +146,7 @@ body.compact .qitem{padding-top:3px;padding-bottom:3px}
 /* 骨架条目不要分隔线，看着更干净 */
 .cmt.sk{border-top-color:transparent}
 
-/* ---------- 第 12 条：首屏骨架 ---------- */
+/* ---------- 首屏骨架 ---------- */
 .sk-card{pointer-events:none}
 .sk-card .sk-box{width:100%;aspect-ratio:1;border-radius:16px;background:var(--panel);
   position:relative;overflow:hidden;margin-bottom:8px}
@@ -146,7 +155,7 @@ body.compact .qitem{padding-top:3px;padding-bottom:3px}
   animation:skSweep 1.5s linear infinite}
 @keyframes skSweep{to{transform:translateX(100%)}}
 
-/* ---------- 第 16 条：评论输入条 ---------- */
+/* ---------- 评论输入条 ---------- */
 .cmt-sheet{display:flex;flex-direction:column}
 .cmt-sheet .cmt-body{flex:1;min-height:0}
 .cmt-send{display:flex;gap:8px;align-items:center;flex:none;padding:9px 14px 11px;

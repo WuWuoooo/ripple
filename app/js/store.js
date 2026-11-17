@@ -28,7 +28,7 @@
     speed: 1,
     showLyric: true,
     showTrans: true,
-    lyricSize: 14,
+    lyricSize: 11,
     lyricOffset: 0,
     mediaSession: true,
     notifyQuiet: true,
@@ -65,6 +65,84 @@
      ---------------------------------------------------- */
   const DEMO = [];
 
+  /* ---------------- 设置项的坏值收敛 ----------------
+   *
+   * localStorage 里的 settings 是纯字符串，任何字段都可能被写坏：
+   * 手工改、老版本遗留、写一半的配额错误、或者别的脚本污染。
+   * 以前这里是 Object.assign({}, DEFAULTS, saved.settings) —— 坏值**原样**
+   * 进入运行时，然后以各种难以定位的方式表现出来：
+   *   theme: 42        → 掉进 else 分支当深色
+   *   lyricSize:'abc'  → 生成 "abcpx"，浏览器直接丢弃，字号"调了没反应"
+   *   glassBlur: null  → "nullpx" 同样被丢弃
+   * 用户没有任何提示，只能逐项重设，而且完全不知道发生了什么。
+   *
+   * 这里按 DEFAULTS 的类型逐项校验，坏值回落默认。
+   * 数值项额外钳到合理区间，避免 "glassBlur: 999999" 这类也不会崩、
+   * 但会让每帧模糊计算爆炸的写入。
+   */
+  const NUM_RANGE = {
+    glassBlur: [0, 40],
+    animSpeed: [0.4, 2.5],
+    fade: [0, 5],
+    speed: [0.5, 2],
+    lyricSize: [11, 19],
+    lyricOffset: [-10, 10],
+    volume: [0, 1],
+    shuffle: [0, 1],          // 实际是 bool，见下
+    sleepMin: [0, 24 * 60],
+    sleepUntil: [0, Number.MAX_SAFE_INTEGER],
+    sbSize: [8, 30],
+    sbAlpha: [0, 1],
+    sbX: [-100000, 100000],
+    sbY: [-100000, 100000],
+    lastIndex: [0, 100000],
+    lastPosition: [0, 1e9],
+  };
+  // 白名单枚举：不在这几个值里的直接回落默认
+  const ENUMS = {
+    theme: ['auto', 'dark', 'light'],
+    quality: ['standard', 'higher', 'exhigh', 'lossless'],
+    eq: ['off', 'pop', 'rock', 'jazz', 'classical', 'vocal', 'custom'],
+    repeat: ['off', 'one', 'all'],
+    playMode: ['list', 'shuffle', 'heart', 'roam'],
+  };
+
+  function coerceSettings(saved) {
+    const out = Object.assign({}, DEFAULTS);
+    if (!saved || typeof saved !== 'object') return out;
+    Object.keys(DEFAULTS).forEach((k) => {
+      const def = DEFAULTS[k];
+      const v = saved[k];
+      if (v === undefined) return;
+      /* 布尔项：只接受真正的布尔，其余按"宁可关掉"处理
+         （开着一个用户不认识的开关，比关掉更难排查） */
+      if (typeof def === 'boolean') { if (typeof v === 'boolean') out[k] = v; return; }
+      /* 数组项（eqCustom / lastQueue）：必须是数组，否则回落默认 */
+      if (Array.isArray(def)) {
+        if (Array.isArray(v)) out[k] = def.length && k === 'eqCustom'
+          ? v.slice(0, def.length).map((n) => (Number.isFinite(Number(n)) ? Number(n) : 0))
+          : v.filter((x) => typeof x === 'string');
+        return;
+      }
+      if (ENUMS[k]) { if (ENUMS[k].indexOf(v) >= 0) out[k] = v; return; }
+      /* 字符串项（apiBase / lastTrackId / sbColor 等） */
+      if (typeof def === 'string') { if (typeof v === 'string') out[k] = v; return; }
+      /* 数值项 */
+      if (typeof def === 'number') {
+        /*
+         * 注意 typeof null === 'object'，但 Number(null) === 0 —— 会被当成
+         * 合法的 0 而把「玻璃强度」静默关掉。null/undefined/空串都按无效处理。
+         */
+        if (v === null || v === undefined || v === '') return;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return;
+        const r = NUM_RANGE[k];
+        out[k] = r ? Math.max(r[0], Math.min(r[1], n)) : n;
+      }
+    });
+    return out;
+  }
+
   const Store = {
     state: null,
     localTracks: [],
@@ -85,7 +163,7 @@
        */
       const arr = (v) => (Array.isArray(v) ? v : []);
       this.state = {
-        settings: Object.assign({}, DEFAULTS, (saved.settings && typeof saved.settings === 'object') ? saved.settings : {}),
+        settings: coerceSettings(saved.settings),
         liked: arr(saved.liked).filter((x) => typeof x === 'string'),
         history: arr(saved.history).filter((x) => x && x.id),
         playedSec: Number(saved.playedSec) > 0 ? Number(saved.playedSec) : 0,
@@ -134,8 +212,14 @@
      * 观感就是「拖起来发涩」。
      *
      * 现在合并到下一帧之后再写：同一帧内的多次 set 只落盘一次。
-     * 用 requestAnimationFrame 而不是 setTimeout，是因为它天然与渲染帧对齐，
-     * 不会在页面不可见时也排队执行。
+     * 用 requestAnimationFrame 是因为它天然与渲染帧对齐。
+     *
+     * ⚠️ 但 rAF 在**页面不可见时会被浏览器暂停**，于是"设完就锁屏"
+     * 这段写入会永远等不到回调 —— 最典型的就是睡眠定时：
+     * 用户设 60 分钟 → 立刻按 Home → sleepUntil 没写进去 → 重启后
+     * 定时器不存在，而界面还显示"60 分钟后暂停"。
+     * 所以页面隐藏时退回 setTimeout（后台定时器仍会被节流到 ~1s，
+     * 但至少一定会执行）。
      *
      * 需要「立刻落盘」的场景（比如切歌前）显式调 Store.save() 即可。
      */
@@ -143,18 +227,26 @@
       this.state.settings[key] = val;
       if (this._saveRaf) return;
       const run = () => { this._saveRaf = 0; this.save(); };
-      this._saveRaf = (typeof requestAnimationFrame === 'function')
+      const hidden = typeof document !== 'undefined'
+        && (document.hidden || document.visibilityState === 'hidden');
+      this._saveRaf = (!hidden && typeof requestAnimationFrame === 'function')
         ? requestAnimationFrame(run)
-        : setTimeout(run, 16);
+        : setTimeout(run, 0);
     },
 
     /* ---------- IndexedDB ---------- */
     async db() {
       if (this._db) return this._db;
+      /*
+       * 并发首次调用会各自 indexedDB.open 一次，第二个连接打开后
+       * 既不被使用也不关闭 —— 而 versionchange 时它还会挡住升级。
+       * 这里缓存「打开中的 Promise」，让并发方共享同一次 open。
+       */
+      if (this._dbPromise) return this._dbPromise;
       // file:// 下（Android 外壳）部分内核禁用 IndexedDB，这里快速失败，
       // 让导入走「仅本次会话可用」的降级路径，而不是整段抛错。
       if (typeof indexedDB === 'undefined' || !indexedDB) throw new Error('IndexedDB 不可用');
-      this._db = await new Promise((res, rej) => {
+      this._dbPromise = new Promise((res, rej) => {
         let r;
         try { r = indexedDB.open(DB_NAME, 1); }
         catch (e) { rej(e); return; }
@@ -162,10 +254,29 @@
           const db = r.result;
           if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, { keyPath: 'id' });
         };
-        r.onsuccess = () => res(r.result);
-        r.onerror = () => rej(r.error);
-      });
-      return this._db;
+        r.onsuccess = () => {
+          const db = r.result;
+          /*
+           * 别的标签页/窗口要升级这个库时会先发 versionchange，
+           * 不关掉自己的连接就会把对方永久卡在 blocked 上。
+           */
+          db.onversionchange = () => { try { db.close(); } catch (e) {} this._db = null; this._dbPromise = null; };
+          res(db);
+        };
+        r.onerror = () => {
+          this._dbPromise = null;
+          rej(r.error);
+        };
+        /*
+         * 没有 onblocked：升级被别的连接挡住时 open 的成功/失败回调都不会来，
+         * Promise 永远 pending → boot 卡在 await restoreLocal()，首页起不来。
+         */
+        r.onblocked = () => {
+          this._dbPromise = null;
+          rej(new Error('IndexedDB 被其它页面占用，无法打开'));
+        };
+      }).then((db) => { this._db = db; return db; });
+      return this._dbPromise;
     },
     async dbPut(rec) {
       const db = await this.db();
@@ -188,6 +299,9 @@
         const q = tx.objectStore(DB_STORE).getAll();
         q.onsuccess = () => res(q.result || []);
         q.onerror = () => rej(q.error);
+        /* 与 dbPut 一致：配额/中止走 abort，onerror 不触发。
+           漏了它 boot 会卡在 await restoreLocal()，首页永远起不来。 */
+        tx.onabort = () => rej(tx.error || new Error('IndexedDB 读取被中止'));
       });
     },
     async dbClear() {
@@ -195,8 +309,10 @@
       return new Promise((res, rej) => {
         const tx = db.transaction(DB_STORE, 'readwrite');
         tx.objectStore(DB_STORE).clear();
-        tx.oncomplete = res;
+        tx.oncomplete = () => res();
         tx.onerror = () => rej(tx.error);
+        /* 同上：漏了 onabort 时「清空已导入的音乐」按下去毫无反应也没有提示 */
+        tx.onabort = () => rej(tx.error || new Error('IndexedDB 清空被中止'));
       });
     },
 
@@ -227,7 +343,7 @@
     },
     async restoreLocal() {
       /*
-       * 审查 3.2：每次冷启动都会为每个本地曲目 createObjectURL 一批 blob URL，
+       * 每次冷启动都会为每个本地曲目 createObjectURL 一批 blob URL，
        * 但从不回收 —— 反复冷启动会持续泄漏。
        * 重建之前先把上一批（同一会话内重入时）回收掉。
        */
@@ -236,23 +352,72 @@
           if (t && t.src && /^blob:/.test(t.src)) URL.revokeObjectURL(t.src);
         });
       } catch (e) {}
+      /*
+       * ⚠️ 这里以前是一个整体 try/catch，catch 里直接 this.localTracks = []。
+       *
+       * 后果比"少几首歌"严重得多：「从链接添加」会往同一个 ObjectStore
+       * 写一条**没有 blob** 的记录（音频在远端，src 是 URL），下次启动
+       * recs.map(...) 对那条记录执行 URL.createObjectURL(undefined) 抛
+       * TypeError → 被外层吞掉 → localTracks 清空 →
+       * **用户所有本机导入的歌在界面上一起消失**。
+       * IDB 里的数据其实还在，但没有任何 UI 路径能把它们救回来。
+       *
+       * 现在：逐条 try/catch，坏记录跳过并记日志，其余正常恢复。
+       * 链接导入的记录（有 remoteUrl 或没有 blob）走另一条路单独重建。
+       */
       try {
         const recs = await this.dbAll();
-        this.localTracks = recs.map((r) => ({
-          id: r.id, source: 'local', title: r.title, artist: r.artist, album: r.album,
-          duration: r.duration || 0, cover: '', src: URL.createObjectURL(r.blob),
-          format: (r.type || '').split('/')[1]?.toUpperCase() || 'AUDIO',
-          sampleRate: '', size: r.size, addedAt: r.addedAt, _blob: r.blob,
-        }));
-      } catch (e) { this.localTracks = []; }
+        const out = [];
+        let bad = 0;
+        for (const r of recs) {
+          if (!r || !r.id) { bad++; continue; }
+          /* 链接导入的曲目：没有 blob，src 是远端地址，直接还原成在线曲目形态 */
+          if (!r.blob) {
+            if (r.remoteUrl && r.src) {
+              out.push({
+                id: r.id, source: 'online', title: r.title || '', artist: r.artist || '',
+                album: r.album || '', duration: r.duration || 0,
+                cover: r.cover || '', src: r.src, format: r.format || 'ONLINE',
+                sampleRate: '', size: r.size || 0, addedAt: r.addedAt || 0,
+                remoteUrl: true,
+              });
+            } else { bad++; }
+            continue;
+          }
+          try {
+            out.push({
+              id: r.id, source: 'local', title: r.title, artist: r.artist, album: r.album,
+              duration: r.duration || 0, cover: '', src: URL.createObjectURL(r.blob),
+              format: (r.type || '').split('/')[1]?.toUpperCase() || 'AUDIO',
+              sampleRate: '', size: r.size, addedAt: r.addedAt, _blob: r.blob,
+            });
+          } catch (e) {
+            /* 单条坏掉不影响其它条 */
+            bad++;
+            try { if (window.Log) Log.err('STORE', e, 'restoreLocal 单条记录失败: ' + r.id); } catch (_) {}
+          }
+        }
+        this.localTracks = out;
+        if (bad) {
+          try {
+            if (window.Log) Log.info('STORE', bad + ' 条本机曲库记录无法恢复（缺少音频数据），已跳过');
+          } catch (_) {}
+        }
+      } catch (e) {
+        /* 读库本身失败（IDB 不可用/被占用）：这才是真的没有本地曲库 */
+        this.localTracks = [];
+        try { if (window.Log) Log.err('STORE', e, 'restoreLocal 读取失败'); } catch (_) {}
+      }
       return this.localTracks;
     },
     async addFiles(files) {
       const added = [];
       /*
        * 候选先筛出来，再并发探测时长。
-       * 之前是 for + await 串行：每个无法解析元数据的文件都要等满 4 秒超时，
-       * 导入 20 个不认识的格式就要 80 秒，期间界面只有一句「正在导入…」。
+       * 之前是 for + await 串行：每个无法解析元数据的文件都要等满
+       * _probe() 的超时（现在是 1.5 秒，上一版是 4 秒），
+       * 导入 20 个不认识的格式就要等半分钟到一分多钟，
+       * 期间界面只有一句「正在导入…」。
        */
       const cands = [];
       for (const f of files) {

@@ -169,7 +169,3 @@
   background:radial-gradient(circle,var(--accent),transparent 66%);filter:blur(26px);opacity:.45;pointer-events:none}
 .acct .btns{display:flex;gap:8px;margin-top:16px;position:relative;z-index:2}
 .acct .btns .btn{flex:1;height:38px;font-size:12px}
-.acct.signed .acct-row{cursor:pointer}
-
-/* ---------- 登录遮罩（网页端需要有登录入口时） ---------- */
-.login-tip{font-size:11px;line-height:1.8;color:var(--text3);padding:0 4px 10px}

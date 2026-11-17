@@ -3,33 +3,49 @@
 
     <!-- 在线搜索 / 播放 / 封面 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- 播放时保持唤醒 -->
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Android 13+ 通知权限（播放通知不打断音乐，靠它把通知发出来） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 崩溃日志写到公共「下载」目录（API 29+ 走 MediaStore，低版本才需要这个） -->
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
     <!-- 状态栏歌词：需要悬浮窗（在其它应用上层绘制），由用户在系统设置里授权 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- 前台服务：退到后台继续播放 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
+    <!--
+        删掉的三条权限（声明了但整个工程从未使用，纯属扩大权限清单）：
+
+        · ACCESS_NETWORK_STATE —— 没有任何 ConnectivityManager / NetworkInfo 调用。
+          网络状态全由 HttpURLConnection 自己抛异常表示。
+        · WAKE_LOCK —— 没有 PowerManager / WakeLock 调用。前台服务期间屏幕是黑的
+          也不会断音频：WebView 的音频播放由系统 MediaSession 侧维持，不需要我们持锁。
+        · WRITE_EXTERNAL_STORAGE(maxSdk 28) —— 崩溃/日志落盘在 API 29+ 走 MediaStore
+          （不需要权限），29 以下已经走 getExternalFilesDir（应用专属目录同样不需要），
+          两条路径都不依赖这个权限。
+    -->
+
     <!-- allowBackup=false：SharedPreferences 里存着 MUSIC_U，不该跟着云备份走。
          选它而不是 dataExtractionRules，是因为后者要在 res/xml 下新增两个资源文件，
-         而本次改动范围只限 Java 层与 manifest。 -->
+         而本次改动范围只限 Java 层与 manifest。
+
+         usesCleartextTraffic 改成由 networkSecurityConfig 决定（默认禁止明文）。
+         代码里的请求全是 https（NeteaseClient 只连 music.163.com、封面走 https、
+         网页侧还会把 http: 主动改写成 https:），没有必要全应用放开明文。
+
+         enableOnBackInvokedCallback 故意**不开启**：
+         targetSdk 34 上开了这个开关，系统会把返回键交给 OnBackInvokedCallback，
+         而 MainActivity 仍然只用 onBackPressed()（里面还有一整套「面板 → 歌词 →
+         播放页 → 搜索框 → 退出」的判定），没有迁移到新回调 ——
+         打开开关的结果就是返回键直接失效。要开它必须先迁移返回键逻辑。 -->
     <application
         android:name=".RippleApp"
         android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/AppTheme"
-        android:usesCleartextTraffic="true">
+        android:theme="@style/AppTheme">
 
         <!--
             小窗 / 分屏 / 自由窗口：

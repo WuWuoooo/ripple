@@ -159,13 +159,21 @@
      * 相同请求在它返回之前再发起，直接复用同一个 Promise，不重复打网络。
      * 请求结束后立刻从缓存里删掉 —— 这是去重，不是缓存，下次调用仍会真的请求。
      *
-     * 注意：只有 GET 语义的读接口才会走这里（搜索、歌单、歌词、评论…）；
-     * 写操作（点赞、发评论）不经过 call()，所以不会被误合并。
+     * ⚠️ 注释以前写"写操作（点赞、发评论）不经过 call()" —— 那是**错的**，
+     * 它们在实现里确实走 call()。去重套在写操作上会带来真实问题：
+     * 用户手抖连点两次「赞」，第二次直接复用第一次的 Promise，
+     * 看起来正确；但如果两次是「赞 → 取消赞」，签名不同不会合并，
+     * 而同一秒内的两次「赞」本来就该只发一次 —— 所以合并其实是对的。
+     * 真正需要区分的是「必须逐次送达」的写（如发评论），这里用
+     * opts.noDedupe 显式跳过，注释同步改成与实现一致。
      */
-    async call(cmd, params) {
+    async call(cmd, params, opts) {
       if (this.mode === 'none') throw new Error('在线功能未启用');
+      const noDedupe = !!(opts && opts.noDedupe);
       let sig = '';
-      try { sig = cmd + '|' + JSON.stringify(params || {}); } catch (e) { sig = ''; }
+      if (!noDedupe) {
+        try { sig = cmd + '|' + JSON.stringify(params || {}); } catch (e) { sig = ''; }
+      }
       if (sig && _inflight.has(sig)) return _inflight.get(sig);
       const task = this._callOnce(cmd, params);
       if (sig) {
@@ -196,8 +204,14 @@
       const codeNum = json && json.code == null ? null : Number(json.code);
       if (json && codeNum && codeNum !== 200 && codeNum !== 800 && codeNum !== 801 && codeNum !== 802) {
         const msg = json.message || json.msg || ('错误码 ' + codeNum);
-        // 301 = 未登录
-        if (json.code === 301) {
+        /*
+         * 301 = 未登录。这里必须用上面归一化过的 codeNum，不能再用
+         * json.code —— 上游返回字符串 "301" 时严格比较会漏判，
+         * 抛出去的就是普通 Error('错误码 301')，没有 needLogin 标记，
+         * 上层 e.needLogin 分支不生效，用户看到「错误码 301」
+         * 而不是「需要登录网易云账号」。
+         */
+        if (codeNum === 301) {
           const err = new Error('需要登录网易云账号');
           err.needLogin = true;
           throw err;
@@ -257,7 +271,31 @@
       let json = {};
       try { json = JSON.parse(text || '{}'); } catch (e) {}
       if (!json.profile) throw new Error('没有读到登录信息，请重试');
-      return this.status();
+      /*
+       * 登录成功与否只看这个回调（profile 已经在手，cookie 也已写入）。
+       *
+       * 以前这里是 `return this.status()` —— status 内部 4 次串行请求，
+       * 最长 60 秒。它一旦失败/超时，doLogin 就进 catch 弹「登录未完成」，
+       * 但账号其实**已经登录成功**了，用户会反复重试，越试越乱。
+       *
+       * 现在：先把 profile 直接用上（账号卡片立刻正确），
+       * status 只用来补 VIP/等级这类附加信息，失败就算了。
+       */
+      this._profile = {
+        userId: json.profile.userId,
+        nickname: json.profile.nickname,
+        avatar: cover(json.profile.avatarUrl, 200),
+        background: cover(json.profile.backgroundUrl, 800),
+        signature: json.profile.signature || '',
+        level: 0, vip: false, vipLevel: 0, vipIcon: '', vipUntil: 0, likeIds: [],
+      };
+      /* 后台补全资料，失败不影响"登录成功"这个结论 */
+      this.status().then((p) => {
+        if (p) this._profile = p;
+      }).catch((e) => {
+        try { if (g.Log) g.Log.add('ACCOUNT', 'status 补全失败（不影响登录）: ' + e.message); } catch (_) {}
+      });
+      return this._profile;
     },
 
     loginCancel() {
@@ -323,7 +361,7 @@
 
     async songDetail(ids) {
       if (!ids || !ids.length) return [];
-      const r = await prof(() => this.call('song_detail', { ids: ids.join(',') }), 'detail');
+      const r = await this.call('song_detail', { ids: ids.join(',') });
       return (r.songs || []).map((s) => this.mapSong(s));
     },
 
@@ -491,8 +529,26 @@
       const text = String(content || '').trim();
       if (!text) throw new Error('评论不能为空');
       if (text.length > 140) throw new Error('评论最多 140 字');
-      const r = await this.call('comment_add', { id: String(songId), content: text });
-      const code = r && (r.code == null ? 200 : r.code);
+      /*
+       * noDedupe：发评论是"必须逐次送达"的写操作。
+       * 而且 _callOnce 对非 200/800/801/802 已经先抛错了，
+       * 所以下面那段 `if (code !== 200)` 其实是**死代码** ——
+       * 250/301 的"需要登录后才能评论"文案永远不执行，
+       * 用户看到的是 call() 抛出来的通用错误。这里显式处理那个异常。
+       */
+      let r;
+      try {
+        r = await this.call('comment_add', { id: String(songId), content: text }, { noDedupe: true });
+      } catch (e) {
+        /* 未登录时上游回 301/250，语气说清楚点 */
+        if (e && (e.needLogin || /301|250|401/.test(String(e.message)))) {
+          const err = new Error('需要登录后才能评论');
+          err.needLogin = true;
+          throw err;
+        }
+        throw e;
+      }
+      const code = r && (r.code == null ? 200 : Number(r.code));
       if (code !== 200) {
         const e = new Error((r && r.message) || (code === 301 || code === 250 ? '需要登录后才能评论' : '发表失败'));
         if (code === 301 || code === 250 || code === 401) e.needLogin = true;
@@ -508,15 +564,6 @@
       return { ok: r.list.length > 0, ms: Math.round(performance.now() - t0), name: r.list[0] ? r.list[0].title : '' };
     },
   };
-
-  /** 有些接口对未登录用户会返回 301，这里兜一层把错误信息说得更具体 */
-  async function prof(fn) {
-    try {
-      return await fn();
-    } catch (e) {
-      throw e;
-    }
-  }
 
   g.Netease = Netease;
 })(window);

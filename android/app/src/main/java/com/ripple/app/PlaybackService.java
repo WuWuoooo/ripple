@@ -40,7 +40,17 @@ import java.net.URL;
 public class PlaybackService extends Service {
 
     public static final String CH_PLAYING = "ripple_now_playing";
-    private static final int NOTIF_ID = 0x9A01;
+    public static final int NOTIF_ID = 0x9A01;
+
+    /**
+     * 无主自动退出：Sink 为 null（Activity 已销毁）且连续这么久没有收到任何
+     * 网页上报，就认为已经没人控制播放了，自己 stopAndQuit()。
+     *
+     * E-06：前端从不调 mediaStop()，退出 App 后服务会被 FGS 一直保活，
+     * 通知栏留下一条滑不掉、按钮全失效的「正在播放」。
+     * 这里是最外层兜底 —— 即使 Activity 的 onDestroy 没走到，也能自己收尾。
+     */
+    private static final long IDLE_EXIT_MS = 5000;
 
     /** 网页侧的指令入口（由 MainActivity 注入的回调转发） */
     public interface Sink {
@@ -58,7 +68,7 @@ public class PlaybackService extends Service {
     private MediaSession session;
     private final Handler main = new Handler(Looper.getMainLooper());
 
-    /* 当前展示状态（由网页上报） */
+    /* 当前展示状态（由网页上报）。只在主线程读写，见各入口的注释。 */
     private String title = "";
     private String artist = "";
     private String album = "";
@@ -69,6 +79,39 @@ public class PlaybackService extends Service {
     private Bitmap coverBmp;
     private String coverLoadedFor = "";
     private boolean foregroundStarted = false;
+
+    /*
+     * R-06：通知构建结果缓存。
+     * 以前 updateProgress() 每秒都 pushNotification() → buildNofitication()，
+     * 也就是每秒重建一次 MediaStyle + 4 个 Action + PendingIntent。
+     * 现在只有「这些字段变了」才重建，进度只走 setPlaybackState（系统自己插值）。
+     */
+    private String lastNotifKey = null;
+
+    /** 最近一次收到网页上报的时间；超过 IDLE_EXIT_MS 且没有 Sink 就自杀 */
+    private long lastReportAt = 0;
+    private final Runnable idleCheck = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                if (sink() != null) {
+                    // 还有人控制，继续看
+                    lastReportAt = System.currentTimeMillis();
+                    main.postDelayed(this, IDLE_EXIT_MS);
+                    return;
+                }
+                long idle = System.currentTimeMillis() - lastReportAt;
+                if (lastReportAt > 0 && idle >= IDLE_EXIT_MS) {
+                    LogBridge.add(PlaybackService.this, "MEDIA",
+                            "无人上报且无控制端，自动退出（idle=" + idle + "ms）");
+                    stopAndQuit();
+                    return;
+                }
+                main.postDelayed(this, IDLE_EXIT_MS);
+            } catch (Throwable ignored) {
+            }
+        }
+    };
 
     public static void setSink(Sink s) {
         sinkRef = s == null ? null : new WeakReference<>(s);
@@ -140,6 +183,9 @@ public class PlaybackService extends Service {
         } catch (Throwable e) {
             CrashLog.record(this, "media-create", e);
         }
+        // E-06 兜底：没有控制端且长时间没有上报就自己退出，不让 FGS 白养进程
+        lastReportAt = System.currentTimeMillis();
+        main.postDelayed(idleCheck, IDLE_EXIT_MS);
     }
 
     private void send(String cmd) {
@@ -167,70 +213,121 @@ public class PlaybackService extends Service {
     /**
      * 由 JS 调用：更新通知里的曲目信息与进度。
      * 参数都做成字符串，避免 @JavascriptInterface 的类型歧义。
+     *
+     * R-10：入口统一切回主线程，字段只在主线程读写。
      */
-    public void update(String title, String artist, String album, String coverUrl,
-                       String durationMs, String positionMs, boolean playing) {
-        try {
-            this.title = nz(title);
-            this.artist = nz(artist);
-            this.album = nz(album);
-            this.duration = parseLong(durationMs);
-            this.position = parseLong(positionMs);
-            this.playing = playing;
-            if (!nz(coverUrl).equals(this.coverUrl)) {
-                this.coverUrl = nz(coverUrl);
-                this.coverBmp = null;
-                this.coverLoadedFor = "";
-                loadCoverAsync(this.coverUrl);
+    public void update(final String title, final String artist, final String album,
+                       final String coverUrl, final String durationMs,
+                       final String positionMs, final boolean playing) {
+        main.post(() -> {
+            try {
+                lastReportAt = System.currentTimeMillis();
+                this.title = nz(title);
+                this.artist = nz(artist);
+                this.album = nz(album);
+                this.duration = parseLong(durationMs);
+                this.position = parseLong(positionMs);
+                this.playing = playing;
+                if (!nz(coverUrl).equals(this.coverUrl)) {
+                    this.coverUrl = nz(coverUrl);
+                    this.coverBmp = null;
+                    this.coverLoadedFor = "";
+                    loadCoverAsync(this.coverUrl);
+                }
+                updateMetadata();
+                updatePlaybackState();
+                pushNotification();
+            } catch (Throwable e) {
+                CrashLog.record(this, "media-update", e);
             }
-            updateMetadata();
-            updatePlaybackState();
-            pushNotification();
-        } catch (Throwable e) {
-            CrashLog.record(this, "media-update", e);
-        }
+        });
     }
 
     /** 只更新进度（每秒一次），成本更低 */
-    public void updateProgress(String positionMs, String durationMs, boolean playing) {
-        try {
-            this.position = parseLong(positionMs);
-            long d = parseLong(durationMs);
-            if (d > 0) this.duration = d;
-            this.playing = playing;
-            /*
-             * 每秒都要把最新的 position 交给 MediaSession。
-             * 以前只在 playing 变化时才重建 PlaybackState，而系统靠 setState 里的
-             * position 做进度插值 —— 于是锁屏/通知栏的进度条长期停滞或跳变。
-             */
-            updatePlaybackState();
-            pushNotification();
-        } catch (Throwable e) {
-            /* 进度更新失败不打扰 */
-        }
+    public void updateProgress(final String positionMs, final String durationMs, final boolean playing) {
+        main.post(() -> {
+            try {
+                lastReportAt = System.currentTimeMillis();
+                final boolean wasPlaying = this.playing;
+                this.position = parseLong(positionMs);
+                long d = parseLong(durationMs);
+                if (d > 0) this.duration = d;
+                this.playing = playing;
+                /*
+                 * 每秒都要把最新的 position 交给 MediaSession。
+                 * 以前只在 playing 变化时才重建 PlaybackState，而系统靠 setState 里的
+                 * position 做进度插值 —— 于是锁屏/通知栏的进度条长期停滞或跳变。
+                 */
+                updatePlaybackState();
+                /*
+                 * R-06：进度变了**不重建通知** —— 通知只展示标题/歌手/封面/播放态，
+                 * 进度条由系统的 MediaStyle 按 PlaybackState 自己插值。
+                 * 只有播放态真的翻转（播放/暂停图标要换）时才需要重画，
+                 * 这里直接比较布尔值，连指纹字符串都不用拼。
+                 */
+                if (wasPlaying == playing) return;
+                pushNotification();
+            } catch (Throwable e) {
+                /* 进度更新失败不打扰 */
+            }
+        });
     }
 
     public void stopAndQuit() {
-        try {
-            if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
-            else stopForeground(true);
-        } catch (Throwable ignored) {
-        }
-        try {
-            if (session != null) {
-                session.setActive(false);
-                session.release();
-                session = null;
+        main.post(() -> {
+            try {
+                main.removeCallbacks(idleCheck);
+            } catch (Throwable ignored) {
             }
-        } catch (Throwable ignored) {
-        }
-        foregroundStarted = false;
-        stopSelf();
+            try {
+                if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
+                else stopForeground(true);
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (session != null) {
+                    session.setActive(false);
+                    session.release();
+                    session = null;
+                }
+            } catch (Throwable ignored) {
+            }
+            foregroundStarted = false;
+            lastNotifKey = null;
+            releaseCover();
+            stopSelf();
+        });
+    }
+
+    /**
+     * O-04：释放封面位图（系统内存吃紧时由 Activity 调）。
+     * 下一次重新上报会重新下载，不影响可播放性。
+     *
+     * 注意**不**调 bitmap.recycle()：同一个 Bitmap 已经通过 MediaMetadata
+     * 交给系统的 MediaSession，跨进程还在用。真正回收它会让通知栏/锁屏
+     * 在重绘时拿到一块已释放的内存（部分 ROM 上直接崩）。
+     * 只把引用放掉，交给 GC 即可。
+     */
+    public void releaseCover() {
+        main.post(() -> {
+            try {
+                coverBmp = null;
+                coverLoadedFor = "";
+                // 通知里还挂着这张图，重画一次去掉它
+                lastNotifKey = null;
+                if (foregroundStarted) pushNotification();
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     @Override
     public void onDestroy() {
         instance = null;
+        try {
+            main.removeCallbacks(idleCheck);
+        } catch (Throwable ignored) {
+        }
         /*
          * 系统因内存压力回收服务时走的是 onDestroy，不是 stopAndQuit()。
          * 原来这里不 stopForeground，通知栏就会留下一条点不动的「正在播放」僵尸通知。
@@ -241,11 +338,14 @@ public class PlaybackService extends Service {
         } catch (Throwable ignored) {
         }
         foregroundStarted = false;
+        lastNotifKey = null;
         setSink(null);
         try {
             if (session != null) { session.release(); session = null; }
         } catch (Throwable ignored) {
         }
+        // 只放引用，不 recycle：这个 Bitmap 已经交给系统的 MediaSession（见 releaseCover）
+        coverBmp = null;
         super.onDestroy();
     }
 
@@ -269,13 +369,20 @@ public class PlaybackService extends Service {
          * 否则直接抛 ANR/ForegroundServiceDidNotStartInTimeException（我们会被系统杀掉）。
          * 而正常流程要等网页上报状态才发通知，中间可能超过 5 秒 ——
          * 所以这里先发一条「正在准备」的空通知把前台坐实，之后再覆盖。
+         *
+         * R-12：这里也是「上一次 startForeground 失败」的重试点 ——
+         * 通知权限/前台服务被系统拒绝时，至少留下日志，并在下一次
+         * startService（比如通知栏按钮）时再试一次，而不是永久静默。
          */
+        lastReportAt = System.currentTimeMillis();
         if (!foregroundStarted) {
             try {
                 enterForeground(buildNofitication());
                 foregroundStarted = true;
             } catch (Throwable e) {
                 CrashLog.record(this, "media-fg", e);
+                LogBridge.add(this, "MEDIA", "startForeground 失败，稍后重试: " + e);
+                main.postDelayed(this::retryForeground, 1500);
             }
         }
         // 通知里那三个按钮是 PendingIntent → getService，命令从这里进来
@@ -291,6 +398,29 @@ public class PlaybackService extends Service {
         }
         // 被系统杀掉后不要自己重启（播放逻辑在网页里）
         return START_NOT_STICKY;
+    }
+
+    /**
+     * 重试进前台。
+     * 只重试有限次（3 次）：真的没权限时无限重试只会刷日志、耗电。
+     */
+    private int fgRetries = 0;
+
+    private void retryForeground() {
+        if (foregroundStarted) return;
+        if (fgRetries >= 3) {
+            LogBridge.add(this, "MEDIA", "startForeground 重试 3 次仍失败，放弃（通知权限/前台服务被限制）");
+            return;
+        }
+        fgRetries++;
+        try {
+            enterForeground(buildNofitication());
+            foregroundStarted = true;
+            LogBridge.add(this, "MEDIA", "startForeground 第 " + fgRetries + " 次重试成功");
+        } catch (Throwable e) {
+            LogBridge.add(this, "MEDIA", "startForeground 重试 " + fgRetries + " 失败: " + e);
+            main.postDelayed(this::retryForeground, 2000L * fgRetries);
+        }
     }
 
     /* ================= 内部 ================= */
@@ -401,7 +531,8 @@ public class PlaybackService extends Service {
         }
         b.setContentTitle(title.isEmpty() ? "Ripple 涟漪" : title)
                 .setContentText(artist.isEmpty() ? "未在播放" : artist)
-                .setSmallIcon(android.R.drawable.ic_media_play)
+                // U-28：自带单色矢量图标，系统 android.R.drawable.ic_media_play 在部分 ROM 上会被 tint 成白块
+                .setSmallIcon(R.drawable.ic_stat_music)
                 .setOngoing(playing)
                 .setOnlyAlertOnce(true)
                 .setShowWhen(false)
@@ -444,6 +575,19 @@ public class PlaybackService extends Service {
         return b.build();
     }
 
+    /**
+     * 通知内容的「指纹」。
+     *
+     * R-06：只有它变化时才重建通知。位置/时长**故意不进指纹** ——
+     * 进度条由系统根据 PlaybackState 插值，重建通知并不能让它更流畅，
+     * 反而每秒都新建一次 MediaStyle + 4 个 Action + 4 个 PendingIntent。
+     */
+    private String notifKey() {
+        return title + "\u0001" + artist + "\u0001" + album
+                + "\u0001" + (playing ? "1" : "0")
+                + "\u0001" + (coverBmp != null ? System.identityHashCode(coverBmp) : 0);
+    }
+
     private PendingIntent cmdIntent(String cmd) {
         Intent it = new Intent(this, PlaybackService.class);
         it.setAction("com.ripple.app.MEDIA_CMD");
@@ -458,6 +602,13 @@ public class PlaybackService extends Service {
         try {
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return;
+            /*
+             * R-06：内容没变就不重建。
+             * 通知已经在前台/通知栏里、且指纹一致 → 直接返回。
+             * foregroundStarted 为 false 时必须继续走（还要把它坐实成前台服务）。
+             */
+            final String key = notifKey();
+            if (foregroundStarted && key.equals(lastNotifKey)) return;
             Notification n = buildNofitication();
             if (!foregroundStarted) {
                 enterForeground(n);
@@ -465,6 +616,7 @@ public class PlaybackService extends Service {
             } else {
                 nm.notify(NOTIF_ID, n);
             }
+            lastNotifKey = key;
         } catch (Throwable e) {
             CrashLog.record(this, "media-notify", e);
             LogBridge.add(this, "MEDIA", "notify failed: " + e);

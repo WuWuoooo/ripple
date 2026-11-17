@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    网络安全配置（targetSdk 34 / API 24+）。
+
+    以前 manifest 上写的是 android:usesCleartextTraffic="true"，等于全应用放开明文。
+    而实际上代码里所有请求都是 https：
+      · NeteaseClient 只请求 https://music.163.com
+      · PlaybackService 下载封面只走 http(s)，但网易云 CDN 返回的都是 https
+      · 网页侧 app/js/netease.js 会把 http: 前缀主动改写成 https:
+    所以这里默认禁止明文，只给「本机调试用的 loopback」留口子 —— 那不是网络可达
+    的地址，不会把用户的数据暴露到链路上。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- 本机：给 adb reverse / 本地自建代理留调试余地 -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

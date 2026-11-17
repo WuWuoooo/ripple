@@ -22,8 +22,14 @@ public class RippleApp extends Application {
         super.onCreate();
         LogBridge.add(this, "APP", "onCreate start, sdk=" + Build.VERSION.SDK_INT
                 + " " + Build.MANUFACTURER + " " + Build.MODEL
-                + " version=1.1.0(110)");
-        CrashLog.installQuietly(this);
+                + " version=1.2.0(120)");
+        /*
+         * 崩溃捕获只在这里装一次（传 Application Context）。
+         * 以前 MainActivity 也调了一遍，形成链式 handler：同一次崩溃写两份文件，
+         * 而且第一次调用带的是 Activity —— 静态字段里留住了整个界面。
+         * installQuietly 内部也有幂等标记，两处都调也只会生效一次。
+         */
+        CrashLog.installQuietly(getApplicationContext());
         readPreviousExit(this);
 
         /*
@@ -87,7 +93,13 @@ public class RippleApp extends Application {
                 sb.append('\n');
             }
             if (sb.length() > 0) {
-                CrashLog.recordRaw(ctx, "exit-info", sb.toString());
+                /*
+                 * 固定文件名覆盖写（Ripple-exit-info.txt）。
+                 * 以前走 recordRaw → 每次新建一个带秒级时间戳的 crash 文件：
+                 * LMK/厂商清理每杀一次就多一份，用得久了下载目录全是它。
+                 * 这类「上次退出原因」只需要最新一次。
+                 */
+                CrashLog.recordExitInfo(ctx, sb.toString());
             }
         } catch (Throwable ignored) {
         }

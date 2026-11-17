@@ -37,65 +37,166 @@ final class NeteaseClient {
     private static final String COOKIE_KEY = "ripple_cookie";
 
     private final SharedPreferences sp;
-    private String cookie = "";
+    /**
+     * 登录 cookie。
+     * 用 volatile 是为了让读侧（isLoggedIn / getCookie）不必进锁 —— 写侧仍然
+     * 做「读-改-写」，保证并发请求不会互相覆盖 Set-Cookie。
+     */
+    private volatile String cookie = "";
+
+    /**
+     * 请求锁：**整条 POST 串行化**。
+     *
+     * 以前 post() 只在 setCookie 里加了 synchronized，而
+     * 「带上当前 cookie 发请求 → 读响应头里的 Set-Cookie → 合并回 cookie」
+     * 这一整段在锁外 —— 两个并发请求各自拿到旧 cookie 快照，
+     * 后写回的会把另一个刚更新的会话 cookie（比如 MUSIC_U 刷新）整个盖掉。
+     * 网页侧一次刷新会同时打 status / likelist / playlist 好几个命令，
+     * 撞上的概率不低。
+     *
+     * 代价是请求变成串行。考虑到每个命令本身就要 1-4 个串行 POST、
+     * 前端也有超时兜底，这个代价远小于「登录态被随机写坏」。
+     */
+    private final Object REQ_LOCK = new Object();
+
+    /**
+     * cookie 字段的轻量锁 —— 只保护「赋值」这几纳秒，**绝不包裹网络 I/O**。
+     *
+     * 为什么必须分开：post() 持 REQ_LOCK 最长 30 秒（connect 12s + read 18s），
+     * 而 setCookie() 是从**主线程**调进来的（MainActivity.harvestLogin 拿到
+     * MUSIC_U 后立刻调）。如果 setCookie 也要抢 REQ_LOCK，网络一慢主线程就
+     * 被冻住几十秒 —— 直接 ANR。
+     *
+     * 两者的一致性：cookie 是 volatile 的，赋值本身原子；setCookie 每次
+     * 递增 cookieGen，absorbCookies 合并前先比对，发现期间有更新的登录态
+     * 就放弃这次合并（让 setCookie 赢，那才是真正来自登录页的新 cookie）。
+     */
+    private final Object COOKIE_LOCK = new Object();
+    private volatile int cookieGen = 0;
 
     NeteaseClient(Context ctx) {
         sp = ctx.getSharedPreferences("ripple", Context.MODE_PRIVATE);
         cookie = sp.getString(COOKIE_KEY, "");
     }
 
-    synchronized String getCookie() {
+    String getCookie() {
         return cookie;
     }
 
-    synchronized void setCookie(String raw) {
-        cookie = raw == null ? "" : raw;
-        sp.edit().putString(COOKIE_KEY, cookie).apply();
+    void setCookie(String raw) {
+        synchronized (COOKIE_LOCK) {
+            cookieGen++;
+            applyCookie(raw == null ? "" : raw);
+        }
     }
 
-    synchronized void clearCookie() {
-        setCookie("");
+    /**
+     * 清登录态。同时把 WebView 的 CookieManager 也清掉 ——
+     * 以前只清了 Java 这份和 SharedPreferences，CookieManager 里那份还在，
+     * 于是「退出登录」之后登录层一打开就又被判成已登录（三副本只清了两份）。
+     */
+    void clearCookie() {
+        synchronized (COOKIE_LOCK) {
+            cookieGen++;
+            applyCookie("");
+        }
+        clearWebViewCookies();
     }
 
-    synchronized boolean isLoggedIn() {
+    /**
+     * 清 CookieManager + 落盘。
+     * CookieManager 的 API 在各版本上返回值不同（Boolean vs Unit），
+     * 统一用 try-catch 吞掉，清不掉也不影响主流程。
+     */
+    static void clearWebViewCookies() {
+        try {
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.removeAllCookies(null);
+            cm.flush();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    boolean isLoggedIn() {
         return cookie.contains("MUSIC_U=");
+    }
+
+    /** 只做「写 cookie + 落盘」，调用方必须已经持有 COOKIE_LOCK */
+    private void applyCookie(String raw) {
+        cookie = raw;
+        try {
+            sp.edit().putString(COOKIE_KEY, raw).apply();
+        } catch (Throwable ignored) {
+        }
     }
 
     /* ================= 底层请求 ================= */
 
+    /**
+     * 发一个 weapi POST。
+     *
+     * 整段（拼请求头用的 cookie 快照 → 发请求 → 合并响应的 Set-Cookie）
+     * 都在 REQ_LOCK 里完成，见字段注释。
+     */
     private String post(String path, String jsonBody) throws Exception {
-        String csrf = Weapi.csrf(cookie);
-        String body = Weapi.form(jsonBody);
-        String url = HOST + "/weapi/" + path + (path.contains("?") ? "&" : "?") + "csrf_token=" + Weapi.urlEncode(csrf);
+        assertSafePath(path);
+        synchronized (REQ_LOCK) {
+            String csrf = Weapi.csrf(cookie);
+            String body = Weapi.form(jsonBody);
+            String url = HOST + "/weapi/" + path
+                    + (path.contains("?") ? "&" : "?") + "csrf_token=" + Weapi.urlEncode(csrf);
 
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        try {
-            conn.setRequestMethod("POST");
-            conn.setConnectTimeout(12000);
-            conn.setReadTimeout(18000);
-            conn.setDoOutput(true);
-            conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", UA);
-            conn.setRequestProperty("Referer", "https://music.163.com/");
-            conn.setRequestProperty("Origin", "https://music.163.com");
-            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            conn.setRequestProperty("Accept", "*/*");
-            conn.setRequestProperty("Accept-Encoding", "gzip");
-            conn.setRequestProperty("Cookie", "os=android; appver=8.9.70; osver=13; " + cookie);
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            try {
+                conn.setRequestMethod("POST");
+                conn.setConnectTimeout(12000);
+                conn.setReadTimeout(18000);
+                conn.setDoOutput(true);
+                conn.setInstanceFollowRedirects(true);
+                conn.setRequestProperty("User-Agent", UA);
+                conn.setRequestProperty("Referer", "https://music.163.com/");
+                conn.setRequestProperty("Origin", "https://music.163.com");
+                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+                conn.setRequestProperty("Accept", "*/*");
+                conn.setRequestProperty("Accept-Encoding", "gzip");
+                conn.setRequestProperty("Cookie", "os=android; appver=8.9.70; osver=13; " + cookie);
 
-            byte[] raw = body.getBytes("UTF-8");
-            conn.setFixedLengthStreamingMode(raw.length);
-            // 只取一次输出流：getOutputStream() 每调用一次都可能重新开流
-            java.io.OutputStream os = conn.getOutputStream();
-            os.write(raw);
-            os.flush();
+                byte[] raw = body.getBytes("UTF-8");
+                conn.setFixedLengthStreamingMode(raw.length);
+                // 只取一次输出流：getOutputStream() 每调用一次都可能重新开流
+                java.io.OutputStream os = conn.getOutputStream();
+                os.write(raw);
+                os.flush();
 
-            String text = readBody(conn);
-            absorbCookies(conn);
-            return text;
-        } finally {
-            conn.disconnect();
+                String text = readBody(conn);
+                absorbCookies(conn);
+                return text;            } finally {
+                conn.disconnect();
+            }
         }
+    }
+
+    /**
+     * 断言 /weapi/ 后面的路径只包含安全字符。
+     *
+     * comments 命令以前把网页传来的 id 原样拼进路径
+     * （"v1/resource/comments/R_SO_4_" + id），id="1../../logout"
+     * 就能打到任意 /weapi/ 下的接口 —— 等于绕过命令白名单。
+     * 这里做成最后一道闸：任何拼路径的地方出错都会被它拦住。
+     *
+     * 顺带把 ".." 这种目录穿越也挡掉（字符集里虽然有 '.'，但连续的点单独判）。
+     */
+    private static void assertSafePath(String path) throws Exception {
+        if (path == null || path.isEmpty()) throw new Exception("非法接口路径");
+        for (int i = 0; i < path.length(); i++) {
+            char c = path.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '/' || c == '_' || c == '-' || c == '.' || c == '?'
+                    || c == '=' || c == '&';
+            if (!ok) throw new Exception("非法接口路径");
+        }
+        if (path.contains("..")) throw new Exception("非法接口路径");
     }
 
     private static String readBody(HttpURLConnection conn) throws Exception {
@@ -112,8 +213,16 @@ final class NeteaseClient {
         return bos.toString("UTF-8");
     }
 
-    /** 把响应里的 Set-Cookie（登录成功后就是 MUSIC_U 等）合并进本地 cookie */
+    /**
+     * 把响应里的 Set-Cookie（登录成功后就是 MUSIC_U 等）合并进本地 cookie。
+     *
+     * 调用时已经持有 REQ_LOCK（所以不会有第二个 post 并发合并），
+     * 但主线程的 setCookie（登录页收割）可能中途插进来 ——
+     * 那种情况必须让 setCookie 赢：它带的是用户刚登录成功的新 cookie。
+     * 所以这里先记一个 cookieGen 快照，合并完发现变了就整段丢弃。
+     */
     private void absorbCookies(HttpURLConnection conn) {
+        final int gen = cookieGen;
         Map<String, String> jar = parseCookie(cookie);
         boolean changed = false;
         for (Map.Entry<String, List<String>> e : conn.getHeaderFields().entrySet()) {
@@ -133,7 +242,12 @@ final class NeteaseClient {
                 changed = true;
             }
         }
-        if (changed) setCookie(joinCookie(jar));
+        if (!changed) return;
+        synchronized (COOKIE_LOCK) {
+            // 期间有登录页写入了更新的 cookie：放弃这次合并，别把它盖回旧值
+            if (cookieGen != gen) return;
+            applyCookie(joinCookie(jar));
+        }
     }
 
     private static Map<String, String> parseCookie(String raw) {
@@ -273,7 +387,16 @@ final class NeteaseClient {
             }
             // 歌曲评论（热评 + 最新）
             case "comments": {
-                String id = p.optString("id");
+                /*
+                 * id 会被拼进 URL 路径（v1/resource/comments/R_SO_4_<id>），
+                 * 所以这里必须只接受纯数字：以前直接拼，id="1../../logout"
+                 * 就能打到 /weapi/ 下任意接口。post() 里还有一道通用的路径断言，
+                 * 两处都做是为了不依赖单一防线。
+                 */
+                String id = p.optString("id").trim();
+                if (!id.matches("^\\d+$")) {
+                    return "{\"code\":-1,\"msg\":\"歌曲 id 不合法\"}";
+                }
                 JSONObject o = new JSONObject();
                 o.put("rid", id);
                 o.put("limit", p.optInt("limit", 20));

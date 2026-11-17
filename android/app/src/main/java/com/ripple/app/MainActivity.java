@@ -30,15 +30,20 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.Locale;
+
 /**
- * Ripple · Android 外壳（v1.1.1）
+ * Ripple · Android 外壳
  *
- * 与 1.1.0 的区别：不再「崩了什么都不显示」。
+ * 设计约定：不再「崩了什么都不显示」。
  *   - Application 里装了全局崩溃捕获（RippleApp + CrashLog），
  *     堆栈会写到 私有 files/crash-*.txt 和「下载/Ripple-crash-*.txt」
  *   - 所有窗口/WebView 设置都包了 try-catch，任何一步失败都降级继续
  *   - 起不来时在界面上直接显示错误文本（而不是白屏/闪退）
- *   - 连续两次启动异常 → 自动进 safeMode（关掉边缘到边缘与 insets 注入）
+ *   - 连续多次启动异常 → 自动进 safeMode（关掉边缘到边缘与 insets 注入）
+ *
+ * 注意：版本号**不要**写在这里。它只有一个来源（项目根 version.json，
+ * 由 build-apk.sh 同步到 Gradle / 网页），写死一份副本必然会和真实 APK 对不上。
  */
 public class MainActivity extends Activity {
 
@@ -70,7 +75,13 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        CrashLog.installQuietly(this);
+        /*
+         * 崩溃捕获已经在 RippleApp.onCreate 里装过（并且用的是 Application Context）。
+         * 这里**不再**调 CrashLog.installQuietly(this)：
+         * 两处都调会形成链式 handler —— 同一次崩溃写两份文件，
+         * 而第一次调用传的是 Activity，静态字段里从此留住整棵 View 树。
+         * （installQuietly 内部也加了幂等标记，这里保险起见直接删掉。）
+         */
         CrashLog.step(this, "onCreate begin, sdk=" + Build.VERSION.SDK_INT
                 + " safeMode=" + StrictModes.safeMode);
         LogBridge.add(this, "UI", "onCreate, safeMode=" + StrictModes.safeMode);
@@ -291,11 +302,57 @@ public class MainActivity extends Activity {
 
     /* ================= WebView ================= */
 
+    /** 主布局容器：WebView 挂在这里，渲染进程挂掉重建时也只替换它的子项 */
+    private FrameLayout webRoot;
+
     private void buildUi() {
         CrashLog.step(this, "creating WebView");
+        webRoot = new FrameLayout(this);
         web = new WebView(this);
         CrashLog.step(this, "WebView created");
-        WebSettings s = web.getSettings();
+        configureWeb(web);
+
+        webRoot.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(webRoot);
+        CrashLog.step(this, "contentView set");
+
+        loadIndex();
+    }
+
+    /**
+     * 启动成功后才清零「连续失败计数」。
+     *
+     * 以前是「new WebView() 成功就清」，而典型故障（edge-to-edge 起不来、
+     * insets 注入异常、页面 JS 崩在第一屏）全都发生在建 WebView **之后** ——
+     * 计数永远累积不到 3 次，safeMode 等于形同虚设。
+     *
+     * 现在改成：页面加载完成（onPageFinished）之后再等 DELAY 毫秒，
+     * 期间没有再次触发崩溃/重建，才认为这一次启动真的成功了。
+     * RippleApp 里 >= 3 的判定保持不变。
+     */
+    private static final long BOOT_OK_DELAY_MS = 5000;
+    /** 每次重建 WebView 都换一个 token，旧的延时清零点自己失效 */
+    private int bootToken = 0;
+
+    private void scheduleBootStreakClear() {
+        final int token = ++bootToken;
+        final WebView w = web;
+        if (w == null) return;
+        w.postDelayed(() -> {
+            // 期间又崩过 / 重建过 / 页面换了：这次不算成功启动，别清零
+            if (token != bootToken) return;
+            if (!pageLoaded || web == null) return;
+            try {
+                getSharedPreferences("ripple", MODE_PRIVATE).edit()
+                        .putInt("boot_streak", 0).apply();
+            } catch (Throwable ignored) {
+            }
+        }, BOOT_OK_DELAY_MS);
+    }
+
+    /** 建一个新的 WebView 并挂到 webRoot（首次启动和渲染进程崩溃后重建共用） */
+    private void configureWeb(final WebView w) {
+        WebSettings s = w.getSettings();
         safe(() -> s.setJavaScriptEnabled(true));
         safe(() -> s.setDomStorageEnabled(true));
         safe(() -> s.setDatabaseEnabled(true));
@@ -330,69 +387,84 @@ public class MainActivity extends Activity {
         if (!StrictModes.safeMode) {
             try {
                 CookieManager.getInstance().setAcceptCookie(true);
-                CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
+                CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
             } catch (Throwable e) {
                 CrashLog.record(this, "cookie-init", e);
             }
         }
 
         try {
-            web.setBackgroundColor(Color.parseColor("#07070b"));
-            web.setOverScrollMode(View.OVER_SCROLL_NEVER);
-            web.addJavascriptInterface(new HttpBridge(this, netease), "RippleNative");
+            w.setBackgroundColor(Color.parseColor("#07070b"));
+            w.setOverScrollMode(View.OVER_SCROLL_NEVER);
+            w.addJavascriptInterface(new HttpBridge(this, netease), "RippleNative");
         } catch (Throwable e) {
             CrashLog.record(this, "bridge", e);
         }
 
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                Uri u = request.getUrl();
-                String scheme = u.getScheme() == null ? "" : u.getScheme();
-                if ("file".equals(scheme) || "about".equals(scheme)) return false;
-                if (scheme.startsWith("http") && "localhost".equals(u.getHost())) return false;
-                try {
-                    Intent it = new Intent(Intent.ACTION_VIEW, u);
-                    it.addCategory(Intent.CATEGORY_BROWSABLE);
-                    startActivity(it);
-                } catch (android.content.ActivityNotFoundException e) {
-                    // 没有任何应用能打开这个链接：明确告诉用户，而不是点了没反应
-                    Toast.makeText(MainActivity.this, "没有可以打开该链接的应用", Toast.LENGTH_SHORT).show();
-                } catch (Throwable e) {
-                    Toast.makeText(MainActivity.this, "打开链接失败", Toast.LENGTH_SHORT).show();
+        // 同一份 WebViewClient / ChromeClient 给重建出来的 WebView 复用
+        try {
+            w.setWebViewClient(new WebViewClient() {
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                    Uri u = request.getUrl();
+                    String scheme = u.getScheme() == null ? "" : u.getScheme();
+                    if ("file".equals(scheme) || "about".equals(scheme)) return false;
+                    if (scheme.startsWith("http") && "localhost".equals(u.getHost())) return false;
+                    try {
+                        Intent it = new Intent(Intent.ACTION_VIEW, u);
+                        it.addCategory(Intent.CATEGORY_BROWSABLE);
+                        startActivity(it);
+                    } catch (android.content.ActivityNotFoundException e) {
+                        // 没有任何应用能打开这个链接：明确告诉用户，而不是点了没反应
+                        Toast.makeText(MainActivity.this, "没有可以打开该链接的应用", Toast.LENGTH_SHORT).show();
+                    } catch (Throwable e) {
+                        Toast.makeText(MainActivity.this, "打开链接失败", Toast.LENGTH_SHORT).show();
+                    }
+                    return true;
                 }
-                return true;
-            }
 
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                pageLoaded = true;
-                CrashLog.step(MainActivity.this, "onPageFinished " + url);
-                measureAndPushInsets();
-            }
-
-            @Override
-            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                // 渲染进程被杀（大内存/系统回收）不能让整个 App 一起死
-                CrashLog.recordMessage(MainActivity.this, "render-gone",
-                        "WebView renderer gone, didCrash=" + (detail != null && detail.didCrash()));
-                showFatal("页面渲染进程被系统回收", null);
-                return true;
-            }
-
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest req, android.webkit.WebResourceError err) {
-                if (req != null && req.isForMainFrame()) {
-                    CrashLog.recordMessage(MainActivity.this, "page-error",
-                            "主页面加载失败: " + err.getErrorCode() + " " + err.getDescription()
-                                    + " url=" + req.getUrl());
+                @Override
+                public void onPageFinished(WebView view, String url) {
+                    super.onPageFinished(view, url);
+                    pageLoaded = true;
+                    CrashLog.step(MainActivity.this, "onPageFinished " + url);
+                    measureAndPushInsets();
+                    scheduleBootStreakClear();
                 }
-            }
-        });
+
+                @Override
+                public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                    /*
+                     * 渲染进程被杀（大内存/系统回收）不能让整个 App 一起死，
+                     * 但也**不能只是 return true 就完事** —— 那个 WebView 已经废了：
+                     * 之后的 evaluateJavascript 永远不回调，返回键判定卡住，
+                     * 用户只能按 Home 出去。
+                     *
+                     * 正确做法（官方文档要求）：先把 View 从布局里摘掉，再 destroy，
+                     * 然后把引用置空；这里再重建一个 WebView，用户不至于被迫退出。
+                     */
+                    CrashLog.recordMessage(MainActivity.this, "render-gone",
+                            "WebView renderer gone, didCrash=" + (detail != null && detail.didCrash()));
+                    discardWeb(view);
+                    recreateWeb();
+                    return true;
+                }
+
+                @Override
+                public void onReceivedError(WebView view, WebResourceRequest req, android.webkit.WebResourceError err) {
+                    if (req != null && req.isForMainFrame()) {
+                        CrashLog.recordMessage(MainActivity.this, "page-error",
+                                "主页面加载失败: " + err.getErrorCode() + " " + err.getDescription()
+                                        + " url=" + req.getUrl());
+                    }
+                }
+            });
+        } catch (Throwable e) {
+            CrashLog.record(this, "webview-client", e);
+        }
 
         try {
-            web.setWebChromeClient(new WebChromeClient() {
+            w.setWebChromeClient(new WebChromeClient() {
                 @Override
                 public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb,
                                                  FileChooserParams params) {
@@ -414,14 +486,9 @@ public class MainActivity extends Activity {
         } catch (Throwable ignored) {
         }
 
-        FrameLayout root = new FrameLayout(this);
-        root.addView(web, new FrameLayout.LayoutParams(-1, -1));
-        setContentView(root);
-        CrashLog.step(this, "contentView set");
-
         // edge-to-edge：必须把真实 insets 转给网页，否则顶部会被状态栏压住
         try {
-            web.setOnApplyWindowInsetsListener((v, insets) -> {
+            w.setOnApplyWindowInsetsListener((v, insets) -> {
                 int top = 0, bottom = 0, left = 0, right = 0;
                 if (Build.VERSION.SDK_INT >= 30) {
                     android.graphics.Insets i = insets.getInsets(
@@ -439,42 +506,70 @@ public class MainActivity extends Activity {
             });
         } catch (Throwable ignored) {
         }
+    }
 
+    /** 载入主页面 + 补推 insets（首次启动和重建都走这里） */
+    private void loadIndex() {
+        final WebView w = web;
+        if (w == null) return;
         CrashLog.step(this, "loading index.html");
-        web.loadUrl("file:///android_asset/www/index.html");
-
-        // 页面脚本可能晚于 insets 回调执行，补推几次
-        web.postDelayed(this::measureAndPushInsets, 300);
-        web.postDelayed(this::measureAndPushInsets, 1200);
-        web.postDelayed(this::measureAndPushInsets, 2600);
-
-        /*
-         * 启动成功：清掉连续失败计数。
-         *
-         * 注意触发时机 —— 以前只有这一个 2.6 秒后的回调。
-         * 用户在 2.6 秒内退出（试完就关 / 切走 / 点错就退）时永远清不掉，
-         * 于是下次启动又判成「异常启动」，累积下来必然进 safeMode：
-         * 视口变矮、状态栏不被覆盖、页面整体下移。
-         *
-         * 现在加两个更早的清零点：
-         *   · onCreate 走到这里（Activity 已经建起来）就算一次成功启动；
-         *   · 页面加载完成（onPageFinished）再清一次，覆盖 WebView 层的问题。
-         * 两个都比原来的 2.6 秒早得多，正常使用基本不可能错过。
-         */
         try {
-            getSharedPreferences("ripple", MODE_PRIVATE).edit()
-                    .putInt("boot_streak", 0).apply();
+            w.loadUrl("file:///android_asset/www/index.html");
+        } catch (Throwable e) {
+            CrashLog.record(this, "load-index", e);
+        }
+        // 页面脚本可能晚于 insets 回调执行，补推几次
+        w.postDelayed(this::measureAndPushInsets, 300);
+        w.postDelayed(this::measureAndPushInsets, 1200);
+        w.postDelayed(this::measureAndPushInsets, 2600);
+    }
+
+    /**
+     * 渲染进程挂掉之后：把废掉的 WebView 从布局摘下再销毁，然后重建。
+     * 任何一步失败都要保证不把 Activity 拖死。
+     */
+    private void discardWeb(WebView dead) {
+        WebView w = dead != null ? dead : web;
+        if (w == web) web = null;
+        try {
+            ViewGroup parent = (ViewGroup) w.getParent();
+            if (parent != null) parent.removeView(w);
         } catch (Throwable ignored) {
         }
-        web.postDelayed(() -> {
-            if (pageLoaded) {
-                try {
-                    getSharedPreferences("ripple", MODE_PRIVATE).edit()
-                            .putInt("boot_streak", 0).apply();
-                } catch (Throwable ignored) {
-                }
+        try {
+            w.stopLoading();
+        } catch (Throwable ignored) {
+        }
+        try {
+            w.destroy();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 重建 WebView。
+     * 渲染进程崩溃后如果什么都不做，用户看到的是一个永远白屏、返回键也失灵的外壳；
+     * 重建能把网页重新拉起来（播放状态在网页侧本地存储里，能续上）。
+     * 连重建都失败时，退回「退出 / 重启」按钮，至少给用户一条出路。
+     */
+    private void recreateWeb() {
+        try {
+            if (webRoot == null) {
+                showFatal("页面渲染进程被系统回收（无法重建）", null);
+                return;
             }
-        }, 3000);
+            final WebView w = new WebView(this);
+            configureWeb(w);
+            web = w;
+            webRoot.addView(w, new FrameLayout.LayoutParams(-1, -1));
+            pageLoaded = false;
+            lastBarKey = null;   // 重建后状态栏配色要重新下发
+            loadIndex();
+            LogBridge.add(this, "UI", "WebView 已重建（渲染进程曾被杀）");
+        } catch (Throwable e) {
+            CrashLog.record(this, "webview-recreate", e);
+            showFatal("页面渲染进程被系统回收", e);
+        }
     }
 
     private interface Action {
@@ -723,16 +818,25 @@ public class MainActivity extends Activity {
                      * 以前没有这个钩子：登录页里任何外链（用户协议、帮助中心、
                      * 甚至广告）都会把整个登录层带到别的站点，
                      * 而登录层没有地址栏也没有返回键，用户就卡在那儿了。
+                     *
+                     * R-17：判定必须是「解析出来的 host」做域名后缀比较。
+                     * 以前用 url.contains("music.163.com")，
+                     * https://evil.example/?music.163.com 这种 URL 能直接绕过。
                      */
                     @Override
                     public boolean shouldOverrideUrlLoading(WebView view, String url) {
                         if (url == null) return false;
-                        if (url.contains("music.163.com") || url.contains("126.net")
-                                || url.startsWith("about:") || url.startsWith("javascript:")) {
-                            return false;
-                        }
+                        if (url.startsWith("about:") || url.startsWith("javascript:")) return false;
+                        if (isNeteaseHost(url)) return false;
                         LogBridge.add(MainActivity.this, "LOGIN", "block external nav " + url);
                         return true;   // 拦掉站外跳转，留在登录页
+                    }
+
+                    /** targetSdk 24+ 的命中走这里（新签名优先，避免只实现旧的那个） */
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                        return shouldOverrideUrlLoading(view, req == null || req.getUrl() == null
+                                ? null : req.getUrl().toString());
                     }
                 });
 
@@ -751,18 +855,50 @@ public class MainActivity extends Activity {
     }
 
     /**
+     * 是不是网易云自己的域名。
+     *
+     * 必须用解析出来的 host 做后缀比较 —— 字符串 contains 会被
+     * "https://evil.example/?music.163.com" 这种 URL 绕过。
+     * 后缀比较也要带上点，否则 "notmusic.163.com.evil.com" 会被误判：
+     *   允许：music.163.com / 163.com / *.163.com / *.126.net / *.127.net
+     */
+    private static boolean isNeteaseHost(String url) {
+        try {
+            String host = Uri.parse(url).getHost();
+            if (host == null) return false;
+            host = host.toLowerCase(Locale.US);
+            return host.equals("163.com") || host.endsWith(".163.com")
+                    || host.equals("126.net") || host.endsWith(".126.net")
+                    || host.equals("127.net") || host.endsWith(".127.net");
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    /**
      * 把一整串 cookie 写回 WebView。
      * 取消登录时的回滚不能直接 setCookie("MUSIC_U=; Max-Age=0")，因为我们要恢复的是
      * 原来的每一项（MUSIC_U / __csrf / NMTID …），逐项写回才能和打开登录页前一致。
+     *
+     * R-09：getCookie() 返回的是 "name=value; name=value" 这种**没有属性**的串，
+     * 所以 Domain / Expires 在这一步已经丢了。折中方案：
+     *   · 已知会话 cookie 默认 Path=/，并且补上 Domain=.music.163.com，
+     *     这样 api 子域也能拿到（music.163.com 下发的 cookie 默认就是整站）；
+     *   · 已经带属性的（理论上不会有，getCookie 不返回属性）不重复拼。
      */
     private static void restoreCookie(String cookies) {
-        CookieManager cm = CookieManager.getInstance();
-        for (String part : cookies.split(";")) {
-            String p = part.trim();
-            if (p.isEmpty()) continue;
-            cm.setCookie("https://music.163.com", p + "; Path=/");
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            for (String part : cookies.split(";")) {
+                String p = part.trim();
+                if (p.isEmpty()) continue;
+                int eq = p.indexOf('=');
+                if (eq <= 0) continue;
+                cm.setCookie("https://music.163.com", p + "; Path=/; Domain=.music.163.com");
+            }
+            cm.flush();
+        } catch (Throwable ignored) {
         }
-        cm.flush();
     }
 
     /** 从 cookie 串里取 MUSIC_U 的值 */
@@ -996,8 +1132,13 @@ public class MainActivity extends Activity {
             closeLogin();
             return;
         }
+        /*
+         * 渲染进程崩溃后 web 会短暂为 null（重建期间）。
+         * 此时不能再 evaluateJavascript —— 那个回调永远不会来，返回键等于失灵，
+         * 只能按 Home 出去。直接 finish() 给用户一条出路。
+         */
         if (web == null) {
-            super.onBackPressed();
+            finish();
             return;
         }
         try {
@@ -1159,7 +1300,12 @@ public class MainActivity extends Activity {
 
     void updateLyricOverlay(String text) {
         LyricOverlay o = overlay();
-        if (o.isShowing()) o.setText(text);
+        /*
+         * 不判断 isShowing()：show() 是 post 到主线程的，紧接着来的第一句歌词
+         * 很可能在浮层真正 addView 之前就到了。text 由 setText 自己存住，
+         * show() 会用当前 text 初始化新 TextView，所以这里无条件交给它。
+         */
+        o.setText(text);
     }
 
     void hideLyricOverlay() {
@@ -1184,9 +1330,21 @@ public class MainActivity extends Activity {
      * 把网页的播放状态同步到通知栏。
      * 第一次收到时启动前台服务（只有前台服务的媒体通知才能固定在通知栏、
      * 并且能接锁屏和耳机键的控制）。
+     *
+     * R-10：本方法的调用方是 WebView 的 JS 桥线程，而 PlaybackService 里的
+     * title / position / playing 等字段只在主线程读写。所以这里先把整段工作
+     * post 到主线程，绝不在桥线程里直接改服务的状态。
      */
-    void updateMediaNotification(String title, String artist, String album, String coverUrl,
-                                 String durationMs, String positionMs, boolean playing) {
+    void updateMediaNotification(final String title, final String artist, final String album,
+                                 final String coverUrl, final String durationMs,
+                                 final String positionMs, final boolean playing) {
+        runOnUiThread(() -> applyMediaNotification(title, artist, album, coverUrl,
+                durationMs, positionMs, playing));
+    }
+
+    private void applyMediaNotification(String title, String artist, String album,
+                                        String coverUrl, String durationMs,
+                                        String positionMs, boolean playing) {
         try {
             /*
              * A-6：Android 13+ 没授通知权限时前台服务照常跑，但通知栏什么都不显示，
@@ -1198,8 +1356,33 @@ public class MainActivity extends Activity {
             PlaybackService.setSink(mediaSink);
             if (!PlaybackService.isRunning()) {
                 Intent it = new Intent(this, PlaybackService.class);
-                try { startForegroundService(it); } catch (Throwable e) {
-                    try { startService(it); } catch (Throwable e2) { return; }
+                boolean started = false;
+                try {
+                    startForegroundService(it);
+                    started = true;
+                } catch (Throwable e) {
+                    // R-12：失败原因要留痕，否则通知永久消失且无声无息
+                    CrashLog.recordMessage(this, "media-fgs",
+                            "startForegroundService 被拒: " + e);
+                    LogBridge.add(this, "MEDIA", "startForegroundService failed: " + e);
+                }
+                if (!started) {
+                    try {
+                        startService(it);
+                        started = true;
+                    } catch (Throwable e2) {
+                        CrashLog.recordMessage(this, "media-svc",
+                                "startService 也失败: " + e2);
+                        LogBridge.add(this, "MEDIA", "startService failed: " + e2);
+                        /*
+                         * 服务起不来（省电策略 / 后台启动限制）。
+                         * 不再静默放弃：让网页知道通知栏这次没起来，
+                         * 它可以在界面上给一条「后台播放受限」的提示。
+                         */
+                        replyToWebQuietly("window.__rippleMediaUnavailable && "
+                                + "window.__rippleMediaUnavailable('" + e2.getClass().getSimpleName() + "')");
+                        return;
+                    }
                 }
                 // 服务刚起时实例还是 null，稍等一拍再写状态
                 new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
@@ -1216,21 +1399,47 @@ public class MainActivity extends Activity {
         }
     }
 
-    void updateMediaProgress(String positionMs, String durationMs, boolean playing) {
-        try {
-            PlaybackService svc = PlaybackService.get();
-            if (svc != null) svc.updateProgress(positionMs, durationMs, playing);
-        } catch (Throwable e) {
-            /* 进度更新失败不打扰 */
-        }
+    /** 给网页推一段 JS（已经在主线程时也能安全调用） */
+    private void replyToWebQuietly(final String code) {
+        runOnUiThread(() -> {
+            try {
+                if (web != null) web.evaluateJavascript(code, null);
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
+    void updateMediaProgress(final String positionMs, final String durationMs, final boolean playing) {
+        // R-10：同样先回主线程，服务字段只在主线程访问
+        runOnUiThread(() -> {
+            try {
+                PlaybackService svc = PlaybackService.get();
+                if (svc != null) svc.updateProgress(positionMs, durationMs, playing);
+            } catch (Throwable e) {
+                /* 进度更新失败不打扰 */
+            }
+        });
+    }
+
+    /**
+     * 停掉播放通知（幂等）。
+     *
+     * 服务可能已经不存在（系统回收过 / 从没起过），这时候 stopService 兜底，
+     * 再显式 cancel 一次通知 id —— 保证不会留下滑不掉的僵尸通知。
+     */
     void stopMediaNotification() {
-        try {
-            PlaybackService svc = PlaybackService.get();
-            if (svc != null) svc.stopAndQuit();
-        } catch (Throwable ignored) {
-        }
+        runOnUiThread(() -> {
+            try {
+                PlaybackService svc = PlaybackService.get();
+                if (svc != null) svc.stopAndQuit();
+            } catch (Throwable ignored) {
+            }
+            try {
+                stopService(new Intent(this, PlaybackService.class));
+            } catch (Throwable ignored) {
+            }
+            cancelPlaybackNotification();
+        });
     }
 
     /**
@@ -1339,11 +1548,32 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        // A-1：服务里的 Sink 是 Activity 的内部类实例，不清掉服务会一直强引用整个 View 树
+        /*
+         * E-06：退出 App 必须把前台服务一起停掉。
+         *
+         * 以前只清掉 Sink，服务本身还在跑 —— 于是通知栏留下一条滑不掉、
+         * 按钮全失效的「正在播放」，进程还被 FGS 保活。前端从不调 mediaStop()，
+         * 所以这条兜底必须由 Activity 自己收尾。
+         *
+         * 顺序：先 Stop 服务（撤通知 + stopForeground），再拆 WebView。
+         * stopService 是幂等的：服务没起时什么都不发生。
+         * 同时清掉残留通知（服务若已被系统回收，stopService 也收不掉那条通知）。
+         */
         try {
             PlaybackService.setSink(null);
         } catch (Throwable ignored) {
         }
+        try {
+            stopService(new Intent(this, PlaybackService.class));
+        } catch (Throwable ignored) {
+        }
+        try {
+            PlaybackService svc = PlaybackService.get();
+            if (svc != null) svc.stopAndQuit();
+        } catch (Throwable ignored) {
+        }
+        cancelPlaybackNotification();
+
         // A-2：歌词浮层是静态单例，不主动收掉的话它会留在桌面上变成一个关不掉的幽灵窗口
         try {
             LyricOverlay o = LyricOverlay.peek();
@@ -1364,15 +1594,73 @@ public class MainActivity extends Activity {
             loginLayer = null;
         } catch (Throwable ignored) {
         }
+        /*
+         * R-02：WebView 必须先 detach 再 destroy。
+         * 直接把一个还挂在 View 树上的 WebView destroy 掉，某些 ROM 上会在
+         * 后续绘制/输入分发时崩（渲染进程已经没了，但 View 还认为自己活着）。
+         * 顺序：stopLoading() → loadUrl("about:blank") → removeView → destroy()。
+         */
+        destroyWeb();
+        webRoot = null;
+        super.onDestroy();
+    }
+
+    /** 撤掉播放通知（服务已经被系统回收时也能清干净） */
+    private void cancelPlaybackNotification() {
         try {
-            if (web != null) {
-                web.loadUrl("about:blank");
-                web.destroy();
-                web = null;
-            }
+            NotificationManager nm =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(PlaybackService.NOTIF_ID);
         } catch (Throwable ignored) {
         }
-        super.onDestroy();
+    }
+
+    /** 停下来 → 卸载 → 销毁，任何一步失败都不影响后面 */
+    private void destroyWeb() {
+        final WebView w = web;
+        web = null;
+        if (w == null) return;
+        try {
+            w.stopLoading();
+        } catch (Throwable ignored) {
+        }
+        try {
+            w.loadUrl("about:blank");
+        } catch (Throwable ignored) {
+        }
+        try {
+            ViewGroup parent = (ViewGroup) w.getParent();
+            if (parent != null) parent.removeView(w);
+        } catch (Throwable ignored) {
+        }
+        try {
+            w.destroy();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * O-04：系统内存吃紧时主动让出内存。
+     *
+     * TRIM_MEMORY_RUNNING_LOW 及以上（= 更紧急）时：
+     *   · 清掉 WebView 的缓存（页面资源在本地 assets 里，清了不影响离线可用）
+     *   · 释放 PlaybackService 里缓存的封面位图（重新播放时会再下载）
+     * 不清 DOM storage / localStorage —— 那里放着登录态之外的播放列表与设置。
+     */
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level < android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) return;
+        try {
+            if (web != null) web.clearCache(true);
+        } catch (Throwable ignored) {
+        }
+        try {
+            PlaybackService svc = PlaybackService.get();
+            if (svc != null) svc.releaseCover();
+        } catch (Throwable ignored) {
+        }
+        LogBridge.add(this, "MEM", "onTrimMemory level=" + level + "，已释放 WebView 缓存与封面");
     }
 
     /** 极简纵向布局，避免依赖 android.widget.LinearLayout 的泛型用法 */

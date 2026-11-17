@@ -2,6 +2,19 @@ plugins {
     id 'com.android.application'
 }
 
+/*
+ * R-23：显式指定签名配置。
+ *
+ * 以前 gradle 路径没有任何 signingConfigs，./gradlew assembleDebug 会用
+ * ~/.android/debug.keystore 里自动生成的随机调试证书 —— 而 build-apk.sh
+ * 用的是仓库里的 android/debug.keystore。两条路径签出来的包证书不同，
+ * 换着装就报 INSTALL_FAILED_UPDATE_INCOMPATIBLE（必须先卸载，
+ * 而卸载会把登录态和本地音乐一起清掉）。
+ *
+ * 这里指向同一个入库 keystore（密码见 build-apk.sh：pass:android）。
+ */
+def repoDebugKeystore = file('../debug.keystore')
+
 android {
     namespace 'com.ripple.app'
     compileSdk 34
@@ -10,16 +23,30 @@ android {
         applicationId 'com.ripple.app'
         minSdk 24
         targetSdk 34
-        versionCode 110
-        versionName '1.1.0'
+        // 由 android/sync-version.sh 从项目根 version.json 同步，别手改
+        versionCode 120
+        versionName '1.2.0'
+    }
+
+    signingConfigs {
+        debug {
+            storeFile repoDebugKeystore
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
     }
 
     buildTypes {
         debug {
             applicationIdSuffix ''
+            signingConfig signingConfigs.debug
         }
         release {
             minifyEnabled false
+            // release 也复用同一把入库调试证书：本项目只做自用分发，不发布上架，
+            // 保证两种构建类型之间可以互相覆盖安装。
+            signingConfig signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
@@ -34,14 +61,37 @@ android {
     }
 }
 
-// 网页源码在 ../../app，每次构建前自动同步进 assets/www，
-// 这样改完前端直接 assembleDebug 就是最新的，不用手动 cp。
+/*
+ * 网页源码在 ../../app，每次构建前自动同步进 assets/www，
+ * 这样改完前端直接 assembleDebug 就是最新的，不用手动 cp。
+ */
 tasks.register('syncWebAssets', Copy) {
     from "${rootDir}/../app"
     into "${projectDir}/src/main/assets/www"
     includeEmptyDirs = false
+    // 版本同步会改写 app/js/version.js 与 app/sw.js，必须先把它们同步完再拷
+    mustRunAfter 'syncVersion'
+}
+
+/*
+ * R-24：Gradle 路径以前完全绕过 version.json 同步 ——
+ * 版本号停在 build.gradle 里手写的那份、sw.js 的缓存名也不会跟着 versionCode 变，
+ * 于是「用 gradle 打出来的包」和「用 build-apk.sh 打出来的包」可能版本号不同，
+ * 甚至同一个 versionCode 对应两套不同的网页资源（Service Worker 缓存永久留存旧壳）。
+ *
+ * 现在两边都调同一个脚本 android/sync-version.sh：
+ *   · 它只在内容真的变化时才写回，不会把 git status 弄脏
+ *   · 解析失败会直接失败构建（而不是静默回退到某个写死的旧版本）
+ */
+tasks.register('syncVersion', Exec) {
+    workingDir rootDir
+    commandLine 'bash', "${rootDir}/sync-version.sh"
+    environment 'SKIP_VERSION_SYNC', System.getenv('SKIP_VERSION_SYNC') ?: '0'
+    // 版本号变了要重新执行：把 version.json 当输入
+    inputs.file file("${rootDir}/../version.json")
+    outputs.upToDateWhen { false }
 }
 
 tasks.named('preBuild') {
-    dependsOn 'syncWebAssets'
+    dependsOn 'syncVersion', 'syncWebAssets'
 }

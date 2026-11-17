@@ -44,25 +44,33 @@ public class LyricOverlay {
     private final Context ctx;
     private final WindowManager wm;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private Callback cb;
+    /**
+     * R-11：以下配置字段会被两个线程碰 ——
+     *   · 写：WebView 的 JS 桥线程（HttpBridge.showLyricOverlay → configure/setText/…）
+     *   · 读：主线程（applyStyle / applyPosition / 触摸回调 / 进度填充）
+     * 全部标 volatile，保证主线程读到的是最新一次配置；
+     * 需要「读+比较+写」的地方（见 configure / setText / setProgress）
+     * 再整体进 main.post 串行化。
+     */
+    private volatile Callback cb;
 
     private TextView view;
     private WindowManager.LayoutParams lp;
-    private boolean added = false;
+    private volatile boolean added = false;
 
-    private boolean locked = true;
-    private String text = "";
-    private int color = Color.WHITE;
-    private float sizeSp = 12f;
-    private float alpha = 0.92f;
-    private int posX = -1;
-    private int posY = -1;
-    private boolean bold = true;
-    private boolean shadow = true;
+    private volatile boolean locked = true;
+    private volatile String text = "";
+    private volatile int color = Color.WHITE;
+    private volatile float sizeSp = 12f;
+    private volatile float alpha = 0.92f;
+    private volatile int posX = -1;
+    private volatile int posY = -1;
+    private volatile boolean bold = true;
+    private volatile boolean shadow = true;
     /* 跟随播放进度填充：0=关闭；开启后按进度把文字从左到右染成高亮色 */
-    private boolean fillProgress = false;
-    private int fillColor = 0xFF7DE3D0;
-    private float progress = 0f;      // 0..1
+    private volatile boolean fillProgress = false;
+    private volatile int fillColor = 0xFF7DE3D0;
+    private volatile float progress = 0f;      // 0..1
 
     public LyricOverlay(Context ctx) {
         this.ctx = ctx.getApplicationContext();
@@ -81,7 +89,6 @@ public class LyricOverlay {
     public void setCallback(Callback c) {
         this.cb = c;
     }
-
     /** 有没有悬浮窗权限 */
     public static boolean canDraw(Context ctx) {
         try {
@@ -102,74 +109,100 @@ public class LyricOverlay {
 
     /* ================= 对外配置 ================= */
 
-    public void configure(boolean locked, String colorHex, String sizeSp, String alphaStr,
-                          String x, String y, boolean bold, boolean shadowOn,
-                          boolean fill, String fillHex) {
-        this.locked = locked;
-        int c = parseColor(colorHex, this.color);
-        float sz = parseFloat(sizeSp, this.sizeSp);
-        float al = parseFloat(alphaStr, this.alpha);
-        int nx = (int) parseFloat(x, this.posX);
-        int ny = (int) parseFloat(y, this.posY);
-        this.color = c;
-        this.sizeSp = Math.max(9f, Math.min(28f, sz));
-        this.alpha = Math.max(0.15f, Math.min(1f, al));
-        this.bold = bold;
-        this.shadow = shadowOn;
-        this.fillProgress = fill;
-        if (fillHex != null && !fillHex.isEmpty()) this.fillColor = parseColor(fillHex, this.fillColor);
-        /*
-         * -1 表示「恢复默认位置」。
-         * 之前写的是 if (ny > -9999) posY = ny，而 -1 恰好大于 -9999，
-         * 于是默认值永远覆盖不上去 —— 点「恢复默认位置」看起来毫无反应。
-         * 现在：< 0 就当作「用默认」，并立刻把窗口重新摆一次。
-         */
-        this.posX = nx < 0 ? -1 : nx;
-        this.posY = ny < 0 ? -1 : ny;
-        final boolean reposition = (this.posX < 0 || this.posY < 0) || nx >= 0 || ny >= 0;
+    /**
+     * 应用网页传来的配置。
+     *
+     * R-11：整段配置的读写搬进主线程 —— 以前 configure 在 JS 桥线程里
+     * 「读 this.color → 算新值 → 写 this.color」，主线程同时在 applyStyle 里读，
+     * 拿到的可能是半新半旧的组合（字号是新的、颜色是旧的）。
+     * 参数在进入 main.post 前先落到 final 局部变量，避免 lambda 捕获可变值。
+     */
+    public void configure(final boolean locked, final String colorHex, final String sizeSp,
+                          final String alphaStr, final String x, final String y,
+                          final boolean bold, final boolean shadowOn,
+                          final boolean fill, final String fillHex) {
         main.post(() -> {
-            applyStyle();
-            if (!added) return;
-            if (reposition) {
-                applyPosition();
-                try { wm.updateViewLayout(view, lp); } catch (Throwable e) {
-                    CrashLog.record(ctx, "lyric-move", e);
+            try {
+                this.locked = locked;
+                int c = parseColor(colorHex, this.color);
+                float sz = parseFloat(sizeSp, this.sizeSp);
+                float al = parseFloat(alphaStr, this.alpha);
+                int nx = (int) parseFloat(x, this.posX);
+                int ny = (int) parseFloat(y, this.posY);
+                this.color = c;
+                this.sizeSp = Math.max(9f, Math.min(28f, sz));
+                this.alpha = Math.max(0.15f, Math.min(1f, al));
+                this.bold = bold;
+                this.shadow = shadowOn;
+                this.fillProgress = fill;
+                if (fillHex != null && !fillHex.isEmpty()) {
+                    this.fillColor = parseColor(fillHex, this.fillColor);
                 }
+                /*
+                 * -1 表示「恢复默认位置」。
+                 * 之前写的是 if (ny > -9999) posY = ny，而 -1 恰好大于 -9999，
+                 * 于是默认值永远覆盖不上去 —— 点「恢复默认位置」看起来毫无反应。
+                 * 现在：< 0 就当作「用默认」，并立刻把窗口重新摆一次。
+                 */
+                this.posX = nx < 0 ? -1 : nx;
+                this.posY = ny < 0 ? -1 : ny;
+                final boolean reposition = (this.posX < 0 || this.posY < 0) || nx >= 0 || ny >= 0;
+
+                applyStyle();
+                if (!added || view == null || lp == null) return;
+                if (reposition) {
+                    applyPosition();
+                    try {
+                        wm.updateViewLayout(view, lp);
+                    } catch (Throwable e) {
+                        CrashLog.record(ctx, "lyric-move", e);
+                    }
+                }
+                updateLayoutFlags();
+            } catch (Throwable e) {
+                CrashLog.record(ctx, "lyric-config", e);
             }
-            updateLayoutFlags();
         });
     }
 
     public void setText(final String t) {
         final String v = t == null ? "" : t.trim();
-        if (v.equals(text)) return;
-        text = v;
+        /*
+         * E-12 + R-11：这里原来是锁外的「读 text → 比较 → 写 text」。
+         * 两个问题：
+         *   1) text 与 view 的内容可能不一致 —— hide() 把 view 置 null 但没清 text，
+         *      再次 show() 时新 TextView 是空的，而 setText 因为 v.equals(text)
+         *      直接早退，于是状态栏歌词永久空白；
+         *   2) 桥线程和主线程同时进这段会互相覆盖。
+         * 现在：整体进主线程串行化，并且改了 text 一律同步到 view（不靠早退省事）。
+         */
         main.post(() -> {
+            text = v;
             if (view == null) return;
             if (v.isEmpty()) {
                 view.setVisibility(View.GONE);
-            } else {
-                view.setVisibility(View.VISIBLE);
-                view.setText(v);
-                /*
-                 * 窗口宽度是「包住文字」的，所以每换一句歌词窗口宽度都会变。
-                 * 如果当前是默认位置（没手动拖过），必须重新居中，
-                 * 否则长句会从中间开始、短句还停在上一句的左边。
-                 */
-                if (posX < 0) {
-                    view.post(() -> {
-                        if (view == null || lp == null || !added) return;
-                        centerHorizontally();
-                    });
-                }
+                return;
+            }
+            view.setVisibility(View.VISIBLE);
+            if (!v.contentEquals(view.getText())) view.setText(v);
+            /*
+             * 窗口宽度是「包住文字」的，所以每换一句歌词窗口宽度都会变。
+             * 如果当前是默认位置（没手动拖过），必须重新居中，
+             * 否则长句会从中间开始、短句还停在上一句的左边。
+             */
+            if (posX < 0) {
+                view.post(() -> {
+                    if (view == null || lp == null || !added) return;
+                    centerHorizontally();
+                });
             }
         });
     }
 
     public void setLocked(boolean v) {
-        if (locked == v) return;
-        locked = v;
         main.post(() -> {
+            if (locked == v && added) return;
+            locked = v;
             if (added) updateLayoutFlags();
         });
     }
@@ -182,6 +215,12 @@ public class LyricOverlay {
                     LogBridge.add(ctx, "LYRIC", "no overlay permission");
                     return;
                 }
+                /*
+                 * E-12 / R-11：view 一定是新建的空 TextView，
+                 * 上次 hide() 之后 text 里可能还留着上一句（hide 里现在会清空，
+                 * 但这里是第二重保险）—— 用当前 text 初始化，
+                 * 否则要等下一条歌词上报才有内容，用户看到的是空白。
+                 */
                 view = new TextView(ctx);
                 view.setSingleLine(true);
                 view.setEllipsize(TextUtils.TruncateAt.MARQUEE);
@@ -221,6 +260,14 @@ public class LyricOverlay {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
                 applyStyle();
+                // 把上次的歌词写进新 TextView（否则重开标签页后一直是空白）
+                final String cur = text;
+                if (cur != null && !cur.isEmpty()) {
+                    view.setText(cur);
+                    view.setVisibility(View.VISIBLE);
+                } else {
+                    view.setVisibility(View.GONE);
+                }
                 placeDefault();
                 bindTouch();
 
@@ -243,6 +290,14 @@ public class LyricOverlay {
             }
             added = false;
             view = null;
+            lp = null;
+            /*
+             * E-12：必须把 text 一起清掉。
+             * 否则「关掉状态栏歌词 → 再打开」时，新 TextView 是空的，
+             * 而下一条歌词如果恰好和上一句相同，setText 会判定「没变化」早退，
+             * 结果界面上永久空白。
+             */
+            text = "";
         });
     }
 
@@ -319,11 +374,20 @@ public class LyricOverlay {
     public void setProgress(final String p) {
         if (!fillProgress) return;
         float v;
-        try { v = Float.parseFloat(String.valueOf(p).trim()); } catch (Throwable e) { return; }
+        try {
+            v = Float.parseFloat(String.valueOf(p).trim());
+        } catch (Throwable e) {
+            return;
+        }
+        if (Float.isNaN(v) || Float.isInfinite(v)) return;
         v = Math.max(0f, Math.min(1f, v));
-        if (Math.abs(v - progress) < 0.004f) return;   // 0.4% 以内不重绘
-        progress = v;
-        main.post(this::applyProgressFill);
+        // R-11：「读 progress → 比较 → 写 progress」整体进主线程
+        final float nv = v;
+        main.post(() -> {
+            if (Math.abs(nv - progress) < 0.004f) return;   // 0.4% 以内不重绘
+            progress = nv;
+            applyProgressFill();
+        });
     }
 
     /** 默认位置：屏幕顶部，避开刘海/状态栏图标那一行 */

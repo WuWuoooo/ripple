@@ -10,11 +10,10 @@ import android.webkit.JavascriptInterface;
 
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.util.zip.GZIPInputStream;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 给网页用的原生桥。
@@ -22,15 +21,28 @@ import java.util.zip.GZIPInputStream;
  *  v1.1 起在线音乐全部改走 netease()：Java 侧做 weapi 加密 + 带登录 cookie，
  *  网页只发命令名和参数，不再需要自建代理（老接口 /api/search/get 明文那套已弃用）。
  *
- *  其余保留：httpGet（通用 GET）、notify（低优先级静默通知，不打断播放）、
+ *  其余保留：notify（低优先级静默通知，不打断播放）、
  *  login / loginClose（内嵌官方登录页）。
+ *
+ *  已经删除的桥方法（前端零调用，删掉等于直接砍掉攻击面）：
+ *    · httpGet / httpGetAsync —— 通用 GET，虽然限了域名，但任意页面脚本都能借它
+ *      以用户身份去请求网易云；而前端从来没用过（全项目 grep 零命中）。
+ *    · exitApp  —— 网页可直接退出 App。
+ *    · platform  —— 常量，页面自己就能判断，留着只是多一个暴露面。
  */
 public class HttpBridge {
 
-    private static final String UA =
-            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
-    private static final String CH_ID = "ripple_playback";
+    private static final String CH_QUIET = "ripple_playback";
     private static final String CH_ALERT = "ripple_alert";
+    /*
+     * 两个渠道的显示名收敛成「通知 / 提示音」两类。
+     * 老 id（ripple_playback）保持不变：渠道名可以改，id 一改用户在系统设置里
+     * 针对这个渠道做的调整（静音、重要性）就全丢了。
+     */
+    private static final String NAME_QUIET = "Ripple 通知";
+    private static final String DESC_QUIET = "低频通知，不发声、不打断音乐播放";
+    private static final String NAME_ALERT = "Ripple 提示（有声音）";
+    private static final String DESC_ALERT = "设置里关掉「通知不打断播放」后使用，会发出提示音";
     /*
      * 提示类通知的固定 id 段。
      * 以前用的是 currentTimeMillis() % 100000，而播放通知 0x9A01(=39425)
@@ -38,8 +50,16 @@ public class HttpBridge {
      * 这里单独占 0x9A10 起的一段，并在段内递增，避免 100 秒内互相覆盖。
      */
     private static final int NOTIF_TEST_BASE = 0x9A10;
-    private static final java.util.concurrent.atomic.AtomicInteger NOTIFY_SEQ =
-            new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final AtomicInteger NOTIFY_SEQ = new AtomicInteger(0);
+
+    /*
+     * 桥调用线程池：以前每次 netease() 都 new Thread()，一个页面刷列表就能
+     * 起几十个线程。改成固定大小 + 有界队列；队列满了明确回错误，
+     * 而不是让请求静默消失（前端会等到超时才报「请求超时」，看不出真正原因）。
+     */
+    private static final int POOL_SIZE = 5;
+    private static final int QUEUE_CAP = 64;
+    private static volatile ThreadPoolExecutor POOL;
 
     private final Context ctx;
     private final MainActivity act;
@@ -52,40 +72,57 @@ public class HttpBridge {
         ensureChannel();
     }
 
+    /** 惰性建池：线程是守护线程，App 退出后不会吊着进程 */
+    private static ThreadPoolExecutor pool() {
+        ThreadPoolExecutor p = POOL;
+        if (p != null) return p;
+        synchronized (HttpBridge.class) {
+            if (POOL == null) {
+                POOL = new ThreadPoolExecutor(POOL_SIZE, POOL_SIZE,
+                        30, TimeUnit.SECONDS,
+                        new ArrayBlockingQueue<>(QUEUE_CAP),
+                        new java.util.concurrent.ThreadFactory() {
+                            private final AtomicInteger seq = new AtomicInteger(0);
+
+                            @Override
+                            public Thread newThread(Runnable r) {
+                                Thread t = new Thread(r, "ripple-ncm-" + seq.incrementAndGet());
+                                t.setDaemon(true);
+                                return t;
+                            }
+                        },
+                        new ThreadPoolExecutor.AbortPolicy());
+            }
+            return POOL;
+        }
+    }
+
     /* ================= 网易云（真接口，weapi） ================= */
 
     /**
      * 异步调用网易云。字符串会被转成 JSON 空对象。
      * 回调 window.__rippleNativeResult(cbId, jsonText)。
      */
-    /**
-     * 第 5 条：网页里「两次下拉」确认后调用，关掉界面回到桌面。
-     * 放在网页侧判断是因为只有网页知道当前页面滚到顶了没有、
-     * 是否在 2 秒的确认窗口内。
-     */
-    @JavascriptInterface
-    public void exitApp() {
-        try {
-            act.runOnUiThread(() -> act.finish());
-        } catch (Throwable ignored) {
-        }
-    }
-
     @JavascriptInterface
     public void netease(final String cmd, final String paramsJson, final String cbId) {
-        new Thread(() -> {
-            String out;
-            try {
-                JSONObject p = null;
-                if (paramsJson != null && paramsJson.trim().startsWith("{")) {
-                    p = new JSONObject(paramsJson);
+        try {
+            pool().execute(() -> {
+                String out;
+                try {
+                    JSONObject p = null;
+                    if (paramsJson != null && paramsJson.trim().startsWith("{")) {
+                        p = new JSONObject(paramsJson);
+                    }
+                    out = ncm.call(cmd, p);
+                } catch (Exception e) {
+                    out = "{\"code\":-1,\"msg\":\"" + safe(e) + "\"}";
                 }
-                out = ncm.call(cmd, p);
-            } catch (Exception e) {
-                out = "{\"code\":-1,\"msg\":\"" + safe(e) + "\"}";
-            }
-            act.replyToWeb(cbId, out);
-        }, "ripple-ncm").start();
+                act.replyToWeb(cbId, out);
+            });
+        } catch (Throwable e) {
+            // 队列满 / 池已关闭：明确告诉网页，别让它干等到超时
+            act.replyToWeb(cbId, "{\"code\":-1,\"msg\":\"原生请求队列已满，请稍后重试\"}");
+        }
     }
 
     /** 当前是否已登录（有 MUSIC_U） */
@@ -93,6 +130,7 @@ public class HttpBridge {
     public boolean loggedIn() {
         return ncm.isLoggedIn();
     }
+
 
     /**
      * 打开官方登录页；登录成功后回调 cbId，payload 是 status 接口的返回
@@ -121,72 +159,6 @@ public class HttpBridge {
     /* ================= 通用 ================= */
 
     /**
-     * 只允许网易云自己的域名。
-     * 原来这个方法接受任意 URL，等于给网页开了一个「访问任意内网地址」的入口。
-     */
-    private static boolean allowedHost(String host) {
-        if (host == null) return false;
-        host = host.toLowerCase();
-        if (host.equals("music.163.com") || host.equals("163.com") || host.endsWith(".163.com")) return true;
-        if (host.equals("126.net") || host.endsWith(".126.net")) return true;
-        return false;
-    }
-
-    /**
-     * 同步 GET。
-     * 不再是 @JavascriptInterface：同步桥方法跑在 WebView 的 JS 线程上，
-     * 一次超时就把整个界面冻住，前端只用异步版本。
-     */
-    private String httpGet(String url) {
-        HttpURLConnection conn = null;
-        try {
-            URL u = new URL(url);
-            if (!allowedHost(u.getHost())) {
-                return "{\"code\":-1,\"msg\":\"host not allowed\"}";
-            }
-            conn = (HttpURLConnection) u.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            conn.setRequestProperty("User-Agent", UA);
-            conn.setRequestProperty("Referer", "https://music.163.com/");
-            conn.setRequestProperty("Accept", "*/*");
-            conn.setRequestProperty("Accept-Encoding", "gzip");
-            conn.setInstanceFollowRedirects(true);
-
-            int code = conn.getResponseCode();
-            InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            if (in == null) return "{\"code\":" + code + ",\"msg\":\"empty\"}";
-
-            String enc = conn.getContentEncoding();
-            if (enc != null && enc.toLowerCase().contains("gzip")) {
-                in = new GZIPInputStream(in);
-            }
-
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
-            in.close();
-            return bos.toString("UTF-8");
-        } catch (Exception e) {
-            String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-            msg = msg.replace("\\", " ").replace("\"", "'").replace("\n", " ");
-            return "{\"code\":-1,\"msg\":\"" + msg + "\"}";
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    @JavascriptInterface
-    public void httpGetAsync(final String url, final String cbId) {
-        new Thread(() -> {
-            final String res = httpGet(url);
-            act.replyToWeb(cbId, res);
-        }, "ripple-http").start();
-    }
-
-    /**
      * 静默通知：低优先级 + 无声 + 不震动，所以不会打断正在播放的音乐。
      */
     @JavascriptInterface
@@ -209,12 +181,12 @@ public class HttpBridge {
             ensureChannel(quiet);
 
             Notification.Builder b = Build.VERSION.SDK_INT >= 26
-                    ? new Notification.Builder(ctx, quiet ? CH_ID : CH_ALERT)
+                    ? new Notification.Builder(ctx, quiet ? CH_QUIET : CH_ALERT)
                     : new Notification.Builder(ctx);
 
             b.setContentTitle(title == null ? "Ripple" : title)
                     .setContentText(body == null ? "" : body)
-                    .setSmallIcon(android.R.drawable.ic_media_play)
+                    .setSmallIcon(R.drawable.ic_stat_music)
                     .setAutoCancel(true)
                     .setOnlyAlertOnce(true);
             if (quiet) {
@@ -260,18 +232,18 @@ public class HttpBridge {
         NotificationManager nm =
                 (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return;
-        String id = quiet ? CH_ID : CH_ALERT;
+        String id = quiet ? CH_QUIET : CH_ALERT;
         NotificationChannel ch = nm.getNotificationChannel(id);
         if (ch != null) return;
         if (quiet) {
-            ch = new NotificationChannel(id, "播放与提示", NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("低频通知，不发声、不打断音乐播放");
+            ch = new NotificationChannel(id, NAME_QUIET, NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription(DESC_QUIET);
             ch.setSound(null, null);
             ch.enableVibration(false);
             ch.setShowBadge(false);
         } else {
-            ch = new NotificationChannel(id, "提示（有声音）", NotificationManager.IMPORTANCE_DEFAULT);
-            ch.setDescription("设置里关掉「通知不打断播放」后使用，会发出提示音");
+            ch = new NotificationChannel(id, NAME_ALERT, NotificationManager.IMPORTANCE_DEFAULT);
+            ch.setDescription(DESC_ALERT);
         }
         nm.createNotificationChannel(ch);
     }
@@ -316,12 +288,11 @@ public class HttpBridge {
         }
     }
 
-    /** 记录一次 JS 错误 */
+    /** 记录一次 JS 错误（落盘单独限速，避免一个每秒复发的错误把盘写爆） */
     @JavascriptInterface
     public void jsError(String msg, String stack) {
         try {
-            LogBridge.add(ctx, "JS-ERROR", msg + "\n" + (stack == null ? "" : stack));
-            LogBridge.flush(ctx);
+            LogBridge.addError(ctx, "JS-ERROR", msg + "\n" + (stack == null ? "" : stack));
         } catch (Throwable ignored) {
         }
     }
@@ -423,7 +394,10 @@ public class HttpBridge {
         }
     }
 
-    /** 停止播放并撤掉通知（用户主动暂停到底 / 关闭 App 时） */
+    /**
+     * 停止播放并撤掉通知（用户主动暂停到底 / 关闭 App 时）。
+     * 幂等：服务没起 / 已经停止时重复调用什么都不会发生。
+     */
     @JavascriptInterface
     public void mediaStop() {
         try {
@@ -471,11 +445,6 @@ public class HttpBridge {
     @JavascriptInterface
     public void lockLyricOverlay(boolean locked) {
         try { act.lockLyricOverlay(locked); } catch (Throwable ignored) {}
-    }
-
-    @JavascriptInterface
-    public String platform() {
-        return "android";
     }
 
     /**

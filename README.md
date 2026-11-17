@@ -4,26 +4,29 @@
 > 在线内容走网易云真实接口（weapi 加密），支持登录自己的账号、每日推荐、心动模式与无限漫游。
 
 <p align="center">
-  <b>PWA + 原生外壳</b> · <b>0.67 MB</b> · <b>无 Gradle 依赖</b> · <b>无 AndroidX</b> · <b>MIT</b>
+  <b>PWA + 原生外壳</b> · <b>约 0.5 MB（APK）</b> · <b>构建不依赖 Gradle</b> · <b>无 AndroidX</b> · <b>MIT</b>
 </p>
 
 ---
 
 ## 它长什么样
 
+> **截图位于 `docs/screenshots/`，由维护者在发布前补充。**
+> 在截图补齐之前，下面这些图在 GitHub 上会显示为裂图，不影响任何功能。
+
 | 首页 | 播放页 |
 |:---:|:---:|
-| <img src="docs/screenshots/home.png" width="300"> | <img src="docs/screenshots/player.png" width="300"> |
+| <img src="docs/screenshots/home.png" alt="Ripple 首页" width="300"> | <img src="docs/screenshots/player.png" alt="Ripple 播放页" width="300"> |
 
 | 完整歌词 | 播放设置 |
 |:---:|:---:|
-| <img src="docs/screenshots/lyrics.png" width="300"> | <img src="docs/screenshots/options.png" width="300"> |
+| <img src="docs/screenshots/lyrics.png" alt="Ripple 完整歌词页" width="300"> | <img src="docs/screenshots/options.png" alt="Ripple 播放设置面板" width="300"> |
 
 | 均衡器 | 状态栏歌词 |
 |:---:|:---:|
-| <img src="docs/screenshots/eq.png" width="300"> | <img src="docs/screenshots/sblyric.png" width="300"> |
+| <img src="docs/screenshots/eq.png" alt="Ripple 均衡器" width="300"> | <img src="docs/screenshots/sblyric.png" alt="Ripple 状态栏歌词" width="300"> |
 
-<img src="docs/screenshots/notification.png" width="640">
+<img src="docs/screenshots/notification.png" alt="Ripple 通知栏播放控件" width="640">
 
 > 真机截图：vivo V2425A / Android 17。通知与原子岛由系统按 MediaSession 渲染。
 
@@ -83,6 +86,11 @@
 - 最低 Android 7.0（API 24）
 - 装完直接可用，**不需要另起服务、不需要配置接口地址**
 
+> **安装来源很重要**：本 App 使用公开的 **debug 签名**（debug keystore 随仓库公开，
+> 密码是业界通用的 `android`，任何人都能拿它签出同包名的 APK）。因此请**只从本仓库
+> Releases 安装**，不要安装其它来源的同包名 APK —— 否则等于把「能覆盖升级你的 Ripple」
+> 的权限交给别人。详见 [SECURITY.md](SECURITY.md)。
+
 ### 跑网页版 / PWA
 
 ```bash
@@ -104,7 +112,13 @@ bash android/build-apk.sh
 ```
 
 产物：`android/build-manual/Ripple-<版本>-debug.apk`。
-详细的环境要求与 ARM 机器的坑见 [BUILD-ANDROID.md](BUILD-ANDROID.md)。
+详细的环境要求与 ARM 机器的坑见 [CONTRIBUTING.md](CONTRIBUTING.md#2-打包-apk)。
+
+构建流程不依赖 Gradle（`build-apk.sh` 只用 `aapt2 / javac / d8`，见
+[android/build-apk.sh](android/build-apk.sh)）；仓库里保留了可选的 Gradle 配置
+（`android/build.gradle`、`android/settings.gradle`、`android/gradle.properties`、
+`android/app/build.gradle`），但它**不是**官方构建入口，只用于 IDE 补全和给想用
+Gradle 的人一个起点。
 
 ## 项目结构
 
@@ -122,9 +136,10 @@ app/                    ← 网页版，同时是 APK 里的 assets/www
 │   └── app.js          ← 界面与业务
 └── sw.js               ← Service Worker
 
-android/                ← Java 外壳（8 个类，见 BUILD-ANDROID.md）
+android/                ← Java 外壳（11 个类，见 CONTRIBUTING.md 的「代码结构」）
 server.js               ← 浏览器模式的本地服务（静态 + /ncm 代理）
 version.json            ← 版本号唯一来源
+tests/                  ← Node 内置测试（bash tests/run.sh），目前覆盖 LRC 解析
 ```
 
 ## 隐私
@@ -133,7 +148,7 @@ version.json            ← 版本号唯一来源
 
 | 数据 | 存在哪 |
 |---|---|
-| 网易云登录态 | APK：应用私有配置；浏览器模式：`.ripple-cookie`（权限 0600，但 Android 外部存储不实现 POSIX 权限位，实际不生效） |
+| 网易云登录态 | APK：应用私有配置；浏览器模式：`.ripple-cookie`（服务端会 `chmod 0600`，但 Android 外部存储不实现 POSIX 权限位，实际为 `660`，见下） |
 | 本机导入的音频 | IndexedDB / 应用私有目录 |
 | 播放记录、设置 | localStorage / SharedPreferences |
 | 运行日志 | `Download/Ripple-log.txt`（不含密码） |
@@ -141,8 +156,9 @@ version.json            ← 版本号唯一来源
 `.ripple-cookie`、`.ripple-token` 都在 `.gitignore` 里，不会被提交。
 
 > **关于 0600 的说明**：本项目常跑在 `/sdcard/DSHBox/ripple`（Android 内部存储，
-> fuseblk 挂载）。该挂载不实现 POSIX 权限位，`chmod 0600` 是空操作。
-> 服务启动时会读回文件 mode 校验，不符即打印醒目警告。
+> fuseblk 挂载）。该挂载不实现 POSIX 权限位，`chmod 0600` 是空操作 ——
+> 实测 `stat -c '%a' .ripple-cookie .ripple-token` 得到的是 `660`，不是 `0600`。
+> 服务启动时会读回文件 mode 校验，不符即打印醒目警告（所以你会看到这条警告，它是准确的）。
 > 如果这台机器上还有其它 App 能读你的内部存储，请把项目移到应用私有目录再运行。
 
 安全相关请读 [SECURITY.md](SECURITY.md)。
@@ -151,6 +167,8 @@ version.json            ← 版本号唯一来源
 
 欢迎提 issue 和 PR，动手前请先看 [CONTRIBUTING.md](CONTRIBUTING.md)。
 请注意本项目刻意不引入 Kotlin / AndroidX / npm 依赖 / 前端构建链——这是它能保持「一个 `node server.js` 就跑起来」的前提。
+
+跑测试：`bash tests/run.sh`（Node 内置 test runner，不需要 `npm install`）。
 
 ## 许可证
 

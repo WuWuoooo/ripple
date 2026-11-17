@@ -245,7 +245,6 @@
    */
   .np-meta h2{font-size:23px;white-space:normal;display:-webkit-box;
     -webkit-line-clamp:2;-webkit-box-orient:vertical}
-  .np-artisticon{display:none}
 
   .np-actions{margin:14px calc(var(--np-pad-x) * -1) 0;padding:12px var(--np-pad-x) var(--safe-b)}
   .np-actions button{height:50px;border-radius:18px}
@@ -322,6 +321,13 @@
   .np-inner{
     display:grid;
     grid-template-columns:minmax(0,.92fr) minmax(0,1.08fr);
+    /*
+     * 手机横屏的两栏：右栏顶部是歌名，中间留给歌词，底部是进度 + 控制。
+     * 关键约束 —— .np-top 和 .np-meta 原来都被挤到同一格里，
+     * 歌名会被「正在播放 / 本地文件」那段小字顶上去、和它重叠。
+     * 所以 top 单独一行（只在左侧封面顶部占位），info 从第二行开始。
+     * （这一段以前在同一个 @media 块里重复声明了第二遍，等价且永远被覆盖，已合并。）
+     */
     grid-template-rows:auto auto 1fr auto auto auto;
     grid-template-areas:
       "top   top"
@@ -332,22 +338,6 @@
       "acts  acts";
     column-gap:20px;
     padding:var(--safe-t) calc(var(--np-pad-x) + 4px) 0;
-  }
-  /*
-   * 手机横屏的两栏：右栏顶部是歌名，中间留给歌词，底部是进度 + 控制。
-   * 关键约束 —— .np-top 和 .np-meta 原来都被挤到同一格里，
-   * 歌名会被「正在播放 / 本地文件」那段小字顶上去、和它重叠。
-   * 现在把 top 单独一行（只在左侧封面顶部占位），info 从第二行开始。
-   */
-  .np-inner{
-    grid-template-rows:auto auto 1fr auto auto auto;
-    grid-template-areas:
-      "top   top"
-      "cover info"
-      "cover lyric"
-      "cover seek"
-      "cover ctl"
-      "acts  acts";
   }
   /*
    * 顶栏横跨两栏：它是「关闭 / 正在播放 / 更多」的横排 flex，
@@ -432,6 +422,8 @@
   .row .r-th{width:38px;height:38px;border-radius:10px}
   .row .r-tx b{font-size:12px}
   .row .r-idx{width:18px}
+  /* 窄屏上歌名已经在截断，再留角标会把副标题挤没 */
+  .row .r-fmt{display:none}
   .tabbar{height:56px;border-radius:20px;left:10px;right:10px}
   .tabbar a{width:50px;font-size:8.5px}
   .tabbar svg{width:18px;height:18px}
@@ -466,7 +458,7 @@ html.perf-low .ambient i{animation:none!important}
 html.perf-low .grain{display:none}
 html.perf-low .page.on{animation:none}
 /*
- * H-20 配套：低配模式下即使 JS 加了 .animating 也不要提升合成层 ——
+ * 低配模式下即使 JS 加了 .animating 也不要提升合成层 ——
  * 低配机提升合成层反而更吃显存，而且 perf-low 本来就要降级动效。
  * 用 !important 明确压过 base.css 里的 .np.animating。
  */
@@ -528,8 +520,8 @@ html.perf-low .art .ripple{display:none}
 @media (prefers-reduced-motion:reduce){
   .ambient i{animation:none!important}
   .grain{display:none}
-  /* B-9：以前只关 animation，全项目 42 条 transition 照跑 ——
-     开了「减少动画」的用户照样看到所有滑动和淡入淡出。这里一起关掉。 */
+  /* 只关 animation 不够：全项目几十条 transition 会照跑，
+     开了「减少动画」的用户仍然看到所有滑动和淡入淡出。这里一起关掉。 */
   *,*::before,*::after{
     animation-duration:.001ms!important;
     animation-iteration-count:1!important;

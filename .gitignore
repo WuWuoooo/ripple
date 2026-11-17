@@ -42,5 +42,7 @@ Ripple-代码审查报告.md
 docs/user-logs/
 docs/代码审查报告.md
 
-# 独立 HTML 调参页（功能已内置到 app/js/animtune.js，避免两套并存）
+# 本地脚本 / 一次性工具
 tools/
+
+# 注意：docs/screenshots/ 要入库（README 会引用这些图），不要加进忽略列表

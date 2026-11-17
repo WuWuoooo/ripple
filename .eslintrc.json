@@ -1,0 +1,43 @@
+{
+  "root": true,
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "script"
+  },
+  "rules": {
+    "no-unused-vars": [
+      "warn",
+      {
+        "args": "after-used",
+        "argsIgnorePattern": "^_",
+        "ignoreRestSiblings": true
+      }
+    ],
+    "no-empty": ["warn", { "allowEmptyCatch": true }],
+    "no-undef": "error"
+  },
+  "globals": {
+    "RIPPLE_VERSION": "readonly",
+    "LRC": "readonly",
+    "AudioContext": "readonly",
+    "webkitAudioContext": "readonly",
+    "OffscreenCanvas": "readonly",
+    "MediaMetadata": "readonly"
+  },
+  "overrides": [
+    {
+      "files": ["tests/**/*.js"],
+      "env": { "browser": false, "node": true }
+    }
+  ],
+  "ignorePatterns": [
+    "app/js/version.js",
+    "android/",
+    "node_modules/"
+  ]
+}

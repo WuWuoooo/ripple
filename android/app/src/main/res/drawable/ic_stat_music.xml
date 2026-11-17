@@ -1,0 +1,16 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <!--
+        通知栏小图标：单色音乐符。
+        以前用的是系统 android.R.drawable.ic_media_play —— 那是「播放按钮」图标，
+        在部分 ROM 上会被按主题 tint，最后显示成一个白方块。
+        状态栏小图标必须是纯白/纯 alpha 的单色图形，所以这里自绘一个。
+    -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,3v10.55A4,4 0,1 0,14 17V7h4V3h-6z" />
+</vector>

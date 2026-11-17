@@ -172,9 +172,14 @@
     });
 
     // 启动后异步拉在线内容（失败不打扰）
-    refreshAccount().then(() => {
-      loadHomeOnline();
-    }).catch(() => loadHomeOnline());
+    /*
+     * 以前是 refreshAccount().then(() => loadHomeOnline()) —— 串行。
+     * 而 status 内部 4 次串行请求、最坏 60 秒，已登录用户弱网下
+     * 首页会长时间停在骨架屏。每日推荐/榜单这些内容本就不依赖账号，
+     * 所以并行发起：账号查询自己有超时兜底，不该拖住首页。
+     */
+    loadHomeOnline();
+    refreshAccount().catch(() => {});
   }
 
   /* ================= 主题 ================= */
@@ -381,8 +386,6 @@
      * 以前速度调到 0.5× 会变成 0.6s。
      */
     r.setProperty('--dur-ani', Math.min(0.3, 0.3 / k).toFixed(2) + 's');
-    /* 内置调参器如果存了自定义曲线/时长，让它覆盖掉上面的默认值 */
-    try { if (window.RippleAnimTune && RippleAnimTune.override) RippleAnimTune.override(r); } catch (e) {}
     r.setProperty('--lyric-size', S().lyricSize + 'px');
   }
 
@@ -565,7 +568,20 @@
   function rowHTML(t, i, isOn) {
     const fmt = t.vip ? 'VIP' : (t.format || '');
     const cls = /Hi-Res|FLAC|ALAC|DSD/i.test(fmt) ? ' hi' : (t.vip ? ' vip' : '');
-    return `<div class="row${isOn ? ' on' : ''}" data-id="${esc(t.id)}">
+    /*
+     * tabindex="0" + role="button" 让键盘/读屏能用。
+     *
+     * 以前这些行全是纯 div，没有 tabindex、没有 role、没有键盘激活 ——
+     * 全站 grep tabindex/role 在 app.js 里 0 命中。
+     * 后果是"用键盘或读屏播一首歌"在结构上就不可能：
+     * Tab 一遍只会停在顶栏 3 个按钮、tabbar 4 个链接、滑块与开关上。
+     * 激活逻辑由 document 上的 keydown 委派统一处理（见 bindRowKeyboard）。
+     * aria-label 给读屏一句完整的话，否则它只会念出一堆无关联的文本。
+     */
+    const label = [t.title, t.artist].filter(Boolean).join(' - ')
+      + (t.duration ? '，' + fmtTime(t.duration) : '');
+    return `<div class="row${isOn ? ' on' : ''}" data-id="${esc(t.id)}"
+      role="button" tabindex="0" aria-label="${esc(label)}">
       <div class="r-idx">${isOn ? '<div class="eq"><i></i><i></i><i></i><i></i></div>' : String(i + 1).padStart(2, '0')}</div>
       <div class="body">
         ${artHTML(t, 'r-th')}
@@ -578,14 +594,16 @@
   }
 
   function gridHTML(t, isOn) {
-    return `<div class="gcard${isOn ? ' on' : ''}" data-id="${esc(t.id)}">
+    return `<div class="gcard${isOn ? ' on' : ''}" data-id="${esc(t.id)}"
+      role="button" tabindex="0" aria-label="${esc([t.title, t.artist].filter(Boolean).join(' - '))}">
       ${artHTML(t, 'th')}
       <b>${esc(t.title)}</b><span>${esc(t.artist)}</span>
     </div>`;
   }
 
   function carouselHTML(items) {
-    return items.map((it) => `<div class="c-card" data-pl="${it.plId || ''}" data-id="${it.id || ''}">
+    return items.map((it) => `<div class="c-card" data-pl="${it.plId || ''}" data-id="${it.id || ''}"
+      role="button" tabindex="0" aria-label="${esc([it.title, it.sub].filter(Boolean).join(' - '))}">
       ${artHTML(it, 'c-art')}
       <div class="c-k">${esc(it.kind || '歌单')}</div>
       <div class="c-tx"><b>${esc(it.title)}</b><span>${esc(it.sub || '')}</span></div>
@@ -595,7 +613,8 @@
 
   function plRowHTML(p) {
     // F-17：data-pl 以前是裸插（esc 也只管 title/sub），属性值一律走 esc()
-    return `<div class="plrow" data-pl="${esc(p.plId)}">
+    return `<div class="plrow" data-pl="${esc(p.plId)}"
+      role="button" tabindex="0" aria-label="${esc([p.title, p.sub, p.creator].filter(Boolean).join(' - '))}">
       ${artHTML(p, 'th')}
       <div class="tx"><b>${esc(p.title)}</b><span>${esc(p.sub || '')}${p.creator ? ' · ' + esc(p.creator) : ''}</span></div>
       <div class="go"><svg><use href="#i-chev-right"/></svg></div>
@@ -605,7 +624,18 @@
   function renderAll() {
     renderHome();
     renderLibrary();
-    renderSearchDefaults();
+    /*
+     * 搜索页要单独判断：这里以前无条件调 renderSearchDefaults()，
+     * 而它会把 #searchBody 整个清空、再放回热搜。
+     * 于是「点♥ / 导入音乐 / 清空本机 / 恢复默认 / 同步我喜欢」任一次
+     * 都会把用户当前的搜索结果抹掉，搜索框里的关键词却还在 ——
+     * 变成「有关键词、没结果」。
+     *
+     * 只在「当前不在搜索页」或「搜索框是空的」时才重置：
+     * 用户正看着结果集时，renderAll 不应该动它。
+     */
+    const kw = ($('#searchInput') && $('#searchInput').value || '').trim();
+    if (App.page !== 'search' || !kw) renderSearchDefaults();
     syncSettingsUI();
     updateDock();
     renderNP();
@@ -1244,9 +1274,38 @@
    * 这里改用递增序号：只有最新一次请求有权落地播放。
    */
   let _resolveSeq = 0;
+  /*
+   * 歌单详情的请求序号（见 openPlaylist）。
+   * 放在这里而不是靠近 openPlaylist 的 4200 行处：那里是 let 声明，
+   * 而 openPlaylist 在 3200 行就会用到它 —— 靠"函数调用晚于模块执行"
+   * 侥幸能跑不算对，挪到前面就不存在 TDZ 风险。
+   */
+  let _plSeq = 0;
+  /*
+   * 打开的模态框栈（见 modal() / modalTop()）。
+   * 必须声明在这里而不是 modal() 旁边：__rippleBack（约 2790 行）
+   * 会调用 modalTop()，而 const 有暂时性死区，提前用会直接抛错。
+   */
+  const _modalStack = [];
+  /* 模态框标题 id 的自增序号（给 aria-labelledby 用） */
+  let _modalIdSeq = 0;
+  /*
+   * 启动恢复的接管序号：restoreLast() 开始时自增并记下自己的值，
+   * 任何「用户主动播放」都再自增一次，让前者后续所有写入作废。
+   * 放在这里而不是 App 上，是为了让它在最早期就能用（boot 里会先调
+   * playTrack 吗？不会，但 restoreLast 本身可能很早执行）。
+   */
+  if (App._restoreSeq == null) App._restoreSeq = 0;
 
   function playTrack(track, context) {
     if (!track) return;
+    /*
+     * 用户主动播放 = 接管播放器。
+     * 自增这个序号会作废所有还在飞的 restoreLast()（它可能正在解析
+     * 上次那首在线歌的地址，最多要等几十秒），避免它稍后把用户
+     * 刚点的歌换掉、或者把旧进度写进新歌。
+     */
+    App._restoreSeq++;
     let list = context && context.length ? context : Store.all();
     let i = list.findIndex((t) => t.id === track.id);
     if (i < 0) { list = [track]; i = 0; }
@@ -1338,7 +1397,15 @@
           Log.add('ONLINE', 'trial only: ' + (track.title || ''));
         }
       }
-      await ensureLyric(track);
+      /*
+       * ⚠️ 以前这里是 `await ensureLyric(track)`，然后才 playAt。
+       * 歌词是可选数据（lyric 命令的预算是 18 秒），却挡在出声之前 ——
+       * 歌词接口慢的时候，点一首歌要等十几秒才听见声音，
+       * 用户只会觉得「点了没反应」。
+       *
+       * 现在：先播，再后台补歌词。Player.on('track') 里已经有一层
+       * 「切歌后补拉歌词」的兜底，所以这条路不会漏。
+       */
       /*
        * F-13：await 期间用户可能已经点了别的歌（或换了音质）。
        * 只有仍是「最后一次请求」才有权把播放器切到这首 ——
@@ -1354,6 +1421,8 @@
       else { Player.playAt([track], 0); }
       Store.set('lastTrackId', track.id);
       rememberOnline(track);
+      /* 出声之后再补歌词，失败也不影响播放 */
+      ensureLyric(track).catch(() => {});
     } catch (e) {
       Log.err('ONLINE', e, (track && track.title) + ' neId=' + (track && track.neId));
       // 过期请求的失败不该弹到用户脸上（他已经在听/在点别的歌了）
@@ -1604,18 +1673,34 @@
     const d = Player.duration(), c = Player.time();
     const p = d ? Math.min(1, c / d) : 0;
     /*
-     * 播放进度是「每 100ms 一次、每次 6 个节点」的热路径，而它几乎总是
-     * 在 0.3% 的粒度内变化 —— 逐次写 style/textContent 会让平板上的
-     * 合成层一直重算。这里做值级短路：只有真的变了才碰 DOM。
+     * 用户正在拖进度条时，ticker 绝不能写进度。
+     *
+     * 以前 bindSeek 里有个局部 dragging 变量，但 updateTimes 根本不看它，
+     * 于是拖动时每秒（甚至每 100ms）都会被真实播放位置抢回去 ——
+     * 手指按着不动，滑块自己弹回原处。
+     * 现在把「正在拖」提到 App._seeking 这个跨函数可见的标记上，
+     * 拖动期间这里直接跳过进度写入（时间文字仍然更新到松手那一刻）。
      */
-    const pct = Math.round(p * 1000) / 10;
-    if (pct !== App._lastPct) {
-      App._lastPct = pct;
-      const w = (p * 100) + '%';
-      /* H-17：底部进度条走 transform（合成层，不触发 layout） */
-      $('#dockProg').style.transform = 'scaleX(' + p.toFixed(4) + ')';
-      $('#npFill').style.width = w;
-      $('#npKnob').style.left = w;
+    if (!App._seeking) {
+      /*
+       * 播放进度是「每 100ms 一次、每次 6 个节点」的热路径，而它几乎总是
+       * 在 0.3% 的粒度内变化 —— 逐次写 style/textContent 会让平板上的
+       * 合成层一直重算。这里做值级短路：只有真的变了才碰 DOM。
+       */
+      const pct = Math.round(p * 1000) / 10;
+      if (pct !== App._lastPct) {
+        App._lastPct = pct;
+        /* 两条进度条都走合成层，不触发 layout。
+           dockProg 是纯色条，直接 scaleX；
+           npFill 是渐变条，配 transform-origin:left 后 scaleX 会把整条渐变
+           压进已填充的那一段 —— 视觉上等宽，且不用改 width。
+           knob 是绝对定位的 10px 圆点，left 变化只影响它自己这一层，
+           保持 left 才能正确按「轨道宽度」的百分比定位（transform 的百分比
+           基准是圆点自身尺寸，用它定位会算错）。 */
+        $('#dockProg').style.transform = 'scaleX(' + p.toFixed(4) + ')';
+        $('#npFill').style.transform = 'scaleX(' + p.toFixed(4) + ')';
+        $('#npKnob').style.left = (p * 100) + '%';
+      }
     }
     const curTxt = fmtTime(c);
     if (curTxt !== App._lastCur) { App._lastCur = curTxt; $('#npCur').textContent = curTxt; }
@@ -1653,6 +1738,16 @@
       $('#npBg').style.backgroundImage = cssUrl(cover);
       $('#npBg').style.backgroundSize = 'cover';
       $('#npBg').style.backgroundPosition = 'center';
+      /*
+       * 「这首歌真的没有封面」用 class 表达，不再靠 CSS 选择器猜。
+       *
+       * 以前的降级规则是 .np-bg:not([style*="url"]){opacity:0}，
+       * 但 coverOf() **永远**返回一个 URL（没封面时返回 hashCover() 生成的
+       * data: SVG），所以 style 里永远含 url(...)，选择器永不匹配 ——
+       * 每首没封面的歌照样整屏铺 blur(44px)，白白多一层全屏模糊。
+       * 现在按 t.cover 的真实性挂 .no-cover，CSS 那边已经改好了。
+       */
+      document.body.classList.toggle('no-cover', !t.cover);
     }
     $('#npTitle').textContent = t.title;
     // VIP 角标：会员曲目 / 需要付费的曲目在歌名右边明确标注
@@ -1728,7 +1823,14 @@
        */
       $$('.lyric .ln', box).forEach((el) => {
         if (el.closest('.np-lyric')) return;      // 三行歌词交给 CSS 变量控制
-        el.style.fontSize = S().lyricSize + 'px';
+        /*
+         * 写 CSS 变量而不是 font-size。
+         * 行内 font-size 优先级高于样式表，会把 .ln.on 的
+         * 「当前行放大 1.12 倍」彻底压掉 —— 长歌词里"唱到哪一句"
+         * 只剩颜色差异，字号完全一样。
+         * 现在 CSS 用 calc(var(--ln-size) * 1.12) 表达放大，两边不再打架。
+         */
+        el.style.setProperty('--ln-size', S().lyricSize + 'px');
       });
     }
     lyricIdx = -2;
@@ -2239,6 +2341,8 @@
         const v = !S()[k];
         S()[k] = v; Store.save();
         sw.classList.toggle('on', v);
+        /* 与主设置页一致：switch 语义的控件要同步 aria-checked */
+        if (sw.getAttribute('role') === 'switch') sw.setAttribute('aria-checked', v ? 'true' : 'false');
         applyVars();
         onSettingChange(k, v, true);
         syncOptSheet();
@@ -2719,6 +2823,17 @@
    */
   window.__rippleBack = function () {
     try {
+      /*
+       * 模态框（确认/输入/关于）优先级最高。
+       *
+       * 以前这里只认 .np-sheet.on 和播放页，完全不知道 .modal-wrap 的存在，
+       * 于是：设置里点「清除播放记录」→ 弹出确认框 → 连按两次返回 →
+       * **App 直接退出，对话框还挂在屏幕上**，而 `await confirmDialog()`
+       * 永远等不到 resolve，那个"清空/不清空"的意图就被无声丢弃了。
+       * 现在按返回先关最上层的模态框，等于"取消"。
+       */
+      const mt = modalTop();
+      if (mt) { mt.close(null); return 'handled'; }
       const sheet = $('.np-sheet.on');
       if (sheet) {
         const id = sheet.id || '';
@@ -2766,6 +2881,13 @@
     liftWhileAnimating($('#np'), 560);
     liftWhileAnimating($('#npBg'), 560);
     $('#np').classList.add('open');
+    /*
+     * inert 是 CSS visibility 之外的第二层兜底：
+     * visibility:hidden 已经不接收焦点，但 inert 还能把整棵子树
+     * 从无障碍树和命中测试里彻底摘掉（更严格，也更省心）。
+     * 两层不冲突，同时存在最稳。
+     */
+    try { $('#np').removeAttribute('inert'); } catch (e) {}
     refreshSystemBars();
     /*
      * 打开播放页时强制发布一次封面尺寸 —— 这时播放页刚变成可见，
@@ -2783,6 +2905,12 @@
     liftWhileAnimating($('#npBg'), 560);
     $('#np').classList.remove('open');
     $('#np').setAttribute('aria-hidden', 'true');
+    /*
+     * 收起后整页内容不该再被 Tab 到 / 被读屏念到。
+     * CSS 那边已经用 visibility:hidden 拦了一道（transition-delay 保证
+     * 收起动画走完才真正隐藏），inert 作为第二层更彻底的兜底。
+     */
+    try { $('#np').setAttribute('inert', ''); } catch (e) {}
     if (isLyricExpanded()) collapseLyric();
     setTimeout(refreshSystemBars, 120);
   }
@@ -3098,13 +3226,23 @@
       const d = Player.duration();
       if (!d) return;
       const p = at(e);
-      $('#npFill').style.width = (p * 100) + '%';
+      /*
+       * 拖动期间同步写 _lastPct，否则 ticker 那边会认为"百分比变了"
+       * 而立刻把滑块拉回真实播放位置（E-03 的另一个入口）。
+       */
+      App._lastPct = Math.round(p * 1000) / 10;
+      $('#npFill').style.transform = 'scaleX(' + p.toFixed(4) + ')';
       $('#npKnob').style.left = (p * 100) + '%';
       $('#npCur').textContent = fmtTime(p * d);
       return p;
     };
     bar.addEventListener('pointerdown', (e) => {
       dragging = true;
+      /*
+       * 关键的跨函数标记：updateTimes() 看到它为 true 就完全不碰进度，
+       * 这样按住不动的时候滑块不会被每秒的 ticker 抢回去。
+       */
+      App._seeking = true;
       seek.classList.add('dragging');
       apply(e);
       try { bar.setPointerCapture(e.pointerId); } catch (err) {}
@@ -3113,12 +3251,14 @@
     bar.addEventListener('pointerup', (e) => {
       if (!dragging) return;
       dragging = false;
+      App._seeking = false;
       seek.classList.remove('dragging');
       const p = apply(e);
       if (p != null) Player.seek(p * Player.duration());
     });
     bar.addEventListener('pointercancel', () => {
       dragging = false;
+      App._seeking = false;
       seek.classList.remove('dragging');
     });
   }
@@ -3169,6 +3309,13 @@
   /* ================= 歌单详情 ================= */
   async function openPlaylist(plId, meta) {
     /*
+     * 请求序号：快速切换歌单时旧请求可能后返回，会把 header、封面、
+     * 曲目、App._plCurrent 全改成上一张，而用户在看新的那张。
+     * App._plCurrent 被覆盖后点「播放全部」会播错歌单。
+     * doSearch 早就有 _searchSeq，这里是同一套做法。
+     */
+    const my = ++_plSeq;
+    /*
      * H-1：#plPlay / #plShuffle 读的是 App._plCurrent。
      * 失败时不清空就会保留「上一张歌单」，点播放全部会播上一张的歌，
      * 标题却是新歌单 —— 张冠李戴。请求前先置空，成功后再赋值。
@@ -3195,12 +3342,16 @@
         }
         App._plCache.set(String(plId), data);
       } catch (e) {
+        /* 过期请求的失败不该覆盖新歌单的画面 */
+        if (my !== _plSeq) return;
         $('#plTracks').innerHTML = `<div class="empty"><b>读取失败</b><p>${esc(e.message)}</p></div>`;
         const plLoad3 = $('#plLoading');
         if (plLoad3) plLoad3.textContent = '失败';
         return;
       }
     }
+    /* 期间用户已经点了别的歌单：这一份结果直接丢掉 */
+    if (my !== _plSeq) return;
     $('#plTitle').textContent = data.title;
     $('#plSub').textContent = [data.creator, data.sub, data.desc].filter(Boolean).join(' · ');
     $('#plArt img').src = coverOf(data);
@@ -3217,15 +3368,38 @@
     const cur = Player.track;
     $('#plTracks').innerHTML = data.tracks.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
       || '<div class="empty"><b>空歌单</b></div>';
+    /*
+     * 成功路径必须把这个指示清掉。
+     * 以前只在进入时设成「读取中…」、失败时设成「失败」，
+     * 成功路径什么都没写 —— 于是这个 span 永远挂在「曲目」标题右边。
+     */
+    if (plLoad) plLoad.textContent = '';
     App._plCurrent = data;
   }
 
   /* ================= 设置 UI ================= */
   function syncSettingsUI() {
     const s = S();
+    /*
+     * 「设置 → 界面」这类开关的 DOM 副作用必须在这里补做一次。
+     *
+     * 以前只有 onSettingChange() 里写（那函数只在用户手动改设置时触发），
+     * 启动流程里没有任何一处补写，于是：
+     *   · 「列表密度」重启后回到标准行距
+     *   · 「显示歌词」关掉后重启，播放页三行歌词又出现
+     * 两项都表现为「设置没保存」，其实是保存了、只是没被应用。
+     * syncSettingsUI() 在 boot 里会跑一次，放这里最省事也最不容易漏。
+     */
+    document.body.classList.toggle('compact', !!s.compactList);
+    const mini = $('#npLyricMini');
+    if (mini) mini.classList.toggle('hidden', !s.showLyric);
     $$('[data-set]').forEach((el) => {
       const k = el.dataset.set;
-      if (el.classList.contains('sw')) el.classList.toggle('on', !!s[k]);
+      if (el.classList.contains('sw')) {
+        el.classList.toggle('on', !!s[k]);
+        /* 开关现在是有语义的 role="switch"，状态要同步给读屏 */
+        if (el.getAttribute('role') === 'switch') el.setAttribute('aria-checked', s[k] ? 'true' : 'false');
+      }
       if (el.tagName === 'INPUT') {
         el.value = s[k];
         paintSlider(el);
@@ -3468,9 +3642,30 @@
     });
 
     // 卡片 / 列表点击（委派）
+    /*
+     * 键盘激活：把 Enter / Space 转成一次 click。
+     *
+     * 行/卡现在带 role="button" tabindex="0"（见 rowHTML/gridHTML/
+     * carouselHTML/plRowHTML），但 div 不会因为回车就触发 click ——
+     * 浏览器原生只有真正的 <button> 会那样做。
+     * 这里统一补一层：命中带 tabindex 的可激活元素时合成 click 事件，
+     * 于是上面那套 document 级 click 委派原样复用，
+     * 不需要给每个处理分支再写一遍键盘版本。
+     */
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const t = e.target;
+      if (!t || !t.matches) return;
+      if (!t.matches('[role="button"][tabindex], .row[tabindex], .gcard[tabindex], .plrow[tabindex], .c-card[tabindex]')) return;
+      e.preventDefault();
+      const active = document.activeElement;
+      t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      /* 保持焦点，方便连续用键盘浏览 */
+      if (active && active.focus) { try { active.focus(); } catch (err) {} }
+    });
+
     document.addEventListener('click', (e) => {
       if (e.target.closest('#dock')) return;
-
       // 歌单卡 / 歌单行
       const plEl = e.target.closest('[data-pl]');
       if (plEl && plEl.dataset.pl) {
@@ -3776,7 +3971,14 @@
       lyricFollow = true;
       const box = $('#npLyric');
       if (box) box.classList.remove('free');
-      Player.seek(+ln.dataset.t);
+      /*
+       * 必须扣掉 lyricOffset。
+       * 高亮判定用的是 (歌词时间 + offset)，而这里以前直接 seek 原始时间，
+       * 于是设了 +2s 偏移之后，点哪一句跳过去都会落在别的句上 ——
+       * 越是靠后的歌词差得越明显。
+       */
+      const off = Number(S().lyricOffset) || 0;
+      Player.seek(Math.max(0, +ln.dataset.t - off));
     });
     /* 滚动监听是挂在 #npLyric 容器上的，启动时绑一次就够；
        以前只在 renderLyric 里绑，没有歌词时完全没监听。 */
@@ -3870,6 +4072,8 @@
           const v = !S()[k];
           S()[k] = v; Store.save();
           el.classList.toggle('on', v);
+          /* role="switch" 的状态要同步，否则读屏念的永远是初始值 */
+          if (el.getAttribute('role') === 'switch') el.setAttribute('aria-checked', v ? 'true' : 'false');
           applyVars();
           onSettingChange(k, v);
         });
@@ -3972,10 +4176,27 @@
       Player.setNormalize(S().normalize);
       Player.setGapless(S().gapless);
       syncModeButtons();
+      /*
+       * 这两项以前漏了，于是"恢复默认"之后 UI 说关闭、运行时还在用旧值：
+       *   · 接口地址：显示"默认"，实际仍用旧的 apiBase 发请求
+       *   · 睡眠定时：显示"关闭"，已设的定时照旧到点暂停
+       * 都要真的回滚。
+       */
+      try { Netease.setBase(S().apiBase || ''); } catch (e) {}
+      try { Player.sleep(0); } catch (e) {}
+      try {
+        const sh = $('#sleepHint'); if (sh) sh.textContent = '关闭';
+        const sl = $('[data-set="sleepMin"]'); if (sl) { sl.value = 0; paintSlider(sl); }
+      } catch (e) {}
       document.body.classList.toggle('compact', !!S().compactList);
       applyVars();
       syncSettingsUI(); renderAll();
-      toast('已恢复默认', '液态玻璃 · 深色', 'check');
+      /*
+       * toast 文案以前写死「液态玻璃 · 深色」，而 DEFAULTS.theme 其实是 'auto'。
+       * 按实际值说，别再给用户一个错误的结论。
+       */
+      const THEME_LABEL = { auto: '跟随系统', dark: '深色', light: '浅色' };
+      toast('已恢复默认', '主题 · ' + (THEME_LABEL[S().theme] || '跟随系统'), 'check');
     });
     $('#rowLog').addEventListener('click', showLog);
     $('#rowAbout').addEventListener('click', showAbout);
@@ -3989,11 +4210,34 @@
 
     // 键盘（桌面调试用）
     document.addEventListener('keydown', (e) => {
-      if (e.target.tagName === 'INPUT') return;
-      if (e.code === 'Space') { e.preventDefault(); Player.toggle(); }
-      if (e.key === 'ArrowRight') Player.next();
-      if (e.key === 'ArrowLeft') Player.prev();
-      if (e.key === 'Escape') closeNP();
+      /*
+       * 只在"没有输入焦点、也没有可激活控件"时才接管全局快捷键。
+       *
+       * 以前只判了 INPUT，漏掉 TEXTAREA 和 contenteditable ——
+       * 评论框里按空格会变成播放/暂停，字打不出来。
+       * 更要命的是 Space 被无条件 preventDefault 后，
+       * 键盘用户 Tab 到任意按钮上按空格，激活被吞、反而切换了播放。
+       */
+      const t = e.target;
+      const tag = (t && t.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (t && t.isContentEditable) return;
+      /* 焦点在可激活控件上时，把 Space/Enter 让给控件本身 */
+      const act = t && t.closest && t.closest('button, a, [role="button"], [role="switch"], [tabindex]');
+      if (act && (e.code === 'Space' || e.key === 'Enter')) return;
+      if (e.code === 'Space') { e.preventDefault(); Player.toggle(); return; }
+      if (e.key === 'ArrowRight') { Player.next(); return; }
+      if (e.key === 'ArrowLeft') { Player.prev(); return; }
+      /*
+       * Esc 的优先级要跟返回键一致：先关遮罩/面板，最后才收播放页。
+       * 以前无条件 closeNP()，桌面端按 Esc 想关个评论面板，
+       * 结果整页播放页被收走了。
+       */
+      if (e.key === 'Escape') {
+        if (typeof closeAnySheet === 'function' && closeAnySheet()) return;
+        if ($('.modal-wrap')) { const b = $('.modal-wrap'); const x = b.querySelector('[data-modal-cancel]'); if (x) x.click(); return; }
+        closeNP();
+      }
     });
 
     /*
@@ -4098,7 +4342,8 @@
     if (!box) return;
     $$('.ln', box).forEach((el) => {
       if (el.closest('.np-lyric')) return;
-      el.style.fontSize = px + 'px';
+      /* 同上：变量而不是行内 font-size，否则 .on 的放大永远不生效 */
+      el.style.setProperty('--ln-size', px + 'px');
     });
   }
 
@@ -4136,6 +4381,7 @@
    * 输入框写着林俊杰，列表却是周杰伦。这里只接受最新一次请求的结果。
    */
   let _searchSeq = 0;
+  /* 歌单详情的请求序号：快速切换时只接受最新一次的结果（见 openPlaylist） */
   function resetSearchSeq() { _searchSeq++; }
 
   /*
@@ -4174,7 +4420,19 @@
     /* 新行的 data-index 要接在已有行后面，否则点击播放会拿错曲目 */
     const frag = document.createElement('div');
     frag.innerHTML = list.map((t, i) => rowHTML(t, startIndex + i, false)).join('');
-    const listEl = host.querySelector('.list') || host;
+    /*
+     * 必须精确命中「单曲」那个列表。
+     *
+     * 以前写的是 host.querySelector('.list')，而 doSearch 的渲染顺序是
+     * 「歌单 div.list → 单曲标题 → 单曲 div.list → 加载更多按钮」，
+     * 于是这个选择器永远命中**第一个** .list（歌单容器）——
+     * 加载更多的新歌被插进了歌单区块，单曲区仍是 30 行，
+     * 但按钮计数已经变成 60 / 3127。
+     *
+     * 现在 doSearch 给单曲容器打了 id="searchSongList"，直接按 id 定位；
+     * 保留 .list 兜底是为了兼容旧缓存页面（SW 可能还在供旧 HTML）。
+     */
+    const listEl = body.querySelector('#searchSongList') || host.querySelector('.list') || host;
     while (frag.firstChild) listEl.insertBefore(frag.firstChild, more || done || null);
   }
 
@@ -4257,7 +4515,7 @@
         }
         html += `<div class="sec-head"><span class="n">NE</span><h2>单曲 · ${songs.total || songs.list.length}</h2></div>`;
         html += songs.list.length
-          ? `<div class="list">${songs.list.map((t, i) => rowHTML(t, i, false)).join('')}</div>
+          ? `<div class="list" id="searchSongList">${songs.list.map((t, i) => rowHTML(t, i, false)).join('')}</div>
              ${searchSongsTailHTML(_searchSession)}`
           : `<div class="empty"><b>没有找到</b><p>换个关键词试试</p></div>`;
         body.innerHTML = html;
@@ -5202,14 +5460,38 @@
   }
 
   /* ================= 弹窗 ================= */
+  /**
+   * 当前打开的模态框栈。
+   *
+   * 以前 modal() 只是往 body 塞一个 .modal-wrap：
+   *   · 没有 role="dialog" / aria-modal，读屏不知道这是对话框
+   *   · 不把焦点移进去，也不做焦点陷阱，Tab 会跑到底下的页面里
+   *   · Esc 不关（反而会把播放页收走）
+   *   · **返回键完全不认识它** —— __rippleBack 只认 .np-sheet.on 和播放页，
+   *     所以确认框开着时按一次返回提示"再按一次退出"，再按一次 App 就退了，
+   *     而 `await confirmDialog()` 永远不 resolve，用户的操作被无声丢弃。
+   * 这里用一个栈记录，返回键/Esc 都优先处理最上层的那个。
+   * （_modalStack 本身声明在文件前部的序号区，因为 __rippleBack 更早用到它。）
+   */
+
   function modal(html, opts = {}) {
     return new Promise((resolve) => {
       const wrap = document.createElement('div');
       wrap.className = 'modal-wrap';
+      /* 对话框语义：读屏会念"对话框"，且知道它是模态的 */
+      wrap.setAttribute('role', 'dialog');
+      wrap.setAttribute('aria-modal', 'true');
       wrap.innerHTML = `<div class="modal glass">${html}</div>`;
       document.body.appendChild(wrap);
       requestAnimationFrame(() => wrap.classList.add('on'));
+      /* 记下打开前的焦点，关闭时还回去 */
+      const prevFocus = document.activeElement;
+      let closed = false;
       const close = (v) => {
+        if (closed) return;
+        closed = true;
+        const i = _modalStack.indexOf(entry);
+        if (i >= 0) _modalStack.splice(i, 1);
         /*
          * L-19：关闭弹窗前必须 blur() 里面的输入框。
          * Android WebView 里 input 失去 DOM 后焦点不会自动释放，
@@ -5222,16 +5504,47 @@
         }
         wrap.classList.remove('on');
         setTimeout(() => wrap.remove(), 260);
+        /* 焦点还原，键盘用户不会掉回 body */
+        try { if (prevFocus && prevFocus.focus) prevFocus.focus(); } catch (e) {}
         resolve(v);
       };
+      const entry = { wrap, close };
+      _modalStack.push(entry);
+      /* 给标题一个 id，用 aria-labelledby 关联，读屏念得出这是什么框 */
+      const h3 = wrap.querySelector('h3');
+      if (h3) {
+        const hid = 'modal-h-' + (++_modalIdSeq);
+        h3.id = hid;
+        wrap.setAttribute('aria-labelledby', hid);
+      }
       wrap.addEventListener('click', (e) => { if (e.target === wrap) close(null); });
       const ok = $('[data-ok]', wrap), cancel = $('[data-cancel]', wrap);
       if (ok) ok.addEventListener('click', () => close(opts.confirm ? true : ($('input', wrap) ? $('input', wrap).value : true)));
       if (cancel) cancel.addEventListener('click', () => close(null));
+      /*
+       * 焦点接管 + 陷阱：打开时把焦点移到第一个可聚焦元素（或输入框），
+       * Tab / Shift+Tab 在框内循环，不会跑到后面的页面去。
+       */
+      const focusables = () => $$('input, textarea, button, [tabindex]:not([tabindex="-1"])', wrap)
+        .filter((el) => !el.disabled && el.offsetParent !== null);
+      wrap.addEventListener('keydown', (e) => {
+        if (e.key !== 'Tab') return;
+        const f = focusables();
+        if (!f.length) return;
+        const first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      });
       const inp = $('input', wrap);
       if (inp) setTimeout(() => inp.focus(), 120);
+      else setTimeout(() => { const f = focusables(); if (f.length) f[0].focus(); }, 120);
       opts.onMount && opts.onMount(wrap, close);
     });
+  }
+
+  /** 有没有开着的模态框（返回键/Esc 要优先处理它） */
+  function modalTop() {
+    return _modalStack.length ? _modalStack[_modalStack.length - 1] : null;
   }
 
   function promptDialog(title, hint, value) {
@@ -5505,17 +5818,61 @@
     }
 
     // 真正还原：设好队列 + 音源 + 上次进度，但不自动播放
+    /*
+     * ⚠️ 这是一个「后台异步恢复」的过程，而 boot 并没有 await 它
+     * （见 boot 里的 restoreLast().catch(...)），界面早已可交互。
+     * 解析在线地址最多要串行试 3 档、每档最长 25s，用户完全可能
+     * 在这 75 秒里自己点了别的歌。
+     *
+     * 以前这里没有任何「用户已接管」的判断，于是会直接把用户正在听的歌换掉；
+     * 更隐蔽的是 applyPos 读的是外层 Player.el（而不是当时这首歌的元素），
+     * 延迟 1.2 秒执行时若已切歌，会把**新歌**的 currentTime 写成旧进度。
+     *
+     * 现在：
+     *   · 每次 restoreLast 开始时记一个序号，用户任何播放动作都会 ++
+     *   · 每个可能写播放器状态的节点都先校验序号没变
+     *   · applyPos 闭包捕获当时的元素与期望位置，不再读 Player.el
+     */
+    const myRestore = ++App._restoreSeq;
+    const stillMine = () => App._restoreSeq === myRestore;
+
     Player.queueSet(list, at);
     Player.track = t;
-    Player.el = Player._pickEl(t);
-    Player.el.src = new URL(t.src, location.href).href;
-    Player.el.volume = S().volume;
+    /*
+     * 走 Player.load() 而不是直接写 el.src。
+     *
+     * load() 会顺带做完整套：设 playbackRate（播放速度）、发 track 事件、
+     * 更新 MediaSession、必要时建 WebAudio 图并重下发 EQ。
+     * 以前恢复路径只写了 src/volume，于是：
+     *   · 变速 1.5× → 重启后回到 1.0×
+     *   · 本地歌的均衡器预设看起来开着但不生效
+     *   · 通知栏元数据要等下次交互才刷新
+     *
+     * 传 autoplay=false：恢复不该自动出声，仍停在暂停态等用户点。
+     */
+    let loadOk = true;
+    try {
+      Player.load(t, { autoplay: false });
+    } catch (e) {
+      loadOk = false;
+      Log.err('RESTORE', e, 'Player.load failed: ' + t.title);
+    }
+    if (!loadOk) {
+      /* load 失败（非法 URL 等）时退回最小实现，至少界面是对的 */
+      Player.el = Player._pickEl(t);
+      try { Player.el.src = new URL(t.src, location.href).href; } catch (e) {}
+      Player.el.volume = S().volume;
+    }
 
     const applyPos = () => {
-      const d = Player.el.duration;
+      /* 用户已经接管播放：这次恢复的一切都不许再写播放器 */
+      if (!stillMine()) return;
+      const el = Player.el;
+      if (!el) return;
+      const d = el.duration;
       const pos = (isFinite(d) && d > 0) ? Math.min(savedPos, d - 1) : savedPos;
       if (pos > 0.5) {
-        try { Player.el.currentTime = pos; } catch (e) {}
+        try { el.currentTime = pos; } catch (e) {}
       }
       updateTimes();
       Log.add('RESTORE', 'restored ' + t.title + ' @' + pos.toFixed(1) + 's');
@@ -5551,6 +5908,17 @@
 
   App.play = playTrack;
   App.go = go;
+  /*
+   * 导出 toast / toastBottom。
+   *
+   * perf.js 会自动降画质后想告诉用户"发生了什么"，
+   * 它写的是 `if (g.RippleApp && typeof g.RippleApp.toast === 'function')`，
+   * 但这里以前只导出了 play 和 go —— toast 是 IIFE 内部函数，
+   * 那个判断恒为 false，于是低端机上画面**突然变丑、没有任何解释**。
+   * 同理 showAbout 之类的内部函数如需外部调用也在这里补。
+   */
+  App.toast = toast;
+  App.toastBottom = toastBottom;
   window.RippleApp = App;
   document.addEventListener('DOMContentLoaded', boot);
 })();

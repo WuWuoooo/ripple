@@ -56,6 +56,13 @@
       const line = `${stamp()} ${tag}: ERROR ${msg}${extra ? ' | ' + fmt(extra) : ''}`;
       BUF.push(line);
       if (stack) BUF.push(stack);
+      /*
+       * err() 一次 push 两行（message + stack），以前完全不做上限裁剪，
+       * 而 add() 只 shift 一次。反复报错的场景（比如每秒复发的歌词渲染错误）
+       * 会让 BUF 缓慢突破 MAX，内存和 dump 输出一起膨胀。
+       * 这里统一裁到 MAX，多出来的从头部丢掉。
+       */
+      while (BUF.length > MAX) BUF.shift();
       try {
         const n = N();
         if (n && typeof n.jsError === 'function') {
@@ -65,7 +72,15 @@
           if (typeof n.logFlush === 'function') n.logFlush();
         }
       } catch (err) {}
-      try { console.error('[ripple]', tag, e); } catch (err) {}
+      /*
+       * console 只在「没有原生桥」时才打 —— 与 add() 的策略保持一致。
+       * APK 里已经有原生日志，再往 console 打一份纯噪音。
+       */
+      let nativeOk = false;
+      try { const n = N(); nativeOk = !!(n && typeof n.jsError === 'function'); } catch (e2) {}
+      if (!nativeOk) {
+        try { console.error('[ripple]', tag, e); } catch (err) {}
+      }
     },
 
     flush() {

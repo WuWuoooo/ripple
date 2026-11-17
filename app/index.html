@@ -50,15 +50,18 @@
   如果等 perf.js（在 body 末尾）再判断，首屏会先按高画质渲染一帧
   （十几个 backdrop-filter + 整屏模糊），然后才挂上 perf-low 类降级，
   用户会看到明显一闪。这里提前把类挂上，样式表直接就按低配渲染。
-  判断逻辑与 app/js/perf.js 里的 guessLow() 保持一致。
+  判断逻辑与 app/js/perf.js 里的 guessLow() 保持一致：
+  · PHYS_LOW 阈值（450 万物理像素）必须与 perf.js 的 PHYS_LOW 相同；
+  · 「减少动效」不参与低配判定（它是偏好，不是性能信号）。
+  改其中一处时，另一处必须同步 —— 这是这段代码唯一的坑。
 -->
 <script>
 (function(){try{
+  var PHYS_LOW = 4500000;
   var dpr=window.devicePixelRatio||1, sc=window.screen||{};
   var phys=(sc.width||0)*(sc.height||0)*dpr*dpr;
   var cores=navigator.hardwareConcurrency||0, mem=navigator.deviceMemory||0;
-  var low = phys>2000000 || (cores&&cores<=4) || (mem&&mem<=3);
-  if(!low && window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) low=true;
+  var low = phys>PHYS_LOW || (cores&&cores<=4) || (mem&&mem<=3);
   var m=null; try{ m=localStorage.getItem('ripple.perf.v1'); }catch(e){}
   if(m==='high') low=false; else if(m==='low') low=true;
   else { try{ if(localStorage.getItem('ripple.perf.auto')==='1') low=true; }catch(e){} }
@@ -160,9 +163,9 @@
       <h1 id="helloTitle">晚上好，欢迎回来</h1>
     </div>
 
-    <button class="tb-btn" id="btnSearch" title="搜索"><svg><use href="#i-search"/></svg></button>
-    <button class="tb-btn" id="btnTheme" title="切换深浅色"><svg><use href="#i-moon"/></svg></button>
-    <button class="tb-btn" id="btnSettings" title="设置"><svg><use href="#i-settings"/></svg></button>
+    <button class="tb-btn" id="btnSearch" title="搜索" aria-label="搜索"><svg><use href="#i-search"/></svg></button>
+    <button class="tb-btn" id="btnTheme" title="切换深浅色" aria-label="切换深色 / 浅色主题"><svg><use href="#i-moon"/></svg></button>
+    <button class="tb-btn" id="btnSettings" title="设置" aria-label="打开设置"><svg><use href="#i-settings"/></svg></button>
   </header>
 
   <main class="view" id="view">
@@ -190,15 +193,15 @@
       </div>
 
       <div class="sec-head"><span class="n">01</span><h2 id="dailyTitle">每日推荐</h2>
-        <span class="more" id="dailyMore">全部 <svg width="12" height="12"><use href="#i-chev-right"/></svg></span></div>
+        <button type="button" class="more" id="dailyMore">全部 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
       <div class="carousel" id="carousel"></div>
 
       <div class="sec-head"><span class="n">02</span><h2>排行榜</h2>
-        <span class="more" id="toplistMore" data-act="toplist">更多 <svg width="12" height="12"><use href="#i-chev-right"/></svg></span></div>
+        <button type="button" class="more" id="toplistMore" data-act="toplist">更多 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
       <div class="carousel" id="toplistCarousel"></div>
 
       <div class="sec-head"><span class="n">03</span><h2>最近播放</h2>
-        <span class="more" data-nav="library">记录 <svg width="12" height="12"><use href="#i-chev-right"/></svg></span></div>
+        <button type="button" class="more" data-nav="library">记录 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
       <div class="grid" id="gridView"></div>
       <div class="list" id="listView"></div>
     </section>
@@ -241,7 +244,7 @@
       <div class="searchbox">
         <svg width="16" height="16"><use href="#i-search"/></svg>
         <input id="searchInput" placeholder="搜索歌曲、歌手，或粘贴链接" enterkeyhint="search" autocomplete="off">
-        <button class="clear" id="searchClear" hidden><svg width="13" height="13"><use href="#i-x"/></svg></button>
+        <button type="button" class="clear" id="searchClear" aria-label="清空搜索" hidden><svg width="13" height="13"><use href="#i-x"/></svg></button>
       </div>
       <div class="chiprow" id="searchScope">
         <button class="chip on" data-scope="online">网易云</button>
@@ -265,8 +268,8 @@
 
     <!-- ============ 歌单详情 ============ -->
     <section class="page" data-page="playlist">
-      <div class="pl-head" id="plHead">
-        <button class="back" id="plBack"><svg width="16" height="16"><use href="#i-chev-down"/></svg></button>
+      <div class="pl-head">
+        <button type="button" class="back" id="plBack" aria-label="返回"><svg width="16" height="16"><use href="#i-chev-down"/></svg></button>
         <div class="pl-art art" id="plArt"><img alt=""><div class="ripple"></div></div>
         <div class="pl-tx">
           <span class="k" id="plKind">歌单</span>
@@ -320,24 +323,24 @@
           <div class="set-row">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
             <div class="tx"><b>封面动态取色</b><span>界面主色随专辑封面变化</span></div>
-            <label class="sw on" data-set="dynamicColor"></label>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="dynamicColor" aria-label="封面动态取色"></button>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
             <div class="tx"><b>玻璃强度</b><span id="glassBlurHint">26 px</span></div>
-            <div class="sld"><input type="range" min="0" max="40" step="2" data-set="glassBlur"></div>
+            <div class="sld"><input type="range" min="0" max="40" step="2" data-set="glassBlur" aria-label="玻璃强度"></div>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-play"/></svg></div>
             <div class="tx"><b>动画速度</b><span id="animSpeedHint">1.0×</span></div>
-            <div class="sld"><input type="range" min="0.5" max="1.6" step="0.1" data-set="animSpeed"></div>
+            <div class="sld"><input type="range" min="0.5" max="1.6" step="0.1" data-set="animSpeed" aria-label="动画速度"></div>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-lyric"/></svg></div>
             <div class="tx"><b>列表密度</b><span>紧凑 / 标准</span></div>
-            <label class="sw" data-set="compactList"></label>
+            <button type="button" class="sw" role="switch" aria-checked="false" data-set="compactList" aria-label="紧凑列表"></button>
           </div>
-          <div class="set-row" id="rowPerf">
+          <div class="set-row">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
             <div class="tx"><b>画面性能</b><span id="perfHint">自动</span></div>
             <div class="segmini" id="perfSeg">
@@ -368,7 +371,7 @@
           <div class="set-row">
             <div class="ic"><svg><use href="#i-volume"/></svg></div>
             <div class="tx"><b>音量</b><span id="volHint">85%</span></div>
-            <div class="sld"><input type="range" min="0" max="1" step="0.05" data-set="volume"></div>
+            <div class="sld"><input type="range" min="0" max="1" step="0.05" data-set="volume" aria-label="音量"></div>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
@@ -385,19 +388,19 @@
           <div class="set-row">
             <div class="ic"><svg><use href="#i-play"/></svg></div>
             <div class="tx"><b>无缝播放</b><span>预加载下一首，曲间零间隔</span></div>
-            <label class="sw on" data-set="gapless"></label>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="gapless" aria-label="无缝播放"></button>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
             <div class="tx"><b>音量归一化</b><span>不同来源音量拉平</span></div>
-            <label class="sw" data-set="normalize"></label>
+            <button type="button" class="sw" role="switch" aria-checked="false" data-set="normalize" aria-label="音量归一化"></button>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-play"/></svg></div>
             <div class="tx"><b>播放速度</b><span id="speedHint">1.0×</span></div>
-            <div class="sld"><input type="range" min="0.75" max="1.5" step="0.05" data-set="speed"></div>
+            <div class="sld"><input type="range" min="0.75" max="1.5" step="0.05" data-set="speed" aria-label="播放速度"></div>
           </div>
-          <div class="set-row" id="rowSleep">
+          <div class="set-row">
             <div class="ic"><svg><use href="#i-moon"/></svg></div>
             <div class="tx"><b>睡眠定时</b><span id="sleepHint">关闭</span></div>
             <div class="val" id="sleepVal">关闭 ›</div>
@@ -411,27 +414,27 @@
           <div class="set-row">
             <div class="ic"><svg><use href="#i-lyric"/></svg></div>
             <div class="tx"><b>显示歌词</b><span>播放页底部歌词面板</span></div>
-            <label class="sw on" data-set="showLyric"></label>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="showLyric" aria-label="显示歌词"></button>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-lyric"/></svg></div>
             <div class="tx"><b>翻译</b><span>有译文时显示第二行</span></div>
-            <label class="sw on" data-set="showTrans"></label>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="showTrans" aria-label="显示歌词翻译"></button>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-lyric"/></svg></div>
             <div class="tx"><b>歌词字号</b><span id="lyricSizeHint">标准</span></div>
-            <div class="sld"><input type="range" min="11" max="19" step="1" data-set="lyricSize"></div>
+            <div class="sld"><input type="range" min="11" max="19" step="1" data-set="lyricSize" aria-label="歌词字号（像素）"></div>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-lyric"/></svg></div>
             <div class="tx"><b>歌词偏移</b><span id="lyricOffsetHint">0.0s</span></div>
-            <div class="sld"><input type="range" min="-2" max="2" step="0.1" data-set="lyricOffset"></div>
+            <div class="sld"><input type="range" min="-2" max="2" step="0.1" data-set="lyricOffset" aria-label="歌词偏移（秒）"></div>
           </div>
-          <div class="set-row" id="rowSbLyric">
+          <div class="set-row">
             <div class="ic"><svg><use href="#i-lyric"/></svg></div>
             <div class="tx"><b>状态栏歌词</b><span id="sbHint">关闭</span></div>
-            <label class="sw" data-set="sbLyric"></label>
+            <button type="button" class="sw" role="switch" aria-checked="false" data-set="sbLyric" aria-label="状态栏歌词"></button>
           </div>
           <div class="set-row" id="rowSbTune">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
@@ -447,12 +450,12 @@
           <div class="set-row">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知栏播放控件</b><span id="mediaHint">锁屏 / 通知中心显示</span></div>
-            <label class="sw on" data-set="mediaSession"></label>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="mediaSession" aria-label="通知栏播放控件"></button>
           </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知不打断播放</b><span>横幅只提示，不暂停、不压低音量</span></div>
-            <label class="sw on" data-set="notifyQuiet"></label>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="notifyQuiet" aria-label="通知不打断播放"></button>
           </div>
           <div class="set-row" id="rowTestNotify">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
@@ -546,14 +549,14 @@
   <!-- 底部迷你播放器 -->
   <div class="dock" id="dock">
     <div class="dock-inner glass" id="dockInner">
-      <div class="dock-prog" id="dockProg" style="width:0"></div>
+      <div class="dock-prog" id="dockProg"></div>
       <div class="thumb art" id="dockThumb"><img alt=""><div class="ripple"></div></div>
-      <div class="meta" id="dockMeta">
+      <div class="meta">
         <b id="dockTitle">未在播放</b>
         <span id="dockArtist">选择一首歌开始</span>
       </div>
-      <button class="play" id="dockPlay"><svg><use href="#i-play"/></svg></button>
-      <button class="next" id="dockNext"><svg><use href="#i-next"/></svg></button>
+      <button type="button" class="play" id="dockPlay" aria-label="播放 / 暂停"><svg><use href="#i-play"/></svg></button>
+      <button type="button" class="next" id="dockNext" aria-label="下一首"><svg><use href="#i-next"/></svg></button>
     </div>
   </div>
 
@@ -566,15 +569,15 @@
 </div>
 
 <!-- 全屏播放页 -->
-<section class="np" id="np" aria-hidden="true">
+<section class="np" id="np" aria-hidden="true" inert>
   <div class="np-bg" id="npBg"></div>
   <div class="np-glow"></div>
   <div class="np-veil"></div>
   <div class="np-inner">
     <div class="np-top">
-      <button class="cir" id="npClose"><svg><use href="#i-chev-down"/></svg></button>
+      <button type="button" class="cir" id="npClose" aria-label="收起播放页"><svg><use href="#i-chev-down"/></svg></button>
       <div class="t"><b>正在播放</b><span id="npFrom">示例曲库</span></div>
-      <button class="cir" id="npMore"><svg><use href="#i-more"/></svg></button>
+      <button type="button" class="cir" id="npMore" aria-label="播放设置"><svg><use href="#i-more"/></svg></button>
     </div>
 
     <div class="cover-wrap">
@@ -594,7 +597,7 @@
         <h2 id="npTitle">未在播放</h2><span class="np-vip" id="npVip" hidden>VIP</span>
         <p id="npArtist">—</p>
       </div>
-      <button class="np-like" id="npLike"><svg><use href="#i-heart-o"/></svg></button>
+      <button type="button" class="np-like" id="npLike" aria-label="收藏到「我喜欢」"><svg><use href="#i-heart-o"/></svg></button>
     </div>
 
     <!-- 歌词：默认三行；展开时这一块原地长高，封面/按钮让位 -->
@@ -617,14 +620,14 @@
     </div>
 
     <div class="np-ctl">
-      <button class="c mode on" id="npMode" title="播放模式">
+      <button type="button" class="c mode on" id="npMode" title="播放模式" aria-label="播放模式">
         <svg><use href="#i-repeat" id="npModeIcon"/></svg>
         <span class="tag" id="npModeTag">列表</span>
       </button>
-      <button class="c nav" id="npPrev"><svg><use href="#i-prev"/></svg></button>
-      <button class="main" id="npPlay"><svg><use href="#i-play"/></svg></button>
-      <button class="c nav" id="npNext"><svg><use href="#i-next"/></svg></button>
-      <button class="c" id="npQueueBtn" title="播放列表"><svg><use href="#i-queue"/></svg></button>
+      <button type="button" class="c nav" id="npPrev" aria-label="上一首"><svg><use href="#i-prev"/></svg></button>
+      <button type="button" class="main" id="npPlay" aria-label="播放 / 暂停"><svg><use href="#i-play"/></svg></button>
+      <button type="button" class="c nav" id="npNext" aria-label="下一首"><svg><use href="#i-next"/></svg></button>
+      <button type="button" class="c" id="npQueueBtn" title="播放列表" aria-label="播放列表"><svg><use href="#i-queue"/></svg></button>
     </div>
 
     <div class="np-flexspacer"></div>
@@ -642,14 +645,14 @@
     <div class="grab"></div>
     <div class="sheet-hd">
       <b>评论</b><span id="cmtCount">—</span>
-      <button class="x" id="cmtClose">收起</button>
+      <button type="button" class="x" id="cmtClose" aria-label="收起评论">收起</button>
     </div>
     <div class="cmt-body" id="cmtBody"></div>
     <!-- 第 16 条：评论列表下方的发布框 -->
     <div class="cmt-send">
       <input id="cmtInput" class="cmt-in" type="text" maxlength="140"
              placeholder="说点什么…（登录后可发）" autocomplete="off">
-      <button class="cmt-go" id="cmtSend">发送</button>
+      <button type="button" class="cmt-go" id="cmtSend">发送</button>
     </div>
   </div>
 
@@ -659,7 +662,7 @@
     <div class="grab"></div>
     <div class="sheet-hd">
       <b>播放列表</b><span id="npQueueCount">0 首</span>
-      <button class="x" id="npQueueClose">收起</button>
+      <button type="button" class="x" id="npQueueClose" aria-label="收起播放列表">收起</button>
     </div>
     <div class="queue" id="npQueue"></div>
   </div>
@@ -674,7 +677,7 @@
     <div class="grab"></div>
     <div class="sheet-hd">
       <b>均衡器</b><span>5 段</span>
-      <button class="x" id="eqClose">收起</button>
+      <button type="button" class="x" id="eqClose" aria-label="收起均衡器">收起</button>
     </div>
     <div class="cmt-body" id="eqBody" style="flex:1;overflow-y:auto;min-height:0"></div>
   </div>
@@ -685,7 +688,7 @@
     <div class="grab"></div>
     <div class="sheet-hd">
       <b>自定义颜色</b><span>拖动选色</span>
-      <button class="x" id="pickClose">收起</button>
+      <button type="button" class="x" id="pickClose" aria-label="收起取色器">收起</button>
     </div>
     <div class="opt-body" id="pickBody"></div>
   </div>
@@ -696,7 +699,7 @@
     <div class="grab"></div>
     <div class="sheet-hd">
       <b>状态栏歌词</b><span>调整样式</span>
-      <button class="x" id="sbClose">收起</button>
+      <button type="button" class="x" id="sbClose" aria-label="收起状态栏歌词设置">收起</button>
     </div>
     <div class="opt-body" id="sbBody"></div>
   </div>
@@ -705,15 +708,17 @@
     <div class="grab"></div>
     <div class="sheet-hd">
       <b>播放设置</b><span>只影响音乐本身</span>
-      <button class="x" id="npOptClose">收起</button>
+      <button type="button" class="x" id="npOptClose" aria-label="收起播放设置">收起</button>
     </div>
     <div class="opt-body" id="npOptBody"></div>
   </div>
 
 
 <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
-<!-- 第 5 条：底部 dock 胶囊提示（下拉退出的确认等） -->
-<div class="toasts bottom" id="toastsBottom"></div>
+<!-- 底部 dock 胶囊提示（下拉退出的确认等）。
+     和顶部 toasts 是同一套语义：都是「刚刚发生了什么」的播报，
+     所以同样要 live region，否则读屏用户听不到下拉退出、切歌模式这些反馈。 -->
+<div class="toasts bottom" id="toastsBottom" role="status" aria-live="polite"></div>
 
 <input type="file" id="filePicker" accept="audio/*,.mp3,.flac,.m4a,.wav,.ogg,.aac" multiple hidden>
 
@@ -727,7 +732,5 @@
 <script src="js/store.js"></script>
 <script src="js/player.js"></script>
 <script src="js/app.js"></script>
-<!-- 内置动画调参器（临时工具，调好后删这一行和 js/animtune.js） -->
-<script src="js/animtune.js"></script>
 </body>
 </html>

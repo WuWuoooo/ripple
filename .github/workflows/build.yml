@@ -36,6 +36,87 @@ jobs:
           done
           exit $fail
 
+      # 纯逻辑的单元测试（Node 内置 test runner，不需要 npm install）。
+      # 目前只覆盖 app/js/lrc.js：LRC 解析、同时间戳去重、原文/译文最近邻合并。
+      # 走 tests/run.sh 而不是直接 `node --test tests/`：目录参数在部分 Node 构建
+      #（含本机 24.22.1）上会报 ERR_UNSUPPORTED_DIR_IMPORT，脚本里显式展开文件列表。
+      - name: 单元测试
+        run: bash tests/run.sh
+
+      # 只编译不发布：push/PR 阶段就要能发现 Java 编译错误和资源/manifest 错误。
+      # 签名、打包、发布仍然只走 build job（workflow_dispatch）。
+      #
+      # 必须先生成 R.java 再编译 Java：PlaybackService.java 引用 R.drawable.*，
+      # 只拿 android.jar 编译会报 "package R does not exist"。
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 安装 Android SDK 组件（编译校验用）
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" > /dev/null
+
+      - name: Java / 资源 / manifest 编译校验
+        run: |
+          set -e
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          JAR="$ANDROID_HOME/platforms/android-34/android.jar"
+          OUT="$(mktemp -d)"
+          mkdir -p "$OUT/gen" "$OUT/classes"
+
+          echo "→ aapt2 compile（资源）"
+          "$BT/aapt2" compile --dir android/app/src/main/res -o "$OUT/res.zip"
+
+          # aapt2 link 同时校验 manifest 与资源引用，并生成 R.java。
+          # 源码 manifest 按 AGP 8 的写法不带 package（由 build-apk.sh 用
+          # --rename-manifest-package 注入），但 aapt2 link 自身要求 manifest 里必须有
+          # package 属性，所以这里先在构建副本里补上，源码一行不动。
+          echo "→ aapt2 link（manifest + 资源 + 生成 R.java）"
+          python3 - "$OUT/AndroidManifest.xml" <<'PY'
+          import re, sys
+          src = open('android/app/src/main/AndroidManifest.xml', encoding='utf-8').read()
+          def inject(m):
+              tag = m.group(0)
+              return tag if 'package=' in tag else tag.replace('<manifest', '<manifest package="com.ripple.app"', 1)
+          out, n = re.subn(r'<manifest[ ][^>]*>', inject, src, count=1)
+          if n != 1:
+              sys.exit('找不到 <manifest> 开标签，manifest 格式异常')
+          open(sys.argv[1], 'w', encoding='utf-8').write(out)
+          PY
+          "$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" \
+            --manifest "$OUT/AndroidManifest.xml" --java "$OUT/gen" \
+            --min-sdk-version 24 --target-sdk-version 34 \
+            --version-code 1 --version-name 0.0.0 "$OUT/res.zip"
+
+          # 与 build-apk.sh 保持一致：产物 manifest 里必须真的有包名
+          "$BT/aapt2" dump packagename "$OUT/base.apk" | grep -q "com.ripple.app" \
+            || { echo "::error::aapt2 link 之后 base.apk 里没有 package=com.ripple.app"; exit 1; }
+
+          echo "→ javac（含生成的 R.java）"
+          javac -encoding UTF-8 -nowarn -source 17 -target 17 -classpath "$JAR" \
+            -d "$OUT/classes" \
+            $(find android/app/src/main/java "$OUT/gen" -name '*.java')
+
+          echo "编译校验通过：$(find "$OUT/classes" -name '*.class' | wc -l) 个 class"
+
+      - name: 文档与仓库现状一致（仅告警）
+        run: |
+          # README 里写了「Java 外壳（N 个类）」。这个数字以前是错的（写 8，实际 10），
+          # 加一条告警让它在新增/删除 Java 文件时自己冒出来，而不是等读者发现。
+          # 只告警不失败：数量对不上不影响构建，不该拦住 PR。
+          ACTUAL=$(find android/app/src/main/java -name '*.java' | wc -l | tr -d ' ')
+          DOC=$(sed -n 's/.*Java 外壳（\([0-9]\+\) 个类.*/\1/p' README.md | head -1)
+          if [ -z "$DOC" ]; then
+            echo "::warning::README.md 里没找到「Java 外壳（N 个类）」这句，检查一下项目结构一节"
+          elif [ "$ACTUAL" != "$DOC" ]; then
+            echo "::warning::README.md 写 $DOC 个 Java 类，实际 $ACTUAL 个。请更新 README.md 与 CONTRIBUTING.md 的代码结构树。"
+          else
+            echo "Java 类数一致：$ACTUAL"
+          fi
+
       - name: 检查敏感文件没被提交
         run: |
           bad=0
@@ -82,20 +163,44 @@ jobs:
             echo "::error::version.json 解析失败"
             exit 1
           fi
-          # 这三处由 build-apk.sh 自动同步；不一致说明有人手改了，必须失败而不是告警
+          # 这几处由 build-apk.sh 自动同步；不一致说明有人手改了，必须失败而不是告警。
+          # 注意用词边界：`grep -q "versionCode 11"` 会命中 `versionCode 110`，
+          # 那样 110 和 11 互相通过，等于没校验。必须要求数字后紧跟非数字或行尾。
           bad=0
-          grep -q "versionCode $VC" android/app/build.gradle \
-            || { echo "::error::build.gradle versionCode 与 version.json 不一致"; bad=1; }
-          grep -q "versionName '$VN'" android/app/build.gradle \
-            || { echo "::error::build.gradle versionName 与 version.json 不一致"; bad=1; }
+          grep -Eq "versionCode[[:space:]]+$VC([^0-9]|$)" android/app/build.gradle \
+            || { echo "::error::build.gradle versionCode 与 version.json 不一致（期望 $VC）"; bad=1; }
+          grep -Eq "versionName[[:space:]]+'$VN'([^0-9.]|$)" android/app/build.gradle \
+            || { echo "::error::build.gradle versionName 与 version.json 不一致（期望 $VN）"; bad=1; }
           # version.js 由脚本生成但必须入库（网页版直接引用），这里校验内容已同步
           if [ -f app/js/version.js ]; then
-            grep -q "name: '$VN'" app/js/version.js \
+            grep -Eq "name: '$VN'" app/js/version.js \
               || { echo "::error::app/js/version.js 的 name 与 version.json 不一致"; bad=1; }
-            grep -q "code: $VC" app/js/version.js \
+            grep -Eq "code: $VC([^0-9]|$)" app/js/version.js \
               || { echo "::error::app/js/version.js 的 code 与 version.json 不一致"; bad=1; }
           else
             echo "::error::缺少 app/js/version.js（网页版会 404，请先跑一次 build-apk.sh）"
+            bad=1
+          fi
+          # 两个 Java 文件里的版本号也由 sync-version.sh 同步，同样入库，
+          # 仓库里跑构建会写回它们 —— 忘了跑会出现「代码里写 1.1.0，version.json 已 1.2.0」。
+          grep -qF "version: $VN (\" + $VC + \")" \
+              android/app/src/main/java/com/ripple/app/CrashLog.java \
+            || { echo "::error::CrashLog.java 的 version 行与 version.json 不一致（期望 version: $VN (\" + $VC + \")）"; bad=1; }
+          grep -qF "version=$VN($VC)" \
+              android/app/src/main/java/com/ripple/app/RippleApp.java \
+            || { echo "::error::RippleApp.java 的 version= 与 version.json 不一致（期望 version=$VN($VC)）"; bad=1; }
+          # Service Worker 的缓存名必须等于 ripple-<versionCode>（没有 v 前缀）。
+          # 这一条以前没有，于是「忘了提升 versionCode」在 CI 里是查不出来的：
+          # 已装用户会继续跑旧壳，表现为「改了没生效」。
+          if [ -f app/sw.js ]; then
+            SWC=$(sed -n "s/^const CACHE = '\([^']*\)'.*/\1/p" app/sw.js | head -1)
+            echo "app/sw.js → CACHE='$SWC'"
+            if [ "$SWC" != "ripple-$VC" ]; then
+              echo "::error::app/sw.js 的 CACHE 应为 'ripple-$VC'（实际 '$SWC'）。它由 sync-version.sh 按 versionCode 自动同步，请改 version.json 后重跑构建，不要手改。"
+              bad=1
+            fi
+          else
+            echo "::error::缺少 app/sw.js"
             bad=1
           fi
           exit $bad
@@ -147,17 +252,21 @@ jobs:
 
       - name: 显示产物信息
         run: |
-          APK=$(ls android/build-manual/*.apk | head -1)
+          # 只认最终产物：build-manual/ 里还有 base.apk / aligned.apk 等中间文件
+          APK=$(ls android/build-manual/Ripple-*.apk | head -1)
           echo "产物：$APK"
           ls -lh "$APK"
           "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$APK" | head -1
 
       # Artifact 是临时产物（需登录、有过期时间），只当兜底留存。
       # 真正给人下载的是 Release 资产 —— 下面这一步负责发布。
+      #
+      # 只传最终的 Ripple-*.apk：build-manual/ 里还有 base.apk（未签名、无 dex）、
+      # aligned.apk、unaligned.apk 这些中间产物，一起传上去只会让人下错包。
       - uses: actions/upload-artifact@v7
         with:
           name: ripple-apk
-          path: android/build-manual/*.apk
+          path: android/build-manual/Ripple-*.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -170,7 +279,7 @@ jobs:
           echo "code=$VC"     >> "$GITHUB_OUTPUT"
           echo "tag=v$VN"     >> "$GITHUB_OUTPUT"
 
-          SRC=$(ls android/build-manual/*.apk | head -1)
+          SRC=$(ls android/build-manual/Ripple-*.apk | head -1)
           # 发布出去的名字去掉 -debug，看着体面些
           OUT="Ripple-${VN}.apk"
           cp "$SRC" "$OUT"
@@ -195,7 +304,14 @@ jobs:
             ' CHANGELOG.md > "$OUT"
             echo "已从 CHANGELOG.md 提取 $VN 的说明（$(wc -l < "$OUT") 行）"
           else
+            # 必须真的创建这个文件：下面的 cat "$OUT" 在 `bash -e` 下会失败，
+            # 以前这里只 echo 一句、不落盘，于是「CHANGELOG 缺本版段落」直接把发布打挂。
             echo "CHANGELOG.md 里没有 $VN 的段落，使用占位说明"
+            {
+              echo "## Ripple $VN"
+              echo ""
+              echo "本版未在 CHANGELOG.md 中找到对应段落，详见仓库提交记录。"
+            } > "$OUT"
           fi
 
           # 指纹直接从**成品 APK** 读，而不是从 keystore 猜：

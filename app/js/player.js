@@ -47,11 +47,30 @@
       this.elC = new Audio();
       for (const el of [this.elA, this.elB, this.elC]) {
         el.preload = 'auto';
-        el.addEventListener('timeupdate', () => this._emit('time', this.time()));
-        el.addEventListener('loadedmetadata', () => this._emit('time', this.time()));
-        el.addEventListener('ended', () => this._onEnded());
-        el.addEventListener('play', () => { this.playing = true; this._emit('state', true); this._loop(); });
-        el.addEventListener('pause', () => { this.playing = false; this._emit('state', false); });
+        /*
+         * ⚠️ 所有回调都必须校验「事件来自当前元素」。
+         *
+         * 三个 <audio> 里始终只有一个是 this.el，另外两个可能在预取/被切走。
+         * 以前 waiting/stalled/playing/canplay 写了 `if (el !== this.el) return`，
+         * 而 timeupdate / loadedmetadata / ended / play / pause **没写** ——
+         * 于是：
+         *   · 预取元素播完触发 ended → _onEnded → next(true)，
+         *     把用户正在听的歌切走
+         *   · 被切走的元素 pause 事件把 UI 状态闪成"暂停"
+         *   · timeupdate 用错元素的进度刷新进度条
+         * 同一文件两套写法，明显是漏了。
+         */
+        el.addEventListener('timeupdate', () => { if (el !== this.el) return; this._emit('time', this.time()); });
+        el.addEventListener('loadedmetadata', () => { if (el !== this.el) return; this._emit('time', this.time()); });
+        el.addEventListener('ended', () => { if (el !== this.el) return; this._onEnded(); });
+        el.addEventListener('play', () => {
+          if (el !== this.el) return;
+          this.playing = true; this._emit('state', true); this._loop();
+        });
+        el.addEventListener('pause', () => {
+          if (el !== this.el) return;
+          this.playing = false; this._emit('state', false);
+        });
         el.addEventListener('error', () => {
           if (el === this.el && this.track) this._emit('error', this.track);
         });
@@ -135,6 +154,9 @@
 
     _ensureGraph(el) {
       if (el !== this.elB || this.srcNode) return;
+      /* 建图失败过一次就别再试：同一个元素第二次 createMediaElementSource
+         必然抛 InvalidStateError，重试只会制造噪音日志和反复失败的假象。 */
+      if (this._graphBroken) return;
       try {
         const AC = g.AudioContext || g.webkitAudioContext;
         this.ctx = new AC();
@@ -176,7 +198,32 @@
           this.gainNode.connect(this.ctx.destination);
         }
       } catch (e) {
+        /*
+         * 半成功是最糟的状态：createMediaElementSource(elB) 一旦成功，
+         * elB 的输出就已经被**接管**了 —— 它不再自动连到扬声器。
+         * 此时如果后续建节点/连接抛错，只在 catch 里把 srcNode 置空，
+         * 真实后果是：elB 永久无声，而 EQ/归一化 UI 还显示"已启用"。
+         * 更糟的是下次 _ensureGraph 见 srcNode 为空，又会 new AudioContext +
+         * 再次 createMediaElementSource(elB)，此时 Chrome 抛 InvalidStateError
+         * （一个元素只能被接管一次），catch 后继续无声 —— 死循环。
+         *
+         * 正确收尾：关掉 ctx，并把元素直连回 destination 恢复出声；
+         * 如果连直连都做不到，就记下"不可恢复"标记，让 UI 说真话，
+         * 而不是反复重建、反复失败。
+         */
+        try {
+          if (this.srcNode && this.ctx) this.srcNode.connect(this.ctx.destination);
+        } catch (e2) {}
+        try { if (this.ctx && this.ctx.state !== 'closed') this.ctx.close(); } catch (e2) {}
         this.srcNode = null;
+        this.ctx = null;
+        this.gainNode = null;
+        this.analyser = null;
+        this._rmsBuf = null;
+        this.filters = [];
+        /* 记住"这个进程内已经建图失败过"，不要再无限重试 */
+        this._graphBroken = true;
+        try { if (g.Log) g.Log.err('EQ', e, '音频图建立失败，已回退直连（均衡器不可用）'); } catch (e2) {}
       }
     },
 
@@ -381,6 +428,24 @@
         + ' autoplay=' + autoplay + ' source=' + (track && track.source));
       this._blockedOnce = false;
       if (!track) return;
+      /*
+       * 先校验地址再改任何状态。
+       *
+       * 旧顺序是：this.track = track → new URL(track.src) → el.src = ...
+       * 用户从「我的 → 从链接添加」粘贴一个 `http://` 这类非法串时，
+       * new URL() 抛 TypeError，而此时 this.track 已经换成了新歌、
+       * el.src 还是旧 blob、_emit('track') 也没执行 ——
+       * 内部状态说"在播新歌"，实际还在放上一首，点哪都没反应。
+       * 现在把校验提到最前面，非法就发 error 事件并原地不动。
+       */
+      let resolved = '';
+      try {
+        resolved = new URL(track.src || '', location.href).href;
+      } catch (e) {
+        if (g.Log) g.Log.err('PLAY', e, 'load() 非法音源地址: ' + (track && track.src));
+        this._emit('error', track);
+        return;
+      }
       const el = this._pickEl(track);
       const switching = el !== this.el;
       if (switching) {
@@ -397,7 +462,7 @@
         this._emit('track', track);
         return;
       }
-      if (el.src !== new URL(track.src, location.href).href) {
+      if (el.src !== resolved) {
         el.src = track.src;
       }
       el.playbackRate = g.Store.state.settings.speed || 1;
@@ -530,14 +595,24 @@
 
     seek(sec) {
       if (!this.el) return;
+      /*
+       * 有限性校验：MediaSession 的 seekto 回调可能不带 seekTime
+       * （或带 NaN），而 `currentTime = NaN` 会抛
+       * TypeError: The provided double value is non-finite。
+       * 这属于"未处理异常路径"，一旦抛出来整个回调就断了。
+       */
+      const n = Number(sec);
+      if (!isFinite(n)) return;
       const d = this.duration();
       /*
        * duration 为 0（元数据还没到 / track.duration 缺失）时，
        * 以前 Math.min(0 - 0.2, sec) 会把目标钳成负数再由 Math.max 变成 0,
        * 任何拖动都跳回开头。这时直接按目标秒数 seek，交给浏览器自己纠偏。
        */
-      const target = d > 0.4 ? Math.min(d - 0.2, sec) : sec;
-      this.el.currentTime = Math.max(0, target);
+      const target = d > 0.4 ? Math.min(d - 0.2, n) : n;
+      const next = Math.max(0, target);
+      if (!isFinite(next)) return;
+      this.el.currentTime = next;
       this._emit('time', this.time());
     },
 
@@ -557,20 +632,46 @@
       const from = el.volume;
       const t0 = performance.now();
       const dur = secs * 1000;
-      this._fadeTimer = setInterval(() => {
+      /*
+       * 目标值是"活"的，不是常量。
+       *
+       * 以前 target 在调用那一刻就被固定住了，而 setVolume() 在淡入淡出期间
+       * 只更新 this._targetVol、不写元素（等曲线走完再接管）。于是：
+       *   音量 0 起播 → 淡入曲线目标 = 0.85 →
+       *   60ms 时用户把滑块拖到 0.3 → 只改了 _targetVol →
+       *   500ms 曲线走完写回 0.85，滑块却停在 30%
+       * 用户看到的是"拖了没反应/松手后音量跳回去"。
+       *
+       * 现在每帧都读 this._targetVol：如果用户在曲线期间改过音量，
+       * 曲线就直接朝新目标走（并从当前位置续算），不再把它吃掉。
+       * _fadeTarget 记的是"发起时的目标"，用来判断有没有被改过。
+       */
+      this._fadeTarget = target;
+      let cur = target;
+      let from2 = from;      // 当前这一段的起点音量
+      let t0b = t0;          // 当前这一段的起点时刻
+      const tick = () => {
         if (el !== this.el) {              // 已经切歌：这条曲线作废
           clearInterval(this._fadeTimer);
           this._fading = false;
           return;
         }
-        const k = Math.min(1, (performance.now() - t0) / dur);
-        el.volume = from + (target - from) * k;
+        /* 期间用户改了音量：换成新目标，并把曲线起点重置到"当前音量" */
+        const live = (this._targetVol == null) ? cur : this._targetVol;
+        if (Math.abs(live - cur) > 1e-4) {
+          cur = live;
+          from2 = el.volume;
+          t0b = performance.now();
+        }
+        const k = Math.min(1, (performance.now() - t0b) / dur);
+        el.volume = Math.max(0, Math.min(1, from2 + (cur - from2) * k));
         if (k >= 1) {
           clearInterval(this._fadeTimer);
           this._fading = false;
           done && done();
         }
-      }, 30);
+      };
+      this._fadeTimer = setInterval(tick, 30);
     },
 
     queueSet(list, index) {
@@ -739,17 +840,29 @@
          */
         this._sleepCb = null;
         try { g.Store.set('sleepUntil', 0); } catch (e) {}
+        try { g.Store.set('sleepMin', 0); } catch (e) {}
         return;
       }
       this._sleepCb = cb || null;
       this._sleepAt = Date.now() + minutes * 60000;
+      /*
+       * 两个字段一起落盘：sleepUntil 给 restoreSleep 用，sleepMin 给界面显示用。
+       * 只写 sleepUntil 时，重启后定时器其实还在跑，但设置页那行显示"关闭"——
+       * UI 与运行状态对不上（E-27 的另一半）。
+       */
       try { g.Store.set('sleepUntil', this._sleepAt); } catch (e) {}
+      try { g.Store.set('sleepMin', minutes); } catch (e) {}
       const tick = () => {
         if (!this._sleepAt) { clearInterval(this._sleepTimer); return; }
         if (Date.now() >= this._sleepAt) {
           clearInterval(this._sleepTimer);
           this._sleepAt = 0;
+          /*
+           * 触发后必须把 sleepMin 归零，否则设置页一直显示
+           * 「60 分钟后暂停」，而定时器早就结束了。
+           */
           try { g.Store.set('sleepUntil', 0); } catch (e) {}
+          try { g.Store.set('sleepMin', 0); } catch (e) {}
           const f = this._sleepCb;
           this._sleepCb = null;
           this.pause();
@@ -764,17 +877,30 @@
     restoreSleep(cb) {
       const at = Number(g.Store.state.settings.sleepUntil) || 0;
       if (!at || at <= Date.now()) {
+        /* 已经过期/不存在：两个字段都清干净，别留一个说开一个说关 */
         if (at) { try { g.Store.set('sleepUntil', 0); } catch (e) {} }
+        if (Number(g.Store.state.settings.sleepMin)) {
+          try { g.Store.set('sleepMin', 0); } catch (e) {}
+        }
         return;
       }
       this._sleepCb = cb || null;
       this._sleepAt = at;
+      /*
+       * 剩余时间换算回"分钟"，让设置页显示的数字是真实的剩余量，
+       * 而不是启动前那个 60。
+       */
+      try {
+        const left = Math.max(1, Math.round((at - Date.now()) / 60000));
+        g.Store.set('sleepMin', left);
+      } catch (e) {}
       clearInterval(this._sleepTimer);
       this._sleepTimer = setInterval(() => {
         if (Date.now() >= this._sleepAt) {
           clearInterval(this._sleepTimer);
           this._sleepAt = 0;
           try { g.Store.set('sleepUntil', 0); } catch (e) {}
+          try { g.Store.set('sleepMin', 0); } catch (e) {}
           const f = this._sleepCb;
           this._sleepCb = null;
           this.pause();
