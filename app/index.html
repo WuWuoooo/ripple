@@ -196,14 +196,20 @@
         <button type="button" class="more" id="dailyMore">全部 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
       <div class="carousel" id="carousel"></div>
 
-      <div class="sec-head"><span class="n">02</span><h2>排行榜</h2>
+      <div class="sec-head"><span class="n">02</span><h2>推荐歌单</h2>
+        <button type="button" class="more" id="recPlMore" aria-expanded="false">更多 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
+      <div class="carousel" id="recPlCarousel"></div>
+      <!--
+        推荐歌单的「更多」展开区：默认隐藏。
+        点「更多」把推荐歌单从横滑卡片换成 2 列网格（一次能看全），
+        再点一次收起。不新建页面 —— 这一块的语义就是"多看点推荐"，
+        跳走反而多一步。
+      -->
+      <div class="grid" id="recPlGrid" hidden></div>
+
+      <div class="sec-head"><span class="n">03</span><h2>排行榜</h2>
         <button type="button" class="more" id="toplistMore" data-act="toplist">更多 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
       <div class="carousel" id="toplistCarousel"></div>
-
-      <div class="sec-head"><span class="n">03</span><h2>最近播放</h2>
-        <button type="button" class="more" data-nav="library">记录 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg></button></div>
-      <div class="grid" id="gridView"></div>
-      <div class="list" id="listView"></div>
     </section>
 
     <!-- ============ 曲库 ============ -->
@@ -447,6 +453,11 @@
       <div class="set-group">
         <div class="lbl">通知与后台</div>
         <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-bell"/></svg></div>
+            <div class="tx"><b>软件内通知</b><span>顶部弹出的提示条（失败类提示仍会显示）</span></div>
+            <button type="button" class="sw" role="switch" aria-checked="false" data-set="inAppToast" aria-label="软件内通知"></button>
+          </div>
           <div class="set-row">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知栏播放控件</b><span id="mediaHint">锁屏 / 通知中心显示</span></div>

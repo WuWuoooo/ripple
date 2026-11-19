@@ -22,7 +22,7 @@ public class RippleApp extends Application {
         super.onCreate();
         LogBridge.add(this, "APP", "onCreate start, sdk=" + Build.VERSION.SDK_INT
                 + " " + Build.MANUFACTURER + " " + Build.MODEL
-                + " version=1.2.0(120)");
+                + " version=1.2.1(121)");
         /*
          * 崩溃捕获只在这里装一次（传 Application Context）。
          * 以前 MainActivity 也调了一遍，形成链式 handler：同一次崩溃写两份文件，

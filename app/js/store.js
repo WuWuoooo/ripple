@@ -27,6 +27,13 @@
     normalize: false,
     speed: 1,
     showLyric: true,
+    /*
+     * 软件内通知：控制顶部弹出的 toast（不是系统通知栏）。
+     * 默认**关闭** —— 顶部通知会盖住内容，第一次用的人多半不想要。
+     * 需要反馈时会去设置里打开。
+     * 注：底部的操作确认（如"再按一次退出"）不受这个开关影响。
+     */
+    inAppToast: false,
     showTrans: true,
     lyricSize: 11,
     lyricOffset: 0,

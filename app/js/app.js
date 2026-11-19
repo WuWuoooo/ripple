@@ -23,6 +23,8 @@
 
     _dailyAt: 0,
     _topCache: null,
+    /* 推荐歌单（首页区块 02）的缓存，与排行榜分开 —— 两个接口互不影响 */
+    _recPlCache: null,
     _plCache: new Map(),   // plId -> 歌单详情
   };
 
@@ -621,6 +623,21 @@
     </div>`;
   }
 
+  /**
+   * 歌单的网格卡（首页「推荐歌单 → 更多」展开时用）。
+   *
+   * 和 gridHTML 的区别只在数据字段：歌单走 data-pl（点击打开歌单详情），
+   * 歌曲走 data-id（点击播放）。视觉上完全复用 .gcard 的样式，
+   * 所以两种卡片在同一页里看起来是一套。
+   */
+  function plGridHTML(p) {
+    return `<div class="gcard" data-pl="${esc(p.plId)}"
+      role="button" tabindex="0" aria-label="${esc([p.title, p.sub, p.creator].filter(Boolean).join(' - '))}">
+      ${artHTML(p, 'th')}
+      <b>${esc(p.title)}</b><span>${esc(p.sub || '')}</span>
+    </div>`;
+  }
+
   function renderAll() {
     renderHome();
     renderLibrary();
@@ -875,7 +892,15 @@
         + (roamSeed ? '无限漫游' : '先播一首');
     }
 
-    $('#gridView').innerHTML = list.map((t) => gridHTML(t, cur && cur.id === t.id)).join('');
+    /*
+     * 首页的「最近播放」区块已移除（改为「推荐歌单」）。
+     * 这两个容器现在在 HTML 里不存在，$() 返回 null ——
+     * 直接写 .innerHTML 会抛 TypeError 把整个 renderHome 打断，
+     * 连上面的 hero 更新都白做。所以必须判空。
+     * 保留这段渲染是为了兼容旧缓存页面（SW 可能还在供旧 HTML）。
+     */
+    const gv = $('#gridView');
+    if (gv) gv.innerHTML = list.map((t) => gridHTML(t, cur && cur.id === t.id)).join('');
     /*
      * #listView 在 layouts.css 里是 display:none（首页只保留网格），
      * 以前仍然每帧把整份列表 DOM 也渲染一遍 —— 纯属浪费。
@@ -961,19 +986,35 @@
       })), '暂无推荐');
     }
 
-    // 排行榜 / 推荐歌单
+    // 推荐歌单（区块 02）：personalized 接口，与排行榜分开缓存
+    if (!App._recPlCache) {
+      try {
+        App._recPlCache = await Netease.personalizedPlaylists(10);
+      } catch (e) {
+        App._recPlCache = [];
+      }
+    }
+    const recPlEl = $('#recPlCarousel');
+    if (recPlEl) {
+      recPlEl.innerHTML = App._recPlCache && App._recPlCache.length
+        ? carouselHTML(App._recPlCache)
+        : '<div class="c-card ghost">推荐歌单加载失败<br>下拉重试</div>';
+    }
+
+    // 排行榜（区块 03）
     if (!App._topCache) {
       try {
-        let pls = await Netease.toplist();
-        if (!pls.length) pls = await Netease.personalizedPlaylists(8);
-        App._topCache = pls;
+        App._topCache = await Netease.toplist();
       } catch (e) {
         App._topCache = [];
       }
     }
-    $('#toplistCarousel').innerHTML = App._topCache && App._topCache.length
-      ? carouselHTML(App._topCache)
-      : '<div class="c-card ghost">榜单加载失败<br>下拉重试</div>';
+    const topEl = $('#toplistCarousel');
+    if (topEl) {
+      topEl.innerHTML = App._topCache && App._topCache.length
+        ? carouselHTML(App._topCache)
+        : '<div class="c-card ghost">榜单加载失败<br>下拉重试</div>';
+    }
     /*
      * 每日推荐是在启动之后异步回来的，而 renderHome 的 hero 封面取的是
      * App._dailyCache[0]。以前这里不重刷首页，于是首屏大图永远是「最近播放」
@@ -3641,6 +3682,41 @@
       openDaily();
     });
 
+    /*
+     * 「推荐歌单 → 更多」：在首页内把横滑卡片换成 2 列网格，再点收起。
+     *
+     * 不新建页面：这一块的语义就是"多看几个推荐"，
+     * 跳走反而多一步、还要再返回。展开用 hidden 属性控制，
+     * 网格是懒渲染的（只有第一次展开才写 DOM）。
+     */
+    const recPlMore = $('#recPlMore');
+    if (recPlMore) {
+      recPlMore.addEventListener('click', () => {
+        const grid = $('#recPlGrid');
+        const car = $('#recPlCarousel');
+        if (!grid || !car) return;
+        const open = grid.hidden;
+        if (open) {
+          const items = App._recPlCache || [];
+          if (!items.length) {
+            toast('推荐歌单还没加载好', '稍等一下再试', 'info');
+            return;
+          }
+          grid.innerHTML = items.map(plGridHTML).join('');
+        }
+        grid.hidden = !open;
+        car.hidden = open;                 // 展开时把横滑那一排收起来，避免同一批内容出现两次
+        recPlMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+        recPlMore.innerHTML = open
+          ? '收起 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-down"/></svg>'
+          : '更多 <svg width="12" height="12" aria-hidden="true"><use href="#i-chev-right"/></svg>';
+        if (open) {
+          /* 展开后把这一块滚进视野，否则用户看不到下面多出来的内容 */
+          try { grid.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) {}
+        }
+      });
+    }
+
     // 卡片 / 列表点击（委派）
     /*
      * 键盘激活：把 Enter / Space 转成一次 click。
@@ -5649,6 +5725,21 @@
   let _lastToastAt = 0;
 
   function toast(title, desc, icon) {
+    /*
+     * 「设置 → 软件内通知」关掉后，顶部弹出的通知不再显示。
+     *
+     * 这是在**函数入口**统一拦住，而不是去改 106 个调用点 ——
+     * 那样改必然漏，而且以后新加通知又会忘。
+     *
+     * 两个例外，不被开关影响：
+     *   ① warn（失败/异常）—— 「登录未完成」「这首歌放不了」这类
+     *      如果也被吞掉，用户只会觉得"点了没反应"，反而更糟。
+     *      关通知的意图是"别打扰我"，不是"出错了也别告诉我"。
+     *   ② 底部 toastBottom（"再按一次返回退出"这类操作确认），
+     *      它是另一套通道，压根不走这里。
+     * 原生系统通知由 settings.notifyQuiet 单独控制，与这个开关无关。
+     */
+    if (!S().inAppToast && icon !== 'warn') return;
     const wrap = $('#toasts');
     if (!wrap) return;
     /*

@@ -162,7 +162,7 @@ final class CrashLog {
         pw.println("tag: " + tag);
         pw.println("sdk: " + Build.VERSION.SDK_INT + "  device: " + Build.MANUFACTURER + " " + Build.MODEL);
         // 这一行的形状必须保持 "version: x.y.z (" + NNN + ")"：build-apk.sh 用 sed 同步版本号
-        pw.println("version: 1.2.0 (" + 120 + ")");
+        pw.println("version: 1.2.1 (" + 121 + ")");
         pw.println();
         if (e != null) e.printStackTrace(pw);
         pw.println();
