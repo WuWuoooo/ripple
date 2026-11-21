@@ -200,10 +200,30 @@
        * 审查 3.3：code 可能是字符串（"301"），严格 !== 会漏判，
        * 于是 301 被当成成功，全 App 继续认为「已登录」。
        * 这里统一转成数字再比。
+       *
+       * M-02：光有上面的归一化还不够 —— 旧条件是
+       *   `if (json && codeNum && codeNum !== 200 && ...)`
+       * json 为 null 时整句直接为假 → return null，上层 r.profile / r.data
+       * 才炸成 TypeError "Cannot read properties of null"，日志里看不出
+       * 是接口出了问题；上游回 {"code":0} 时 codeNum=0 也是假值，
+       * 一样被当成功放行。
+       * 现在先确认「是对象」、再确认「code 是可识别的成功码」，
+       * 两件不同的事分开判，异常响应在源头就变成一句能读懂的错。
+       * 上游 weapi 的响应一律带 code，缺失/非数字只可能是风控页、
+       * 代理改写或响应被截断，按失败处理比静默放行安全。
        */
-      const codeNum = json && json.code == null ? null : Number(json.code);
-      if (json && codeNum && codeNum !== 200 && codeNum !== 800 && codeNum !== 801 && codeNum !== 802) {
-        const msg = json.message || json.msg || ('错误码 ' + codeNum);
+      if (!json || typeof json !== 'object' || Array.isArray(json)) {
+        if (g.Log) {
+          try { g.Log.err('API', new Error('响应格式异常'), cmd + ' 非 JSON 对象: ' + String(text).slice(0, 120)); } catch (e) {}
+        }
+        throw new Error('接口响应格式异常（' + cmd + '）');
+      }
+      const codeNum = json.code == null ? NaN : Number(json.code);
+      /* 200 = 正常；800/801/802 是扫码登录的过程态（过期/待扫/待确认），都不是错误 */
+      const codeOk = codeNum === 200 || codeNum === 800 || codeNum === 801 || codeNum === 802;
+      if (!codeOk) {
+        const msg = json.message || json.msg
+          || (Number.isFinite(codeNum) ? '错误码 ' + codeNum : '接口未返回 code（' + cmd + '）');
         /*
          * 301 = 未登录。这里必须用上面归一化过的 codeNum，不能再用
          * json.code —— 上游返回字符串 "301" 时严格比较会漏判，

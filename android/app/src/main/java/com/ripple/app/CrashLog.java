@@ -12,6 +12,8 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * 崩溃 / 启动轨迹取证。
@@ -27,6 +29,13 @@ import java.util.Locale;
  * 文件策略（以前会无限增长）：
  *   · 「上次退出原因」这类**不是崩溃**的取证，固定文件名覆盖写（Ripple-exit-info.txt）
  *   · 真正的崩溃保留最近 MAX_CRASH_FILES 份，超出按文件名（含时间戳）删最老的
+ *
+ * 线程模型（J-01）：
+ *   · 常规轨迹（step）与退出取证（recordExitInfo）的落盘丢给后台单线程 ——
+ *     它们会在主线程被调用（MainActivity.onCreate / RippleApp.onCreate），
+ *     一次写盘是 MediaStore 查询 + 跨进程 openOutputStream，不能挡在首帧前面。
+ *   · 崩溃路径（record / flushTrace）**同步**写：进程马上就要被系统杀掉，
+ *     排进队列的任务可能永远不执行，宁可多花几毫秒也要把证据落下来。
  */
 final class CrashLog {
 
@@ -36,7 +45,7 @@ final class CrashLog {
      * 轨迹落盘的节流参数。
      * 以前每一步都 writeDownloads()：MediaStore 查询 + openOutputStream 全量重写，
      * 而 MainActivity.onCreate 里就有十来次 step，冷启动光在写文件上就跨进程好几趟。
-     * 现在内存里照常累积，只在「攒够 8 步」或「距上次落盘超过 5 秒」时才写一次；
+     * 现在内存里照常累积，只在「攒够 8 步」或「距上次落盘超过 5 秒」时才排一次落盘；
      * 崩溃（record / flushTrace）仍然保证拿到完整轨迹。
      * 保留条数上限而不是纯时间窗口，是因为 native 崩溃来不及走 flushTrace，
      * 下载目录里那份必须自己跟上关键启动步骤。
@@ -55,13 +64,48 @@ final class CrashLog {
     /** 幂等标记：装过就不再装第二次（否则会形成链式 handler + 重复写文件） */
     private static boolean installed = false;
 
+    /**
+     * 后台 IO（守护线程）：和 LogBridge 各用各的单线程。
+     * 不合并成一条线程是有意的 —— 两边都会在崩溃路径上被同步调用（LogBridge 的
+     * forceWrite / CrashLog 的 record），共用一条线程会让「我正在队列里等自己」
+     * 这种事变得可能，还容易互相拖慢。两个静态线程不影响退出（daemon）。
+     */
+    private static final ExecutorService IO =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "ripple-crash-io");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * 只保护「真正碰磁盘」的那一段。
+     * 后台线程的轨迹写与崩溃路径的同步写可能同时落同一个 Ripple-trace.txt，
+     * 两个 FileOutputStream / 两条 MediaStore 写互相截断会把证据弄坏。
+     * 加锁顺序固定为 LOCK → IO_LOCK；主线程的 step() 只拿 LOCK（纯内存），
+     * 不会因为后台正在写盘而卡住 —— 这正是 J-01 要的效果。
+     */
+    private static final Object IO_LOCK = new Object();
+
     private CrashLog() {
+    }
+
+    /** 把落盘任务丢给后台线程；executor 已关闭（进程收尾）时静默跳过 */
+    private static void post(Runnable task) {
+        try {
+            IO.execute(() -> {
+                synchronized (IO_LOCK) {
+                    task.run();
+                }
+            });
+        } catch (Throwable ignored) {
+        }
     }
 
     /* ================= 启动轨迹 ================= */
 
     /** 记一步（只在内存累积，按步数/时间窗口节流落盘） */
     static void step(Context ctx, String what) {
+        String snapshot = null;
         synchronized (LOCK) {
             traceStep++;
             TRACE.append(traceStep).append(". ")
@@ -74,21 +118,34 @@ final class CrashLog {
             if (!byCount && !byTime) return;
             stepsSinceFlush = 0;
             lastFlushAt = now;
+            /* 快照必须在锁内取：后台线程再去 toString 会撞上正在 append 的 StringBuilder */
+            snapshot = TRACE.toString();
+        }
+        final String text = snapshot;
+        final Context app = ctx == null ? null : ctx.getApplicationContext();
+        post(() -> {
             try {
-                writeDownloads(ctx, "trace", TRACE.toString(), true);
+                writeDownloads(app, "trace", text, true);
             } catch (Throwable ignored) {
             }
-        }
+        });
     }
 
+    /**
+     * 同步落盘（崩溃路径专用）。
+     * 崩溃后进程随时会被系统收走，这里不能 post 到后台线程 —— 队列里的任务可能不执行。
+     */
     static void flushTrace(Context ctx) {
         synchronized (LOCK) {
             lastFlushAt = System.currentTimeMillis();
             stepsSinceFlush = 0;
-            try {
-                writePrivate(ctx, "trace", TRACE.toString());
-                writeDownloads(ctx, "trace", TRACE.toString(), true);
-            } catch (Throwable ignored) {
+            String text = TRACE.toString();   // 锁内取快照，之后不再碰 StringBuilder
+            synchronized (IO_LOCK) {
+                try {
+                    writePrivate(ctx, "trace", text);
+                    writeDownloads(ctx, "trace", text, true);
+                } catch (Throwable ignored) {
+                }
             }
         }
     }
@@ -112,6 +169,18 @@ final class CrashLog {
         try {
             final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
             Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+                /*
+                 * J-02：崩溃前最后一段**运行日志**也要落盘。
+                 * LogBridge 的内存缓冲最多压着 700ms 的日志，而崩溃之后进程马上
+                 * 被系统收走 —— 不在这里同步写一次，那段就永久丢了（类注释承诺过
+                 * 「崩溃时能看到崩溃前最后一段」，之前只有网页主动 logFlush 才会落）。
+                 * 用 forceWrite 而不是 flush：后者是异步的，队列里的任务可能不执行。
+                 * 它内部吞掉所有异常，LogBridge 没初始化过时也只是白跑一趟，不会递归。
+                 */
+                try {
+                    LogBridge.forceWrite(app);
+                } catch (Throwable ignored) {
+                }
                 try {
                     record(app, "uncaught-" + t.getName(), e);
                     flushTrace(app);
@@ -136,23 +205,21 @@ final class CrashLog {
      * 固定文件名覆盖写：LMK 杀进程、厂商后台清理都会产生一条 exit info，
      * 以前每条都新建一个带秒级时间戳的文件，用得久了下载目录里全是它。
      * 现在只留最新一份 —— 反正每次启动都会重新写。
+     *
+     * 落盘丢给后台线程（J-01）：调用点是 RippleApp.onCreate，正处在冷启动首帧
+     * 之前的那段主线程上，跨进程写盘不该挡在那里。
      */
     static void recordExitInfo(Context ctx, String text) {
         if (text == null || text.isEmpty()) return;
         lastTrace = text;
-        try {
-            writePrivate(ctx, "exit-info", text);
-            writeDownloads(ctx, "exit-info", text, true);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    static void recordRaw(Context ctx, String tag, String text) {
-        lastTrace = text;
-        synchronized (LOCK) {
-            writePrivate(ctx, tag, text);
-            writeDownloads(ctx, tag, text, false);
-        }
+        final Context app = ctx == null ? null : ctx.getApplicationContext();
+        post(() -> {
+            try {
+                writePrivate(app, "exit-info", text);
+                writeDownloads(app, "exit-info", text, true);
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     static String record(Context ctx, String tag, Throwable e) {
@@ -161,8 +228,16 @@ final class CrashLog {
         pw.println("== Ripple crash " + stamp() + " ==");
         pw.println("tag: " + tag);
         pw.println("sdk: " + Build.VERSION.SDK_INT + "  device: " + Build.MANUFACTURER + " " + Build.MODEL);
-        // 这一行的形状必须保持 "version: x.y.z (" + NNN + ")"：build-apk.sh 用 sed 同步版本号
-        pw.println("version: 1.2.1 (" + 121 + ")");
+        /*
+         * 版本号优先从 PackageManager 读（J-04）：这行以前是手写的，谁绕开
+         * build-apk.sh 改版本，报告里的版本就会和真实 APK 对不上。
+         * 读不到才回落到下面这个常量 —— 而下面这一行的形状必须保持
+         * "version: x.y.z (" + NNN + ")"：android/sync-version.sh 用 sed 同步它，
+         * CI 也用 grep -F 校验这一串，改成别的写法会让构建直接失败。
+         */
+        String fallbackVersion = "version: 1.2.2 (" + 122 + ")";
+        String realVersion = versionOf(ctx);
+        pw.println(realVersion == null ? fallbackVersion : "version: " + realVersion);
         pw.println();
         if (e != null) e.printStackTrace(pw);
         pw.println();
@@ -180,7 +255,11 @@ final class CrashLog {
         pw.flush();
         String text = sw.toString();
         lastTrace = text;
-        synchronized (LOCK) {
+        /*
+         * record() 保持同步写：它在崩溃路径上（UncaughtExceptionHandler），
+         * 进程随时会被系统收掉，post 到后台线程等于赌那把队列会不会跑完。
+         */
+        synchronized (IO_LOCK) {
             writePrivate(ctx, tag, text);
             writeDownloads(ctx, tag, text, false);
         }
@@ -189,6 +268,26 @@ final class CrashLog {
 
     static String recordMessage(Context ctx, String tag, String message) {
         return record(ctx, tag, new RuntimeException(message));
+    }
+
+    /**
+     * 真实版本号（"1.2.2 (122)" 这种形状），读不到返回 null 由调用方回落常量。
+     * 不缓存：PackageManager 只有崩溃时才会问一次，缓存的收益抵不上「装了新包
+     * 还在报老版本」的风险。任何异常都不允许冒出去，取证不能自己制造崩溃。
+     */
+    private static String versionOf(Context ctx) {
+        if (ctx == null) return null;
+        try {
+            android.content.pm.PackageInfo pi =
+                    ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+            String name = pi.versionName == null ? "" : pi.versionName;
+            if (name.isEmpty()) return null;
+            int code = Build.VERSION.SDK_INT >= 28
+                    ? (int) pi.getLongVersionCode() : pi.versionCode;
+            return name + " (" + code + ")";
+        } catch (Throwable e) {
+            return null;
+        }
     }
 
     private static String stamp() {

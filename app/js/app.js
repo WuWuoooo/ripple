@@ -26,6 +26,8 @@
     /* 推荐歌单（首页区块 02）的缓存，与排行榜分开 —— 两个接口互不影响 */
     _recPlCache: null,
     _plCache: new Map(),   // plId -> 歌单详情
+    /* 从「专辑 / 艺人」分组点进来的筛选：{ kind:'album'|'artist', name } */
+    _libGroup: null,
   };
 
   /* ================= 启动 ================= */
@@ -567,9 +569,24 @@
     return `<div class="${cls} art"><img src="${cover}" alt="" loading="lazy"><div class="ripple"></div></div>`;
   }
 
+  /*
+   * 会员/付费曲目的统一判定。
+   *
+   * 以前是两处各写一套：列表行只看 t.vip，播放页还额外认 fee===1/4 与
+   * privilege.fee===1。后果是同一首歌在列表里显示普通音质标签、
+   * 进播放页却冒出 VIP 角标，用户会以为标签判错了。
+   *
+   * fee：1 = 需要会员，4 = 付费专辑/单曲，8 = 免费试听（不算会员）。
+   */
+  function isVipTrack(t) {
+    if (!t || t.source !== 'online') return false;
+    return !!(t.vip || t.fee === 1 || t.fee === 4 || (t.privilege && t.privilege.fee === 1));
+  }
+
   function rowHTML(t, i, isOn) {
-    const fmt = t.vip ? 'VIP' : (t.format || '');
-    const cls = /Hi-Res|FLAC|ALAC|DSD/i.test(fmt) ? ' hi' : (t.vip ? ' vip' : '');
+    const vip = isVipTrack(t);
+    const fmt = vip ? 'VIP' : (t.format || '');
+    const cls = /Hi-Res|FLAC|ALAC|DSD/i.test(fmt) ? ' hi' : (vip ? ' vip' : '');
     /*
      * tabindex="0" + role="button" 让键盘/读屏能用。
      *
@@ -674,7 +691,14 @@
     for (let i = 0; i < list.length; i++) {
       const t = list[i];
       const s = t.id + '\u0001' + (t.title || '') + '\u0001' + (t.artist || '') + '\u0001' + (t.album || '')
-        + '\u0001' + (t.cover || '') + '\u0001' + (t.duration || 0) + '\u0001' + (t.format || '') + '\u0001' + (t.vip ? 1 : 0);
+        /*
+         * 末尾要带上 VIP 角标的**全部**输入：角标现在由 isVipTrack() 判定
+         * （vip / fee / privilege.fee 三者任一），只把 t.vip 算进签名的话，
+         * 同一批曲目换了 fee 字段签名不变，行就不会重建、角标还停在旧的。
+         */
+        + '\u0001' + (t.cover || '') + '\u0001' + (t.duration || 0) + '\u0001' + (t.format || '')
+        + '\u0001' + (t.vip ? 1 : 0) + '\u0001' + (t.fee || 0)
+        + '\u0001' + ((t.privilege && t.privilege.fee) || 0);
       for (let k = 0; k < s.length; k++) h = (h * 31 + s.charCodeAt(k)) | 0;
       h = (h * 31 + i) | 0;
     }
@@ -715,6 +739,9 @@
 
   const ROAM_HERO_KEY = 'ripple.roamHero.v1';
   let _roamHeroBusy = false;
+  /* busy 期间又来的 force 请求：只保留最后一个，当前这轮结束后补跑 */
+  let _roamHeroQueued = null;
+  let _roamHeroBusyPromise = null;
 
   function loadRoamHeroCache() {
     try {
@@ -737,39 +764,62 @@
   /**
    * 拉取漫游 hero。seed 为 null 时什么都不做（没种子就显示兜底卡片）。
    * force 为真时忽略「同种子已缓存」的短路（用户点刷新/切歌后强制更新）。
+   *
+   * force 请求撞上在飞的同名请求时不再被直接丢弃：排队等前一个结束再跑。
+   * 以前是静默 return 旧 hero，调用方却照样 toast「换了一首」+ 旧歌名，
+   * 用户会觉得按钮点了个寂寞。
    */
   async function loadRoamHero(seed, force) {
     if (!seed || !seed.neId) { App._roamHero = null; return null; }
     if (!Netease.ready) return null;
     /* 同一个种子已经拉过：直接复用，不重复打接口 */
     if (!force && App._roamHeroSeed === seed.neId && App._roamHero) return App._roamHero;
-    if (_roamHeroBusy) return App._roamHero;
-    _roamHeroBusy = true;
-    try {
-      const list = await Netease.roamSongs(seed.neId, 12);
+    if (_roamHeroBusy) {
       /*
-       * 挑一首当 hero：跳过种子本身（否则封面和「当前播放」重复），
-       * 按天做确定性随机，同一天内不会每次刷新都跳。
+       * 正在拉的时候用户又点了「换一首」：记下待办，当前这一轮结束后再拉一次。
+       * 只保留最后一次请求（连点多次没必要排一长串）。
        */
-      const pool = list.filter((x) => x && x.neId && x.neId !== seed.neId);
-      const use = pool.length ? pool : list;
-      if (!use.length) return null;
-      const d = new Date();
-      const dayKey = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
-      const picked = use[dayKey % use.length];
-      App._roamHero = picked;
-      App._roamHeroSeed = seed.neId;
-      saveRoamHeroCache(seed.neId, picked);
-      Log.add('ROAM', 'hero <- ' + picked.title + ' (seed ' + seed.title + ', ' + use.length + ' 候选)');
-      /* 数据变了必须重绘（清签名） */
-      App._homeSig = '';
-      renderHome();
-      return picked;
-    } catch (e) {
-      Log.err('ROAM', e, 'loadRoamHero seed=' + (seed && seed.neId));
-      return null;
+      if (!force) return App._roamHero;
+      _roamHeroQueued = seed;
+      return _roamHeroBusyPromise;
+    }
+    _roamHeroBusy = true;
+    _roamHeroBusyPromise = (async () => {
+      try {
+        const list = await Netease.roamSongs(seed.neId, 12);
+        /*
+         * 挑一首当 hero：跳过种子本身（否则封面和「当前播放」重复），
+         * 按天做确定性随机，同一天内不会每次刷新都跳。
+         * force 时错开一位，否则同一天同一批候选永远挑到同一首，
+         * 「换一首」点了等于没点。
+         */
+        const pool = list.filter((x) => x && x.neId && x.neId !== seed.neId);
+        const use = pool.length ? pool : list;
+        if (!use.length) return null;
+        const d = new Date();
+        const dayKey = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+        const picked = use[(dayKey + (force ? 1 : 0)) % use.length];
+        App._roamHero = picked;
+        App._roamHeroSeed = seed.neId;
+        saveRoamHeroCache(seed.neId, picked);
+        Log.add('ROAM', 'hero <- ' + picked.title + ' (seed ' + seed.title + ', ' + use.length + ' 候选)');
+        /* 数据变了必须重绘（清签名） */
+        App._homeSig = '';
+        renderHome();
+        return picked;
+      } catch (e) {
+        Log.err('ROAM', e, 'loadRoamHero seed=' + (seed && seed.neId));
+        return null;
+      }
+    })();
+    try {
+      return await _roamHeroBusyPromise;
     } finally {
       _roamHeroBusy = false;
+      /* 期间又有人点了「换一首」：补跑一次，把最新的展示出来 */
+      const queued = _roamHeroQueued;
+      _roamHeroQueued = null;
+      if (queued) loadRoamHero(queued, true).catch(() => {});
     }
   }
 
@@ -926,6 +976,21 @@
     if (tl) tl.innerHTML = card + card + card;
   }
 
+  /**
+   * 丢掉首页的三份在线缓存（每日推荐 / 推荐歌单 / 排行榜）。
+   *
+   * 「刷新资料」以前只清 App._myPl 就调 loadHomeOnline()，而后者对这三份
+   * 都有 10 分钟级的缓存短路（见 939/1005 的判断），于是刷新完首页纹丝不动，
+   * 用户只能等 TTL 过期或者杀进程重开。
+   */
+  function invalidateHomeCaches() {
+    App._dailyCache = null;
+    App._dailyAt = 0;
+    App._recPlCache = null;
+    App._topCache = null;
+    App._homeSig = '';        // 数据换了，签名必须作废，否则 renderHome 直接返回
+  }
+
   /** 拉在线首页内容：每日推荐 + 排行榜 */
   async function loadHomeOnline() {
     if (!Netease.ready) {
@@ -1030,36 +1095,64 @@
       : `<div class="c-card ghost">${esc(emptyText || '暂无内容')}</div>`;
   }
 
-  function libFiltered() {
+  function libFiltered(opts) {
     let list = Store.all();
     if (App.filter === 'local') list = list.filter((t) => t.source === 'local');
     else if (App.filter === 'lossless') list = list.filter((t) => /FLAC|Hi-Res|ALAC|DSD/i.test(t.format || ''));
     else if (App.filter === 'online') list = list.filter((t) => t.source === 'online');
+    /*
+     * 从「专辑 / 艺人」分组点进来的筛选（App._libGroup）。
+     * 只看「歌曲」tab：分组视图自己不能再被它过滤，
+     * 否则点了某个专辑后再切「专辑」tab，聚合结果里只剩那一张。
+     */
+    const g = App._libGroup;
+    if (g && !(opts && opts.noGroup)) {
+      if (g.kind === 'album') list = list.filter((t) => (t.album || '未知专辑') === g.name);
+      else if (g.kind === 'artist') list = list.filter((t) => (t.artist || '未知艺人') === g.name);
+    }
     return list;
   }
 
+  /* 切回「歌曲」tab，并把分段高亮同步过去 */
+  function setLibSeg(seg) {
+    App._libSeg = seg;
+    $$('#segline b').forEach((x) => x.classList.toggle('on', x.dataset.seg === seg));
+  }
+
   function renderLibrary() {
-    const list = libFiltered();
-    const cur = Player.track;
     const seg = App._libSeg || 'songs';
+    /*
+     * 「歌曲」tab 用带分组筛选的列表；分组视图用不带分组筛选的列表 ——
+     * 否则点进某个专辑后再切「专辑」tab，聚合结果里只剩那一张专辑。
+     */
+    const list = seg === 'songs' ? libFiltered() : libFiltered({ noGroup: true });
+    const cur = Player.track;
     // 数据签名没变就直接返回：切歌时只有「当前曲目高亮」会变，
     // 曲目集合没变就不该重建几百行 DOM（平板上这是切歌卡顿的主因之一）
-    const sig = listSig(list, seg + '|' + (cur ? cur.id : '') + '|' + (App.filter || ''));
+    const sig = listSig(list, seg + '|' + (cur ? cur.id : '') + '|' + (App.filter || '')
+      + '|' + (App._libGroup ? App._libGroup.kind + ':' + App._libGroup.name : ''));
     if (sig === App._libSig) return;
     App._libSig = sig;
     if (seg !== 'songs') {
       renderLibGrouped(list, seg, cur);
       return;
     }
+    const g = App._libGroup;
     $('#libList').innerHTML = list.length
       ? list.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
       : `<div class="empty"><b>这里还没有音乐</b><p>点下面「从手机导入音乐」，或在搜索页搜网易云</p></div>`;
-    $('#libCount').textContent = list.length + ' 首';
+    $('#libCount').textContent = g
+      ? `${g.name} · ${list.length} 首`
+      : list.length + ' 首';
   }
 
   /**
    * 专辑 / 艺人 / 下载 三个分组视图。
    * 分组本身不需要额外数据，全从已经并入库的曲目里聚合出来。
+   *
+   * 点分组行会筛出组内的歌并切回「歌曲」tab（见 App._libGroup）；
+   * 分组行以前只是纯展示，样式却和可点的歌曲行一模一样，
+   * 用户点下去毫无反应，会以为列表卡了。
    */
   function renderLibGrouped(list, seg, cur) {
     if (seg === 'albums') {
@@ -1071,7 +1164,8 @@
       });
       const rows = [...map.values()];
       $('#libList').innerHTML = rows.length
-        ? rows.map((e) => `<div class="row" data-album="${esc(e.album)}">
+        ? rows.map((e) => `<div class="row" data-album="${esc(e.album)}" data-artist="${esc(e.artist)}"
+            role="button" tabindex="0" aria-label="专辑 ${esc(e.album)}，共 ${e.n} 首，查看歌曲">
             <div class="r-th art"><img src="${safeCover(coverOf(e.first))}" alt="" loading="lazy"></div>
             <div class="r-tx"><b>${esc(e.album)}</b><span>${esc(e.artist)} · ${e.n} 首</span></div>
           </div>`).join('')
@@ -1088,7 +1182,8 @@
       });
       const rows = [...map.values()];
       $('#libList').innerHTML = rows.length
-        ? rows.map((e) => `<div class="row" data-artist="${esc(e.artist)}">
+        ? rows.map((e) => `<div class="row" data-artist="${esc(e.artist)}"
+            role="button" tabindex="0" aria-label="艺人 ${esc(e.artist)}，共 ${e.n} 首，查看歌曲">
             <div class="r-th art"><img src="${safeCover(coverOf(e.first))}" alt="" loading="lazy"></div>
             <div class="r-tx"><b>${esc(e.artist)}</b><span>${e.n} 首</span></div>
           </div>`).join('')
@@ -1206,6 +1301,7 @@
         + '<button class="btn ghost" id="btnLogout">退出</button>';
       $('#btnReload').onclick = async () => {
         App._myPl = null;
+        invalidateHomeCaches();
         await refreshAccount();
         loadMyPlaylists();
         loadHomeOnline();
@@ -1791,11 +1887,9 @@
       document.body.classList.toggle('no-cover', !t.cover);
     }
     $('#npTitle').textContent = t.title;
-    // VIP 角标：会员曲目 / 需要付费的曲目在歌名右边明确标注
-    const isVip = t.source === 'online' && (t.vip || t.fee === 1 || t.fee === 4
-      || (t.privilege && t.privilege.fee === 1));
+    // VIP 角标：判定统一走 isVipTrack()，与列表行的角标口径一致
     const vipEl = $('#npVip');
-    if (vipEl) vipEl.hidden = !isVip;
+    if (vipEl) vipEl.hidden = !isVipTrack(t);
     $('#npArtist').textContent = [t.artist, t.album, t.format].filter(Boolean).join(' · ');
     $('#npFrom').textContent = t.source === 'online' ? '网易云 · 在线' : t.source === 'local' ? '本地文件' : '示例曲库';
     const liked = Store.isLiked(t.id);
@@ -2975,9 +3069,9 @@
    */
   function animateLyricBox(expand) {
     /*
-     * 1.2.23：整个函数现在只剩一次 class 切换。
+     * 现在整个函数只剩一次 class 切换。
      *
-     * 以前这里有一整套「冻结封面尺寸 / 到点解冻 / 结束后重算」的补偿逻辑，
+     * 早期实现里有一整套「冻结封面尺寸 / 到点解冻 / 结束后重算」的补偿逻辑，
      * 是围绕 JS 量尺寸那套架构长出来的。现在封面尺寸完全由 CSS 的
      * width:100% + aspect-ratio + max-height 决定，浏览器在布局阶段自己算，
      * 动画过程中它只会跟着容器一起变，不存在需要冻结的 inline 值，
@@ -3062,6 +3156,8 @@
 
   /* ================= 无限漫游 ================= */
   let _roamBusy = false;
+  /* 漫游队列上限：漫游是常开的，续下去不封顶会让队列与渲染无限膨胀 */
+  const ROAM_QUEUE_MAX = 300;
   /* 审查 3.1：心动模式的续队列互斥锁（漫游那边的 _roamBusy 已有） */
   let _heartBusy = false;
   async function applyRoamMode() {
@@ -3085,9 +3181,30 @@
         try { list = await Netease.personalFm(); } catch (e) { list = []; }
       }
       if (!list.length) throw new Error('没有拿到相似歌曲');
-      const queue = (Player.queue.length ? Player.queue.slice() : [seedTrack])
-        .concat(list.filter((x) => x && x.id));
-      Player.queueSet(queue, Player.index);
+      /*
+       * 必须按 id 去重：漫游是无限续的，上游按 seed 推荐的歌跟已有队列
+       * 大面积重叠，直接 concat 会让队列越听越长、重复项越堆越多，
+       * 随机权的权重也就失真了（和心动模式续队列同一个道理）。
+       *
+       * 队列还得有上限：漫游是常开的，不封顶的话一次长听能积累到
+       * 几千首，renderQueue 和队列面板都会变慢。
+       */
+      const base = Player.queue.length ? Player.queue.slice() : [seedTrack];
+      const have = new Set(base.map((x) => x && x.id));
+      const add = [];
+      for (const x of list) {
+        if (!x || !x.id || have.has(x.id)) continue;
+        have.add(x.id);
+        add.push(x);
+      }
+      if (!add.length) {
+        toast('漫游中', '暂时没有新的相似歌曲', 'infinite');
+        return;
+      }
+      const queue = base.concat(add).slice(-ROAM_QUEUE_MAX);
+      /* 截掉的是队头，当前这首歌的下标要跟着前移，否则会指向别的歌 */
+      const index = Math.max(0, Player.index - Math.max(0, base.length + add.length - queue.length));
+      Player.queueSet(queue, index);
       App.context = queue;
       renderQueue();
       syncModeButtons();
@@ -3399,15 +3516,19 @@
     /*
      * H-7：再兜一层上限。上游虽然已经降到 300，但缓存/别的入口也可能塞进超长数组；
      * 一次 innerHTML 上万个节点会把主线程卡死。
+     *
+     * 只截断**渲染副本**，绝不能改 data.tracks：App._plCache 里存的就是这个对象，
+     * 写回以后第二次打开同一张歌单就只能看到 300 首，提示里的「共 N 首」
+     * 也变成了 300。队列仍用完整曲目，播到第 300 首还能继续往下。
      */
     const PL_MAX = 300;
     const total = data.tracks.length;
-    if (total > PL_MAX) data.tracks = data.tracks.slice(0, PL_MAX);
+    const shown = total > PL_MAX ? data.tracks.slice(0, PL_MAX) : data.tracks;
     $('#plCount').textContent = total > PL_MAX
       ? `前 ${PL_MAX} 首（共 ${total} 首）`
       : total + ' 首';
     const cur = Player.track;
-    $('#plTracks').innerHTML = data.tracks.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
+    $('#plTracks').innerHTML = shown.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
       || '<div class="empty"><b>空歌单</b></div>';
     /*
      * 成功路径必须把这个指示清掉。
@@ -3584,7 +3705,14 @@
       tip.className = 'sld-tip';
       wrap.appendChild(tip);
     }
-    const key = el.dataset.set;
+    /*
+     * 格式键两套写法都认：
+     *   · 设置页的滑块用 data-set="volume" 之类；
+     *   · 播放页「…」面板的滑块用 data-opt="volume" 之类（它同时是设置键名）。
+     * 以前只读 dataset.set，面板里那四个滑块全都取不到格式，
+     * 气泡显示成裸数字 0.85 / 1.05 / 12 / 0.5，和设置页的同名滑块对不上。
+     */
+    const key = el.dataset.set || el.dataset.opt;
     const fmt = SLD_FMT[key] || ((x) => String(x));
     tip.textContent = fmt(v);
     // thumb 14px 宽，可用轨道宽度 = 容器宽 - 14（容器还有 0 padding）
@@ -3592,14 +3720,6 @@
     tip.style.left = (7 + (p / 100) * trackW) + 'px';
     if (showTip) tip.classList.add('on');
     else tip.classList.remove('on');
-  }
-
-  /** 拖动结束后收起气泡（input 事件里亮、change/松手后灭） */
-  function hideSliderTip(el) {
-    const wrap = el.closest && el.closest('.sld');
-    if (!wrap) return;
-    const tip = wrap.querySelector('.sld-tip');
-    if (tip) tip.classList.remove('on');
   }
 
   /* ================= 事件 ================= */
@@ -3673,6 +3793,18 @@
         return toast('还没有可漫游的歌', '先播一首在线歌，或收藏几首', 'info');
       }
       if (!Netease.ready) return toast('在线功能不可用', '漫游需要联网', 'warn');
+      if (_roamHeroBusy) {
+        /*
+         * 在飞的时候再点：把它登记进队列（loadRoamHero 内部只留最后一次），
+         * 当前这轮结束后会补跑一次。
+         *
+         * 这里**不 await** 它的返回值 —— 那拿到的是「当前这一轮」的结果，
+         * 拿它去 toast 等于还是提示旧歌名，正是要修的那个问题。
+         * 补跑的那一轮只负责把新歌换到 hero 上，提示由这里给出手反馈即可。
+         */
+        loadRoamHero(seed, true).catch(() => {});
+        return toast('正在换，稍等', '', 'info');
+      }
       const got = await loadRoamHero(seed, true);
       if (got) toast('换了一首', got.title, 'shuffle');
       else toast('没拿到新的推荐', '稍后再试', 'warn');
@@ -3754,6 +3886,20 @@
         return;
       }
 
+      /*
+       * 曲库「专辑 / 艺人」分组行：筛出该组的歌并切回「歌曲」tab。
+       * 必须放在 [data-id] 之前判断 —— 分组行没有 data-id，
+       * 但下面那套逻辑遇到没有 data-id 的元素会直接 return。
+       */
+      const grp = e.target.closest('#libList [data-album], #libList [data-artist]');
+      if (grp) {
+        const name = grp.dataset.album != null ? grp.dataset.album : grp.dataset.artist;
+        App._libGroup = { kind: grp.dataset.album != null ? 'album' : 'artist', name: name };
+        setLibSeg('songs');
+        renderLibrary();
+        return;
+      }
+
       const card = e.target.closest('[data-id]');
       if (!card) return;
       const id = card.dataset.id;
@@ -3804,6 +3950,20 @@
         if (!b) return;
         $$('#segline b').forEach((x) => x.classList.toggle('on', x === b));
         App._libSeg = b.dataset.seg;
+        /*
+         * 用户主动切到别的 tab 就不再保留分组筛选，
+         * 否则再点「歌曲」时列表里只剩上次那个专辑的歌，看起来像丢歌了。
+         */
+        App._libGroup = null;
+        renderLibrary();
+      });
+    }
+    /* 分组筛选的「返回全部」提示：点它就清掉筛选 */
+    const libHead = $('#libCount');
+    if (libHead) {
+      libHead.addEventListener('click', () => {
+        if (!App._libGroup) return;
+        App._libGroup = null;
         renderLibrary();
       });
     }
@@ -4106,6 +4266,7 @@
       `);
       $('#acctReload').onclick = async () => {
         App._myPl = null;
+        invalidateHomeCaches();
         await refreshAccount();
         loadMyPlaylists();
         loadHomeOnline();
@@ -4308,10 +4469,30 @@
        * Esc 的优先级要跟返回键一致：先关遮罩/面板，最后才收播放页。
        * 以前无条件 closeNP()，桌面端按 Esc 想关个评论面板，
        * 结果整页播放页被收走了。
+       *
+       * 这里不再另写一套，直接复用 __rippleBack 的判定（见其注释）。
+       * 旧实现引用的 closeAnySheet 与 [data-modal-cancel] 在仓库里都不存在，
+       * 于是「命中 .modal-wrap」时既关不掉对话框、又无条件 return，
+       * 按 Esc 在弹窗状态下完全没反应。
+       * Esc 不承担「再按一次退出」，返回值只看它有没有关掉东西。
        */
       if (e.key === 'Escape') {
-        if (typeof closeAnySheet === 'function' && closeAnySheet()) return;
-        if ($('.modal-wrap')) { const b = $('.modal-wrap'); const x = b.querySelector('[data-modal-cancel]'); if (x) x.click(); return; }
+        const mt = modalTop();
+        if (mt) { mt.close(null); return; }
+        const sheet = $('.np-sheet.on');
+        if (sheet) {
+          const id = sheet.id || '';
+          if (id === 'npQueueSheet') closeQueue();
+          else if (id === 'npOptSheet') closeOptSheet();
+          else if (id === 'cmtSheet') closeComments();
+          else {
+            sheet.classList.remove('on');
+            $$('.sheet-mask.on').forEach((m) => m.classList.remove('on'));
+            const nm = $('#npMask');
+            if (nm) nm.classList.remove('on');
+          }
+          return;
+        }
         closeNP();
       }
     });
@@ -4506,10 +4687,33 @@
      * 但按钮计数已经变成 60 / 3127。
      *
      * 现在 doSearch 给单曲容器打了 id="searchSongList"，直接按 id 定位；
-     * 保留 .list 兜底是为了兼容旧缓存页面（SW 可能还在供旧 HTML）。
+     * 保留兜底是为了兼容旧缓存页面（SW 可能还在供旧 HTML）。
+     *
+     * ⚠️ 新行只能 appendChild 到列表尾部，不能 insertBefore(..., more)：
+     * 「加载更多」按钮是 #searchSongList 的**兄弟**节点，拿它当参照节点
+     * 按 DOM 规范必抛 NotFoundError，于是每次加载更多都变成「加载失败」。
      */
-    const listEl = body.querySelector('#searchSongList') || host.querySelector('.list') || host;
-    while (frag.firstChild) listEl.insertBefore(frag.firstChild, more || done || null);
+    const listEl = body.querySelector('#searchSongList');
+    if (listEl) {
+      while (frag.firstChild) listEl.appendChild(frag.firstChild);
+      return;
+    }
+    /*
+     * 旧缓存页面：没有 id，只能按位置找。
+     * 单曲列表就是紧挨在「加载更多 / 到底了」前面的那个 .list
+     * （doSearch 的顺序是「歌单 .list → 单曲标题 → 单曲 .list → 按钮」，
+     * 用 querySelector('.list') 会命中前面那个歌单容器，又是一次老 bug）。
+     * 找不到就退回父容器，至少别把行丢掉。
+     */
+    const tail = more || done;
+    const prev = tail && tail.previousElementSibling;
+    const fallbackList = prev && prev.classList.contains('list') ? prev
+      : (host.classList.contains('list') ? host : null);
+    if (fallbackList) {
+      while (frag.firstChild) fallbackList.appendChild(frag.firstChild);
+      return;
+    }
+    while (frag.firstChild) host.insertBefore(frag.firstChild, tail || null);
   }
 
   async function loadMoreSearch() {
@@ -5731,15 +5935,17 @@
      * 这是在**函数入口**统一拦住，而不是去改 106 个调用点 ——
      * 那样改必然漏，而且以后新加通知又会忘。
      *
-     * 两个例外，不被开关影响：
+     * 以下几类不被开关影响：
      *   ① warn（失败/异常）—— 「登录未完成」「这首歌放不了」这类
      *      如果也被吞掉，用户只会觉得"点了没反应"，反而更糟。
      *      关通知的意图是"别打扰我"，不是"出错了也别告诉我"。
-     *   ② 底部 toastBottom（"再按一次返回退出"这类操作确认），
+     *   ② check（操作成功确认）—— 「已添加」「登录成功」「已恢复默认」
+     *      同样承担"告诉我做成了"的职责，吞掉会和 ① 一样变成"点了没反应"。
+     *   ③ 底部 toastBottom（"再按一次返回退出"这类操作确认），
      *      它是另一套通道，压根不走这里。
      * 原生系统通知由 settings.notifyQuiet 单独控制，与这个开关无关。
      */
-    if (!S().inAppToast && icon !== 'warn') return;
+    if (!S().inAppToast && icon !== 'warn' && icon !== 'check') return;
     const wrap = $('#toasts');
     if (!wrap) return;
     /*
@@ -5843,6 +6049,16 @@
   }
 
   async function restoreLast() {
+    /*
+     * 接管序号必须在函数最开头登记。
+     *
+     * 下面解析在线直链要串行试档、每档最长 22s，这期间用户完全可能自己点了歌。
+     * 序号若等到解析完再自增，等于把自己追平到最新值，stillMine() 恒为真，
+     * 守卫就形同虚设——这正是上一版「注释说修好了、实际没生效」的地方。
+     */
+    const myRestore = ++App._restoreSeq;
+    const stillMine = () => App._restoreSeq === myRestore;
+
     const id = S().lastTrackId;
     const savedPos = Math.max(0, Number(S().lastPosition) || 0);
     const savedQueue = Array.isArray(S().lastQueue) ? S().lastQueue : [];
@@ -5897,6 +6113,7 @@
     if (!t.src) {
       // 还是拿不到音源（VIP/无版权/离线）：只恢复界面，点播放再重试
       Log.add('RESTORE', 'no src, ui only: ' + t.title);
+      if (!stillMine()) return;
       Player.track = t;
       Player.queueSet(list, at);
       updateDock();
@@ -5923,10 +6140,9 @@
      *   · 每次 restoreLast 开始时记一个序号，用户任何播放动作都会 ++
      *   · 每个可能写播放器状态的节点都先校验序号没变
      *   · applyPos 闭包捕获当时的元素与期望位置，不再读 Player.el
+     *   · 序号已在函数开头登记（见上方说明），这里不能再自增，否则会把自己追平
      */
-    const myRestore = ++App._restoreSeq;
-    const stillMine = () => App._restoreSeq === myRestore;
-
+    if (!stillMine()) return;
     Player.queueSet(list, at);
     Player.track = t;
     /*
@@ -5939,26 +6155,33 @@
      *   · 本地歌的均衡器预设看起来开着但不生效
      *   · 通知栏元数据要等下次交互才刷新
      *
-     * 传 autoplay=false：恢复不该自动出声，仍停在暂停态等用户点。
+     * 第二个参数传 false：恢复不该自动出声，仍停在暂停态等用户点。
      */
     let loadOk = true;
     try {
-      Player.load(t, { autoplay: false });
+      Player.load(t, false);
     } catch (e) {
       loadOk = false;
       Log.err('RESTORE', e, 'Player.load failed: ' + t.title);
     }
     if (!loadOk) {
       /* load 失败（非法 URL 等）时退回最小实现，至少界面是对的 */
+      if (!stillMine()) return;
       Player.el = Player._pickEl(t);
       try { Player.el.src = new URL(t.src, location.href).href; } catch (e) {}
       Player.el.volume = S().volume;
     }
 
+    /*
+     * 元素也一起捕获进闭包：1.2 秒后的兜底调用如果去读 Player.el，
+     * 那时它可能已经指向另一首歌的元素，就把旧进度写进新歌了。
+     * 序号校验是第一道闸，这里是不依赖序号的第二道。
+     */
+    const posEl = Player.el;
     const applyPos = () => {
       /* 用户已经接管播放：这次恢复的一切都不许再写播放器 */
       if (!stillMine()) return;
-      const el = Player.el;
+      const el = posEl;
       if (!el) return;
       const d = el.duration;
       const pos = (isFinite(d) && d > 0) ? Math.min(savedPos, d - 1) : savedPos;
@@ -5973,6 +6196,8 @@
     // 兜底：某些内核不触发 loadedmetadata
     setTimeout(applyPos, 1200);
 
+    /* 走到这里说明恢复仍然有效；再校验一次，避免上面这一段同步调用期间被接管 */
+    if (!stillMine()) return;
     updateDock();
     paletteFor(t);
     renderNP();

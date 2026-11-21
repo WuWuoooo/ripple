@@ -1,4 +1,4 @@
-const CACHE = 'ripple-121';
+const CACHE = 'ripple-122';
 const SHELL = [
   './', './index.html', './manifest.webmanifest',
   './css/base.css', './css/layouts.css', './css/components.css', './css/responsive.css',
@@ -51,7 +51,16 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // 音频 / 图片：缓存优先
+  /*
+   * 音频 / 图片：缓存优先。
+   *
+   * 离线且缓存里也没有时**不要**回退 index.html —— 以前这里写的是
+   * `.catch(() => caches.match('./index.html'))`，结果是 <audio>/<img>
+   * 拿到一份 HTML 文本：媒体解码立刻失败，控制台只剩一句莫名的
+   * 「不支持该格式」，从现象上完全看不出真实原因是「离线且没缓存」。
+   * 音频和图片都属于「要么给真身、要么明确失败」的资源，统一回 504，
+   * 让上层把失败按网络错误处理。
+   */
   e.respondWith(
     caches.match(req).then((hit) => hit || fetch(req).then((res) => {
       if (res.ok && res.type === 'basic') {
@@ -59,7 +68,7 @@ self.addEventListener('fetch', (e) => {
         caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
       }
       return res;
-    }).catch(() => caches.match('./index.html')))
+    }).catch(() => new Response('', { status: 504, statusText: 'Offline' })))
   );
 });
 

@@ -15,9 +15,15 @@
   background:var(--panel2);color:var(--text3)}
 
 /* 关于 */
-/* 不要再叠 opacity —— --text3 本身已经是低对比度的次要色，
+/* 不要再叠 opacity —— 颜色本身已经是低对比度的次要色，
    再乘 0.8 后浅色主题实算只有 2.6:1，说明文字会糊成一片灰。 */
-.about-note{font-size:10px;line-height:1.8;color:var(--text3);padding:22px 6px 30px;text-align:center}
+/*
+ * 颜色用 --text2 而不是 --text3：这块是 10px 的说明正文，
+ * 按 WCAG AA 的「正常文字」一档要 4.5:1，而浅色主题的 --text3 只有 3.56:1。
+ * --text3 本身是刻意的层次权衡（再整体提就和 --text2 撞色了），
+ * 所以只把这一处正文级小字单独提权，其余次要标签继续用 --text3。
+ */
+.about-note{font-size:10px;line-height:1.8;color:var(--text2);padding:22px 6px 30px;text-align:center}
 
 /* 弹窗
  *

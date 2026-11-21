@@ -19,6 +19,14 @@ const os = require('os');
 const crypto = require('crypto');
 
 /*
+ * 安全判定（Host 白名单 / 同源 / 令牌有效性 / 上游路径）都在这个模块里。
+ * 它们以前散在本文件：签发端一套、鉴权端另一套，1.2.1 的 S-01
+ * （.local 页面签得出令牌但 API 全 403）就是两套逻辑漂移造成的。
+ * 拆出去还有个收益：这些纯函数能直接 require，配上了自动化测试。
+ */
+const sec = require('./server-security');
+
+/*
  * R-30：数据目录（.ripple-cookie / .ripple-token）默认仍是脚本所在目录，
  * 但允许 --data-dir <路径> 指到别处。默认目录在 /sdcard 这类 fuse 挂载上
  * chmod 是空操作（实测 0660），想真正 0600 就得把数据放进私有目录。
@@ -134,13 +142,24 @@ function weapiForm(obj) {
  *  · 令牌表落在 .ripple-token（0600，JSON），服务重启后已打开的页面还能继续用；
  *  · 签发端保留 Host 白名单 + Sec-Fetch-Site，并追加
  *    「Sec-Fetch-Mode 或 Origin/Referer 必须是本站」这一条（见 browserSignalOk）。
- *    这层能挡掉盲发的跨站请求，但对同机伪造请求头的程序只是礼貌层 ——
- *    真正的约束是 TTL + IP 绑定 + 轮换。
+ *    这层挡的是**盲发**的跨站请求：网页 JS 改不了 Sec-Fetch-*，所以别的网站
+ *    偷偷 fetch 你的令牌会被挡。但它拦不住同机上能执行程序的伪造 ——
+ *    实测同时带头 `Sec-Fetch-Site: same-origin` + `Sec-Fetch-Mode: no-cors`
+ *    就能签出令牌。真正的约束是 TTL + IP 绑定 + 轮换（见 SECURITY.md 的威胁模型）。
  *
  * 前端协议保持不变：仍然请求 /ripple-token.js，仍然读 window.RIPPLE_TOKEN。
  */
 const TOKEN_FILE = path.join(DATA_DIR, '.ripple-token');
-/* 测试/调试时可覆盖（例如 RIPPLE_TOKEN_TTL_MS=20000 观察过期后的 401） */
+/*
+ * 测试/调试时可覆盖（例如 RIPPLE_TOKEN_TTL_MS=20000 观察过期后的 401）。
+ *
+ * S-02 讨论过「把默认 TTL 再调短」：结论是**不调**。前端只在页面加载时取一次令牌
+ * （index.html 的 <script src="/ripple-token.js">），拿到 401 也不会自动续签。
+ * 而这是个「打开就一直放着听歌」的播放器 —— TTL 一旦短于用户开着的时长，
+ * 到时接口就全 401 并提示「请用最新 server.js 打开本页」，属于把安全焦虑转嫁成可用性 bug。
+ * 而且缩短 TTL 对同机攻击者的收益≈0：那种程序随时能再签一份（见 SECURITY.md 的威胁模型）。
+ * 真正该收紧的方向是浏览器侧挑战（cookie / nonce 校验），本轮不做。
+ */
 const TOKEN_TTL_MS = (() => {
   const raw = Number(process.env.RIPPLE_TOKEN_TTL_MS);
   if (!Number.isFinite(raw) || raw <= 0) return 30 * 60 * 1000;
@@ -152,14 +171,12 @@ const TOKEN_ISSUE_PER_MIN = 30;     // 每个 IP 每分钟最多签发多少个�
 /** 当前有效令牌：新的在前，每项 { t, ip, exp } */
 let tokenList = [];
 
-/** loopback 的 IPv4 映射写法会以 ::ffff: 前缀出现，统一成同一个键 */
-function normIp(ip) {
-  return String(ip || '').replace(/^::ffff:/, '').toLowerCase() || 'unknown';
-}
+const normIp = sec.normIp;
 
+/** 只在真的清掉了过期项时才换数组，避免每次鉴权都新建对象 */
 function pruneTokens(now) {
-  const keep = tokenList.filter((e) => e && e.t && now < e.exp);
-  if (keep.length !== tokenList.length) tokenList = keep;
+  const keep = sec.pruneTokens(tokenList, now);
+  if (keep !== tokenList) tokenList = keep;
 }
 
 function loadTokenStore() {
@@ -206,12 +223,8 @@ function issueToken(ip) {
 
 /** 令牌是否有效：必须存在、未过期、且来源 IP 与签发时一致 */
 function tokenValid(got, ip) {
-  const v = String(got || '');
-  if (!v) return false;
   pruneTokens(Date.now());
-  const me = normIp(ip);
-  /* 令牌本身是 128 位随机值，用普通比较即可：猜中的概率与穷举相同 */
-  return tokenList.some((e) => e.t === v && e.ip === me);
+  return sec.tokenValid(tokenList, got, ip);
 }
 
 loadTokenStore();
@@ -251,7 +264,7 @@ function checkSecretMode(file) {
  * 只能重启服务。现在改成**实时查询**网卡，带 5 秒短缓存（同一页面会连发几十个请求，
  * 不缓存的话每个请求都要枚举一次网卡）。
  */
-const LOCAL_HOST_NAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
+const LOCAL_HOST_NAMES = sec.LOCAL_HOST_NAMES;
 const HOST_CACHE_MS = 5 * 1000;
 
 let hostCache = { at: 0, set: new Set(LOCAL_HOST_NAMES) };
@@ -273,27 +286,13 @@ function allowedHosts() {
   return set;
 }
 
-/** 取 Host 的比较键：IPv6 保留 [..] 形式，其余砍掉端口 */
-function hostKey(host) {
-  const h = String(host || '').toLowerCase().trim();
-  if (!h) return '';
-  return h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0];
-}
-
 /**
- * Host 是否被接受。
- * 额外放行 `.local`（mDNS 主机名，如 dshgo.local）：
- * 这类名字只能由同一局域网内的设备解析到本机，与「本机网卡 IP」同一信任级别，
- * 且 README 里就是用 http://<主机名>:8080 这种写法访问的。
+ * Host 是否被接受（白名单 + `.local`）。
+ * 判定本身在 server-security.js：签发令牌和 API 鉴权必须走同一个函数，
+ * 否则又会出现「页面能开、令牌能签，但 API 全 403」那种两边口径不一致的问题。
  */
 function hostAllowed(req) {
-  const raw = String(req.headers.host || '').toLowerCase().trim();
-  if (!raw) return false;                       // HTTP/1.1 必须有 Host
-  const set = allowedHosts();
-  if (set.has(raw)) return true;
-  const bare = hostKey(raw);
-  if (set.has(bare)) return true;
-  return /^[a-z0-9-]+(\.[a-z0-9-]+)*\.local$/.test(bare);
+  return sec.hostAllowed(req, allowedHosts());
 }
 
 /** 421 响应体：把当前允许的 Host 列表带上，用户自己就能判断该怎么访问 */
@@ -326,34 +325,9 @@ function hostRejectBody(req) {
     + '  若确实要用别的域名（如反向代理），请让代理把 Host 改成上面某个值。\n';
 }
 
-/** 把 candidate（Origin / Referer）与白名单比对（不再用可伪造的 Host 当基准） */
-function hostMatches(req, candidate) {
-  if (!candidate) return false;
-  try {
-    const u = new URL(candidate);
-    const host = String(u.host || '').toLowerCase();
-    const bare = hostKey(host);
-    // 必须同时满足：来源 Host 在白名单里，且和请求的 Host 一致
-    return allowedHosts().has(host) || allowedHosts().has(bare)
-      ? host === String(req.headers.host || '').toLowerCase()
-      : false;
-  } catch (e) {
-    return false;
-  }
-}
-
-/*
- * 同源判定。
- * 有 Origin 就比 Origin 与 Host；
- * 没有 Origin 时不再直接放行（那是旧漏洞：curl 不带 Origin 即可打 /ncm/*），
- * 只接受 Sec-Fetch-Site 为 same-origin / none —— 前者是同源 fetch，
- * 后者是用户在地址栏直接打开，两者都不是「别的站点发起的跨站请求」。
- */
+/** 同源判定：Origin 与本机白名单 + 本次请求的 Host 比对（判定逻辑见 server-security.js） */
 function originAllowed(req) {
-  const org = req.headers.origin;
-  if (org) return hostMatches(req, org);
-  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
-  return site === 'same-origin' || site === 'none';
+  return sec.originAllowed(req, allowedHosts());
 }
 
 /*
@@ -361,11 +335,10 @@ function originAllowed(req) {
  *
  *  ① Host 白名单 —— DNS rebinding 挡在这里（Sec-Fetch-Site 在那种场景下必然是
  *     same-origin，所以它只能当辅助，不能当判据）；
- *  ② 浏览器信号 —— Sec-Fetch-Site 必须是 same-origin，且
- *     Sec-Fetch-Mode（这是 <script> 加载，真浏览器会带 'no-cors'/'cors'）
- *     或 Origin/Referer 至少有一个能对上本站。真浏览器发 <script src> 一定带
- *     这三样里的至少两样；`curl -H 'Sec-Fetch-Site: same-origin'` 只伪造了一样，
- *     会被 browserSignalOk 挡掉。
+ *  ② 浏览器信号 —— Sec-Fetch-Site 必须是 same-origin，Sec-Fetch-Mode 必须是
+ *     浏览器会用的那几个值，或者 Origin/Referer 至少有一个能对上本站。
+ *     它挡的是**盲发**的跨站请求（别的网站的 JS 无法自定这几个头）；
+ *     对同机上能执行程序的伪造请求头只算礼貌层，别把它当安全边界。
  *  ③ 令牌本身是短期 + IP 绑定 + 每次加载轮换（见 issueToken），
  *     所以即便有人把① ② 都伪造齐了，拿到的也只是一份很短命的令牌。
  *
@@ -373,19 +346,7 @@ function originAllowed(req) {
  * 一次性会导致页面刷新后立刻失效。用 TTL + 轮换达到同样的目标。
  */
 function browserSignalOk(req) {
-  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
-  const mode = String(req.headers['sec-fetch-mode'] || '').toLowerCase();
-  const sameOriginRef = hostMatches(req, req.headers.origin) || hostMatches(req, req.headers.referer);
-  /* 三者全无 —— 既不是浏览器导航/子资源加载，也没有来源，拒绝 */
-  if (!site && !mode && !sameOriginRef) return false;
-  /* 有 Sec-Fetch-Site 就必须是 same-origin（cross-site/same-site 都不行） */
-  if (site && site !== 'same-origin') return false;
-  /* Sec-Fetch-Mode 是浏览器专有的 fetch 元数据，真浏览器必带；带了就认为可信 */
-  if (mode && mode !== 'navigate' && mode !== 'no-cors' && mode !== 'cors') return false;
-  /* 走 <script src> 的加载是 no-cors；navigate 是地址栏直开；两者都没有时看来源 */
-  if (mode === 'no-cors' || mode === 'cors') return true;
-  if (mode === 'navigate') return true;
-  return sameOriginRef;
+  return sec.browserSignalOk(req, allowedHosts());
 }
 
 function tokenEndpointAllowed(req) {
@@ -492,28 +453,16 @@ const UA = 'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML,
   + 'Chrome/124.0.0.0 Mobile Safari/537.36';
 
 /*
- * 上游路径校验。ncmCall 的 switch 是逻辑白名单，但它靠字符串拼出 path，
+ * 上游路径校验（实现在 server-security.js，那里连注释一起搬过去了）。
+ * ncmCall 的 switch 是逻辑白名单，但它靠字符串拼出 path，
  * 只要某个命令把用户参数直接拼进路径（comments 就是这样），
  * `x/../../../../user/level` 这种就能靠 WHATWG URL 的 .. 归一化跳出白名单。
- *
- * 注意：只在 new URL() 之后校验 pathname 是**不够的** —— URL 构造时已经把
- * `..` 归一化掉了，`/weapi/v1/.../x/../../../../user/level` 会先变成
- * `/weapi/user/level`，一个「必须以 /weapi/ 且只含 [a-z0-9/_-]」的正则
- * 照样通过，等于没拦住。所以真正的关口在**拼 URL 之前**检查原始 path：
+ * 真正的关口在**拼 URL 之前**检查原始 path：
  * 只允许 [a-z0-9/_-]，天然排除了 `.`、`..`、`%`、`\`、`?`、`#` 等一切
  * 能改变路径含义的字符。归一化后的 pathname 再校验一次，纯属纵深防御。
  */
-const SAFE_PATH_SEG_RE = /^[a-z0-9/_-]+$/i;
-const UPSTREAM_PATH_RE = /^\/weapi\/[a-z0-9/_-]+$/i;
-
 function assertUpstreamPath(rawPath, url) {
-  if (typeof rawPath !== 'string' || !SAFE_PATH_SEG_RE.test(rawPath) || rawPath.includes('..')) {
-    throw badRequest('bad upstream path');
-  }
-  const p = url.pathname;
-  if (p.includes('..') || !UPSTREAM_PATH_RE.test(p)) {
-    throw badRequest('bad upstream path: ' + p);
-  }
+  sec.assertUpstreamPath(rawPath, url);
 }
 
 function ncmPost(path, body) {
@@ -580,16 +529,12 @@ function ncmPost(path, body) {
 }
 
 /**
- * E-18：参数校验错误统一构造。
+ * E-18：参数校验错误统一构造，实现在 server-security.js（测试要能直接 require）。
  * 以前只靠错误信息前缀正则判断「是不是客户端的问题」，漏一条就变成 502（上游失败）。
  * 现在改成带 err.badRequest = true 标记，错误处理优先看这个标记。
  * 正则兜底仍然保留（兼容历史上直接 throw new Error 的路径）。
  */
-function badRequest(msg) {
-  const e = new Error(msg);
-  e.badRequest = true;
-  return e;
-}
+const badRequest = sec.badRequest;
 
 /** 把可选的分页参数收敛成整数：非法就用默认值，再 clamp 到 [min, max] */
 function clampInt(v, min, max, dflt) {
@@ -1053,7 +998,8 @@ function handleRequest(req, res) {
   if (u.pathname === '/ripple-token.js') {
     if (!tokenEndpointAllowed(req)) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end('forbidden: token is only served to same-origin browser requests');
+      /* 别在 403 文案里承诺「同机一定拿不到」—— 伪造请求头可以过这一层（S-02） */
+      return res.end('forbidden: token is only served to browser requests from this page');
     }
     /* 轮换窗口只有 3 个槽位，不对签发做限流的话别人能把它一直刷掉 */
     const waitS = issueTokenLimited(req);
@@ -1155,7 +1101,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('\n  网易云真接口已就绪：POST /ncm/<cmd>（weapi 加密，可带登录态）');
   console.log('  未登录也能搜索/试听；登录请用 APK，或在 .ripple-cookie 里放 MUSIC_U');
   console.log('  访问令牌  每次页面加载轮换，绑定来源 IP，有效期 '
-    + Math.round(TOKEN_TTL_MS / 60000) + ' 分钟');
+    + sec.formatTtl(TOKEN_TTL_MS));
   reportDataDir();
   console.log('\n  按 Ctrl+C 停止\n');
 });

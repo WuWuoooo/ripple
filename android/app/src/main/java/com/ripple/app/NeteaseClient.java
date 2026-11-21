@@ -469,8 +469,21 @@ final class NeteaseClient {
         for (String s : idsCsv.split(",")) {
             String t = s.trim();
             if (t.isEmpty()) continue;
+            /*
+             * J-03：坏 id 只跳过它自己，不能让整批请求失败。
+             * ids 是从上游拿的（歌单 trackIds / 搜索结果的 id 字段），
+             * 上游偶尔会给 null 或非数字串；以前这里裸 parseLong，一个坏值抛
+             * NumberFormatException 冒到 HttpBridge 的 catch，整个 song_detail
+             * 直接回 code:-1 —— 用户看到的是「歌单打不开」，而其实只坏了一条。
+             */
+            long id;
+            try {
+                id = Long.parseLong(t);
+            } catch (NumberFormatException bad) {
+                continue;
+            }
             JSONObject one = new JSONObject();
-            one.put("id", Long.parseLong(t));
+            one.put("id", id);
             c.put(one);
         }
         JSONObject o = new JSONObject();

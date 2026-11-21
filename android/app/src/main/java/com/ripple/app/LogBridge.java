@@ -24,7 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *     synchronized static 并且同步写盘，而它会在 UI 线程（WebView 的 JS 桥）
  *     上被调用：一次 MediaStore 查询 + 200KB 全量重写就卡在那里。
  *   · 落盘节流：相邻两次写盘至少间隔 FLUSH_MS，内容没变直接跳过
- *   · 崩溃时强制 flush，日志里能看到崩溃前最后一段
+ *   · 崩溃时由 CrashLog 的 UncaughtExceptionHandler 调 forceWrite() **同步**落盘，
+ *     日志里能看到崩溃前最后一段（flush() 是异步的，崩溃路径不能用它：进程马上
+ *     就会被系统收走，排进队列的任务可能永远不执行）
  */
 final class LogBridge {
 
@@ -35,6 +37,8 @@ final class LogBridge {
     private static final long RATE_MS = 3000;
 
     private static final Object LOCK = new Object();
+    /** 串行化「真正写文件」这一段：后台线程与崩溃路径的 forceWrite 都可能进 */
+    private static final Object WRITE_LOCK = new Object();
     private static final StringBuilder BUF = new StringBuilder();
     private static final SimpleDateFormat TS =
             new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US);
@@ -96,6 +100,27 @@ final class LogBridge {
     }
 
     /**
+     * 同步落盘（崩溃路径专用）。
+     *
+     * 为什么不复用 flush()：那是异步的，把任务交给后台线程就返回 ——
+     * 而崩溃之后进程马上就要被系统杀掉，队列里的任务根本没机会执行。
+     * 这里直接在调用线程写，写完再返回，代价是崩溃时多花几毫秒。
+     *
+     * 幂等：即使 LogBridge 还没被 add() 初始化过（appCtx 为空）也只是白跑一趟。
+     */
+    static void forceWrite(Context ctx) {
+        if (ctx != null) appCtx = ctx.getApplicationContext();
+        synchronized (LOCK) {
+            lastFlush = System.currentTimeMillis();
+        }
+        try {
+            write();
+        } catch (Throwable ignored) {
+            // 取证代码自己抛异常会把「记录崩溃」变成「制造崩溃」，一律吞掉
+        }
+    }
+
+    /**
      * 记录一次 JS 错误并请求落盘。
      * 一个每秒复发的 JS 错误以前会每秒双写 200KB，这里单独限速。
      */
@@ -146,36 +171,43 @@ final class LogBridge {
     }
 
     private static void write() {
-        Context ctx = appCtx;
-        if (ctx == null) return;
-        byte[] data;
-        String body;
-        synchronized (LOCK) {
-            body = BUF.toString();
-            // 内容完全一样就别再写一遍：CrashLog.step / 启动阶段会连着调好几次
-            if (body.equals(lastBody)) return;
-            lastBody = body;
-        }
-        try {
-            data = body.getBytes("UTF-8");
-        } catch (Exception e) {
-            return;
-        }
-
-        // 1) 私有目录（保底）
-        try {
-            File f = new File(ctx.getFilesDir(), "ripple-log.txt");
-            FileOutputStream out = new FileOutputStream(f, false);
-            try {
-                out.write(data);
-            } finally {
-                out.close();
+        /*
+         * 整段写文件串行化：后台线程与崩溃路径的 forceWrite() 会同时进来，
+         * 两个 FileOutputStream 并发覆盖同一个文件会互相截断。
+         * 注意 WRITE_LOCK 包在 LOCK 外面（顺序固定），不会和 add()/dump() 死锁。
+         */
+        synchronized (WRITE_LOCK) {
+            Context ctx = appCtx;
+            if (ctx == null) return;
+            byte[] data;
+            String body;
+            synchronized (LOCK) {
+                body = BUF.toString();
+                // 内容完全一样就别再写一遍：CrashLog.step / 启动阶段会连着调好几次
+                if (body.equals(lastBody)) return;
+                lastBody = body;
             }
-        } catch (Throwable ignored) {
-        }
+            try {
+                data = body.getBytes("UTF-8");
+            } catch (Exception e) {
+                return;
+            }
 
-        // 2) 公共下载目录（proot 可读）——落点逻辑收敛到 PublicFile
-        String p = PublicFile.write(ctx, FILE_NAME, data, true);
-        if (!p.isEmpty()) cachedPath = p;
+            // 1) 私有目录（保底）
+            try {
+                File f = new File(ctx.getFilesDir(), "ripple-log.txt");
+                FileOutputStream out = new FileOutputStream(f, false);
+                try {
+                    out.write(data);
+                } finally {
+                    out.close();
+                }
+            } catch (Throwable ignored) {
+            }
+
+            // 2) 公共下载目录（proot 可读）——落点逻辑收敛到 PublicFile
+            String p = PublicFile.write(ctx, FILE_NAME, data, true);
+            if (!p.isEmpty()) cachedPath = p;
+        }
     }
 }

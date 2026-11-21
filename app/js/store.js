@@ -67,7 +67,7 @@
   };
 
   /* ---------------- 示例曲库（已移除） ----------------
-     1.2.4 起不再内置示例歌曲：曲库只包含「本机导入」和网易云在线内容。
+     早期版本内置过示例歌曲，现在曲库只包含「本机导入」和网易云在线内容。
      保留空数组是为了兼容旧代码里对 DEMO 的引用。
      ---------------------------------------------------- */
   const DEMO = [];
@@ -109,9 +109,29 @@
   const ENUMS = {
     theme: ['auto', 'dark', 'light'],
     quality: ['standard', 'higher', 'exhigh', 'lossless'],
-    eq: ['off', 'pop', 'rock', 'jazz', 'classical', 'vocal', 'custom'],
+    /*
+     * eq 以 player.js 的 EQ_PRESETS 与均衡器面板的按钮为准。
+     * 以前这里是 off/pop/rock/jazz/classical/vocal/custom —— 和实现、UI 三份名单
+     * 各不相同：用户选「低频(bass)」「夜间(night)」存盘时白名单不认，重启回落 off，
+     * 表现为「预设重启后失效」；反过来 jazz/classical 在白名单里，但
+     * EQ_PRESETS 没有对应曲线，选中只会被当成 off 静音，两套都是坏的。
+     * custom 保留：它不是预设，走 eqCustom 那一支。
+     */
+    eq: ['off', 'pop', 'rock', 'vocal', 'bass', 'night', 'custom'],
     repeat: ['off', 'one', 'all'],
     playMode: ['list', 'shuffle', 'heart', 'roam'],
+  };
+  /*
+   * 已废弃的枚举值 → 现行值（按设置项分组）。
+   *
+   * jazz/classical 在早期实现里被写进过 eq 白名单，选过它们的用户设置就留在
+   * localStorage 里。白名单收紧后如果不迁移，这些值会直接回落 off ——
+   * 等于用户设置被静默清空。这两个曲线当时也没有真实实现（EQ_PRESETS 里
+   * 根本没有对应频段），最近似的其实是「关闭」，所以统一映射到 off，
+   * 并在设置加载时留一行日志，让愿意查日志的人知道自己的旧值被改过。
+   */
+  const MIGRATE = {
+    eq: { jazz: 'off', classical: 'off' },
   };
 
   function coerceSettings(saved) {
@@ -131,7 +151,19 @@
           : v.filter((x) => typeof x === 'string');
         return;
       }
-      if (ENUMS[k]) { if (ENUMS[k].indexOf(v) >= 0) out[k] = v; return; }
+      if (ENUMS[k]) {
+        if (ENUMS[k].indexOf(v) >= 0) { out[k] = v; return; }
+        /* 已废弃的旧值先翻译一次（jazz/classical → off），翻译后的值也要在白名单里 */
+        const legacy = MIGRATE[k];
+        const migrated = legacy && legacy[v];
+        if (migrated && ENUMS[k].indexOf(migrated) >= 0) {
+          out[k] = migrated;
+          try {
+            if (g.Log) g.Log.info('STORE', '设置 ' + k + ' 的旧值 ' + v + ' 已迁移为 ' + migrated);
+          } catch (e) {}
+        }
+        return;
+      }
       /* 字符串项（apiBase / lastTrackId / sbColor 等） */
       if (typeof def === 'string') { if (typeof v === 'string') out[k] = v; return; }
       /* 数值项 */

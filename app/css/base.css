@@ -112,7 +112,9 @@
   --bg:#F1EEEA;--bg2:#F7F4F0;--panel:rgba(255,255,255,.62);--panel2:rgba(255,255,255,.42);
   /* 浅色底 #F1EEEA 上实算：text3 的 .38 只有 2.39:1 —— 副标题基本读不清。
      .52 是 3.56:1（小字里能接受的那一档，再提会盖过正文）。
-     lyric-dim 的 .55 只有 3.90:1，歌词是正文级内容要 4.5:1，所以提到 .68 → 5.95:1。 */
+     lyric-dim 的 .55 只有 3.90:1，歌词是正文级内容要 4.5:1，所以提到 .68 → 5.95:1。
+     分工上，--text3 只给「标签级」的次要小字（时间、序号、分组标题），
+     凡是要读成句子的正文级小字（如 .about-note）单独用 --text2，不继承 --text3。 */
   --text:#17131B;--text2:rgba(23,19,27,.62);--text3:rgba(23,19,27,.52);
   --lyric-dim:rgba(23,19,27,.68);
   --line:rgba(23,19,27,.10);--line2:rgba(23,19,27,.16);
@@ -516,7 +518,7 @@ body.no-cover .np-bg{opacity:0}
  *   因为容器高度在展开时会塌陷，而 aspect-ratio 配上 max-height:100%
  *   会让封面的边长跟着容器一起变 —— 那就是「偶见缩放」的来源。
  *
- * 为什么不用 JS 到处量尺寸（1.2.22 及以前）：
+ * 为什么不用 JS 到处量尺寸（早期实现）：
  *   sizeCover() 有 6 个触发点（resize / orientationchange / 打开播放页 /
  *   __rippleViewport / 动画结束 / 滑动结束）。cover-wrap 的高度又受兄弟元素
  *   影响（歌名一行还是两行、歌词字号、底部安全区），于是每次量到的 availH
@@ -960,7 +962,7 @@ body.no-cover .np-bg{opacity:0}
  * 展开时：整块封面「原样」滑走，歌名/进度/按钮让位
  * ============================================================
  *
- * 1.2.23 换了驱动方式。以前的思路是「让容器塌陷，顺带把封面带走」，
+ * 这一版换了驱动方式。以前的思路是「让容器塌陷，顺带把封面带走」，
  * 再靠各种补偿去对齐封面和歌名 —— 那条路上有太多互相牵制的量：
  *   容器高度、padding、min-height、flex 分配、以及 JS 写进去的像素尺寸，
  * 任何一个在错误的时机变一次，就会表现为「偶见缩放」或「回来时闪一下」。
@@ -981,7 +983,7 @@ body.no-cover .np-bg{opacity:0}
    *
    * 这里之所以能安全地让容器塌陷，是因为**封面的边长已经不吃容器高度了**：
    * 它写死成 var(--cover-size)，由 ResizeObserver 在收起态发布。
-   * 1.2.22 及以前封面是 width:100% + max-height:100% 自适应容器高度，
+   * 旧版封面是 width:100% + max-height:100% 自适应容器高度，
    * 容器一塌封面就跟着缩 —— 这才是「偶发缩放」的根。
    */
   flex-grow:0;
@@ -1451,9 +1453,13 @@ html:not(.perf-low) .acct{
  * 把原本压在别的层下面的东西翻上来，观感上像「整页都能被推开」。
  * 用 z-index:-1 的 ::before 配 mix-blend-mode 时，
  * 只要父级自己有背景色就不会穿帮，不需要隔离。
+ *
+ * .dock-inner 不在下面这组里：它有 overflow:hidden（裁圆角和 2px 进度条），
+ * 负 z-index 的伪元素会被连父级背景一起裁掉，这层高光永远显示不出来。
+ * 它的反射改走 background 的多层渐变（见上面 .dock-inner 那段），
+ * 所以这里再加 ::before 只会是死样式。
  */
 html:not(.perf-low) .tabbar::before,
-html:not(.perf-low) .dock-inner::before,
 html:not(.perf-low) .hero::before,
 html:not(.perf-low) .acct::before{
   content:"";

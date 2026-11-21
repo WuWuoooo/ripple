@@ -17,12 +17,22 @@ public class RippleApp extends Application {
     private static final String SP = "ripple";
     private static final String KEY_BOOT_STREAK = "boot_streak";
 
+    /**
+     * 启动日志里的版本号回落值。
+     *
+     * 形状必须保持 `version=x.y.z(NNN)` 这一串：android/sync-version.sh 用 sed
+     * 同步它、CI 用 grep -F 校验它，改成别的写法会让构建直接失败。
+     * 正常路径下不起作用 —— 版本号优先从 PackageManager 读（J-04），
+     * 免得有人绕开 build-apk.sh 手改版本后，日志里报的还是旧版本。
+     */
+    private static final String FALLBACK_VERSION_TAG = "version=1.2.2(122)";
+
     @Override
     public void onCreate() {
         super.onCreate();
         LogBridge.add(this, "APP", "onCreate start, sdk=" + Build.VERSION.SDK_INT
                 + " " + Build.MANUFACTURER + " " + Build.MODEL
-                + " version=1.2.1(121)");
+                + " " + versionTag(this));
         /*
          * 崩溃捕获只在这里装一次（传 Application Context）。
          * 以前 MainActivity 也调了一遍，形成链式 handler：同一次崩溃写两份文件，
@@ -55,6 +65,25 @@ public class RippleApp extends Application {
                 LogBridge.add(this, "APP", "safeMode ON (streak=" + streak + ")，已关闭 edge-to-edge");
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 运行时版本标记（"version=1.2.2(122)" 这种形状）。
+     * 读不到时回落 FALLBACK_VERSION_TAG；任何异常都不能冒出去 ——
+     * 这行日志是启动取证的一部分，不能反过来把启动搞挂。
+     */
+    private static String versionTag(Context ctx) {
+        try {
+            android.content.pm.PackageInfo pi =
+                    ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+            String name = pi.versionName == null ? "" : pi.versionName;
+            if (name.isEmpty()) return FALLBACK_VERSION_TAG;
+            int code = Build.VERSION.SDK_INT >= 28
+                    ? (int) pi.getLongVersionCode() : pi.versionCode;
+            return "version=" + name + "(" + code + ")";
+        } catch (Throwable e) {
+            return FALLBACK_VERSION_TAG;
         }
     }
 
@@ -95,7 +124,7 @@ public class RippleApp extends Application {
             if (sb.length() > 0) {
                 /*
                  * 固定文件名覆盖写（Ripple-exit-info.txt）。
-                 * 以前走 recordRaw → 每次新建一个带秒级时间戳的 crash 文件：
+                 * 以前这条走的是「每次新建一个带秒级时间戳的 crash 文件」那条路：
                  * LMK/厂商清理每杀一次就多一份，用得久了下载目录全是它。
                  * 这类「上次退出原因」只需要最新一次。
                  */

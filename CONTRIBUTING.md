@@ -1,5 +1,7 @@
 # 参与 Ripple 的开发
 
+**简体中文** | [English](./docs/en/CONTRIBUTING_en.md)
+
 感谢你愿意花时间。Ripple 是一个刻意保持「小而完整」的项目：构建流程不依赖 Gradle、没有 AndroidX、没有前端构建链。读完这一页你就能跑起来。
 
 > **关于 Gradle**：`build-apk.sh` 只用 `aapt2 / javac / d8 / zipalign / apksigner`，

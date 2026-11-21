@@ -424,6 +424,17 @@
     },
 
     load(track, autoplay = true) {
+      /*
+       * 第二参数同时接受布尔和 `{autoplay}` 对象。
+       *
+       * 原因：冷启动恢复上次曲目时传的是 `Player.load(t, {autoplay:false})`，
+       * 而对象恒为真 —— `if (autoplay)` 必然起播。冷启动没有用户手势，
+       * WebView 拒播后落到 _playMuted，表现为「进度条在走但没有声音」，
+       * 正是那种「看起来坏了」的体验。调用点在 app.js 里、且这层签名
+       * 已经不止一处历史用法，所以在这里收口归一化，而不是指望每个
+       * 调用点都记得传布尔。新增调用请直接传 true/false。
+       */
+      if (autoplay && typeof autoplay === 'object') autoplay = autoplay.autoplay !== false;
       if (g.Log) g.Log.add('PLAY', 'load() ' + (track && track.title)
         + ' autoplay=' + autoplay + ' source=' + (track && track.source));
       this._blockedOnce = false;
