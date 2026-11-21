@@ -27,13 +27,16 @@ import java.util.concurrent.Executors;
  * 这样即使发生 native 崩溃（Java 层抓不到），也能看出死在哪一步之前。
  *
  * 文件策略（以前会无限增长）：
- *   · 「上次退出原因」这类**不是崩溃**的取证，固定文件名覆盖写（Ripple-exit-info.txt）
+ *   · 「上次退出原因」这类**不是崩溃**的取证，固定文件名覆盖写（Ripple-exit-info.txt）；
+ *     私有目录那份同样走固定名（exit-info-latest.txt / trace-latest.txt）——
+ *     这两个是高频 tag，用时间戳命名会把崩溃文件的保留配额刷满（J-11）
  *   · 真正的崩溃保留最近 MAX_CRASH_FILES 份，超出按文件名（含时间戳）删最老的
  *
  * 线程模型（J-01）：
- *   · 常规轨迹（step）与退出取证（recordExitInfo）的落盘丢给后台单线程 ——
- *     它们会在主线程被调用（MainActivity.onCreate / RippleApp.onCreate），
- *     一次写盘是 MediaStore 查询 + 跨进程 openOutputStream，不能挡在首帧前面。
+ *   · 常规轨迹（step）、退出取证（recordExitInfo）与**非崩溃的错误日志**（recordAsync）
+ *     的落盘丢给后台单线程 —— 它们会在主线程被调用（MainActivity.onCreate、
+ *     PlaybackService 的回调），一次写盘是 MediaStore 查询 + 跨进程 openOutputStream，
+ *     不能挡在首帧或 UI 交互前面。
  *   · 崩溃路径（record / flushTrace）**同步**写：进程马上就要被系统杀掉，
  *     排进队列的任务可能永远不执行，宁可多花几毫秒也要把证据落下来。
  */
@@ -142,7 +145,8 @@ final class CrashLog {
             String text = TRACE.toString();   // 锁内取快照，之后不再碰 StringBuilder
             synchronized (IO_LOCK) {
                 try {
-                    writePrivate(ctx, "trace", text);
+                    /* J-11：高频 tag 走固定名覆盖，别去挤崩溃文件的保留配额 */
+                    writePrivateLatest(ctx, "trace", text);
                     writeDownloads(ctx, "trace", text, true);
                 } catch (Throwable ignored) {
                 }
@@ -215,14 +219,68 @@ final class CrashLog {
         final Context app = ctx == null ? null : ctx.getApplicationContext();
         post(() -> {
             try {
-                writePrivate(app, "exit-info", text);
+                /* J-11：同上，exit-info 每次启动都会写，必须固定名 */
+                writePrivateLatest(app, "exit-info", text);
                 writeDownloads(app, "exit-info", text, true);
             } catch (Throwable ignored) {
             }
         });
     }
 
+    /**
+     * 非崩溃路径专用的异步版本（J-05）。
+     *
+     * 为什么需要它：record() 是**同步**写盘 —— MediaStore 查询 + 跨进程 openOutputStream
+     * + 全量重写，在故障场景（也正是它被大量调用的时候）主线程每卡几十毫秒。
+     * 它保持同步是对的（崩溃 handler 里进程随时会被收走，排队等于丢证据），
+     * 但 MainActivity / PlaybackService 里那二十来处调用都是普通的错误日志
+     * （cookie-init / edge-to-edge / webview-client / login-open …），
+     * 一句「这次操作失败了」完全不值得挡在 UI 线程上。
+     *
+     * 这里做的就是把「拼文本」保留在调用线程（Throwable 的栈要趁还完整时取），
+     * 真正碰盘的那一段丢给后台单线程。崩溃 handler 里仍然用 record()。
+     *
+     * 注意返回 void：异步路径拿不到落盘后的文本，需要 lastTrace 的调用方用 record()。
+     */
+    static void recordAsync(Context ctx, String tag, Throwable e) {
+        final Context app = ctx == null ? null : (ctx.getApplicationContext() == null
+                ? ctx : ctx.getApplicationContext());
+        String text;
+        try {
+            text = buildReport(ctx, tag, e);
+        } catch (Throwable ignored) {
+            return;
+        }
+        post(() -> {
+            try {
+                writePrivate(app, tag, text);
+                writeDownloads(app, tag, text, false);
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    /** 同名便捷版：把一句话包成 RuntimeException（与 recordMessage 对应） */
+    static void recordMessageAsync(Context ctx, String tag, String message) {
+        recordAsync(ctx, tag, new RuntimeException(message));
+    }
+
     static String record(Context ctx, String tag, Throwable e) {
+        String text = buildReport(ctx, tag, e);
+        lastTrace = text;
+        /*
+         * record() 保持同步写：它在崩溃路径上（UncaughtExceptionHandler），
+         * 进程随时会被系统收掉，post 到后台线程等于赌那把队列会不会跑完。
+         */
+        synchronized (IO_LOCK) {
+            writePrivate(ctx, tag, text);
+            writeDownloads(ctx, tag, text, false);
+        }
+        return text;
+    }
+
+    /** 拼报告正文（不碰磁盘）。抽出来是为了让同步/异步两条路共用同一份格式。 */
+    private static String buildReport(Context ctx, String tag, Throwable e) {
         StringWriter sw = new StringWriter();
         PrintWriter pw = new PrintWriter(sw);
         pw.println("== Ripple crash " + stamp() + " ==");
@@ -235,7 +293,7 @@ final class CrashLog {
          * "version: x.y.z (" + NNN + ")"：android/sync-version.sh 用 sed 同步它，
          * CI 也用 grep -F 校验这一串，改成别的写法会让构建直接失败。
          */
-        String fallbackVersion = "version: 1.2.2 (" + 122 + ")";
+        String fallbackVersion = "version: 1.2.3 (" + 123 + ")";
         String realVersion = versionOf(ctx);
         pw.println(realVersion == null ? fallbackVersion : "version: " + realVersion);
         pw.println();
@@ -253,17 +311,7 @@ final class CrashLog {
         pw.println("---- startup trace ----");
         pw.println(trace);
         pw.flush();
-        String text = sw.toString();
-        lastTrace = text;
-        /*
-         * record() 保持同步写：它在崩溃路径上（UncaughtExceptionHandler），
-         * 进程随时会被系统收掉，post 到后台线程等于赌那把队列会不会跑完。
-         */
-        synchronized (IO_LOCK) {
-            writePrivate(ctx, tag, text);
-            writeDownloads(ctx, tag, text, false);
-        }
-        return text;
+        return sw.toString();
     }
 
     static String recordMessage(Context ctx, String tag, String message) {
@@ -295,8 +343,36 @@ final class CrashLog {
     }
 
     private static void writePrivate(Context ctx, String tag, String text) {
+        if (ctx == null) return;
         try {
             File f = new File(ctx.getFilesDir(), "crash-" + stamp() + "-" + safe(tag) + ".txt");
+            FileOutputStream out = new FileOutputStream(f, false);
+            try {
+                out.write(text.getBytes("UTF-8"));
+            } finally {
+                out.close();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 私有目录里的「最新一份」固定名覆盖写（J-11）。
+     *
+     * 为什么必须和 writePrivate 分开：trace / exit-info 这两个 tag 是**高频**的
+     * （每次崩溃写一次 trace、每次启动写一次 exit-info），而它们和真正的崩溃文件
+     * 共用同一个命名前缀与同一个保留配额 —— 用带时间戳的名字会让它们不断生成新文件，
+     * 把 10 份的配额刷满，于是最早那份**真崩溃**的取证被挤掉。
+     *
+     * 这里改成固定名覆盖（trace-latest.txt / exit-info-latest.txt），
+     * 而且**故意不带 crash- 前缀**：prunePrivateCrashFiles 只清 crash-*.txt，
+     * 固定名不会被它当成历史崩溃删掉，两份配额从此互不干扰。
+     * 下载目录那份本来就是覆盖写（writeDownloads(..., true)），不受影响。
+     */
+    private static void writePrivateLatest(Context ctx, String tag, String text) {
+        if (ctx == null) return;
+        try {
+            File f = new File(ctx.getFilesDir(), safe(tag) + "-latest.txt");
             FileOutputStream out = new FileOutputStream(f, false);
             try {
                 out.write(text.getBytes("UTF-8"));

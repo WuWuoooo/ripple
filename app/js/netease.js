@@ -16,7 +16,21 @@
   /* ---- 原生回调入口（Java → JS） ---- */
   g.__rippleNativeResult = function (id, text) {
     const done = _pending.get(id);
-    if (!done) return;
+    if (!done) {
+      /*
+       * 无主回调：JS 侧已经超时（pending 被删）之后，Java 才把结果送回来。
+       * 这类迟到结果的典型场景就是扫码登录 —— 用户在 180 秒末尾扫码成功，
+       * Java 侧正常写完 cookie 并回调，而这里直接 return，用户看到的
+       * 最后一条信息是「登录超时」。以前这里连日志都没有，排查时完全
+       * 看不出「其实成功了，只是没人接」。
+       * 记一条日志而不是抛错：回调入口在原生桥的调用栈里，抛错会污染
+       * Java 侧的返回流程，而这个事实只需要可查。
+       */
+      try {
+        if (g.Log) g.Log.add('API', '收到无主回调（可能已超时）: ' + id);
+      } catch (e) {}
+      return;
+    }
     _pending.delete(id);
     done(text);
   };
@@ -32,18 +46,25 @@
    *
    * 现在按命令的可预期耗时给预算：串行越多给得越宽。
    * 单请求的（song_url / search 等）反而可以收紧，让失败更快反馈。
+   *
+   * 覆盖范围要跟着「失败代价」走，不能只挑几个写死：走默认 22 秒的命令一旦
+   * 比默认值慢，用户就会看到一次假的「请求超时」，而这类失败又常常被上层
+   * 吞掉（静默变成空列表 / 空面板），现场只留下「点开什么都没发生」。
+   * 所以凡是耗时明显不同于单请求的命令都单独列出来，理由写在行尾。
    */
   const CALL_TIMEOUT = {
     status: 60000,        // 4 次串行
     login: 45000,
-    like_list: 30000,
-    playlist: 30000,
+    playlist: 30000,      // 歌单详情连 tracks 一起取，体积大
     playlist_tracks: 30000,
+    heart_mode: 30000,    // 服务端要按口味现算一遍推荐，比普通读慢
     comments: 25000,
     song_url: 25000,
+    song_detail: 22000,
     search: 20000,
     lyric: 18000,
     hot_search: 15000,
+    comment_add: 15000,   // 写操作：失败要尽快反馈，别让「正在发表…」一直转
   };
   const DEFAULT_TIMEOUT = 22000;
   function timeoutOf(cmd) {
@@ -99,7 +120,19 @@
         .then((t) => { clearTimeout(timer); res(t); })
         .catch((e) => {
           clearTimeout(timer);
-          rej(new Error((e.name === 'AbortError' ? '接口超时' : e.message) + ' · ' + (Date.now() - t0) + 'ms'));
+          /*
+           * 离线与「服务端不可达」要能区分开。
+           *
+           * 浏览器模式下 fetch 失败一律是 TypeError: Failed to fetch ——
+           * 断网、server.js 没起、地址填错，三者提示完全一样，用户只能瞎猜。
+           * navigator.onLine === false 时直接说是离线：这不是「接口坏了」，
+           * 提示的措辞要把用户往「检查网络」而不是「重装 server.js」上带。
+           * 注意 onLine 只有明确的 false 才可信（true 也可能实际上不通），
+           * 所以只用于离线这一支，其余仍按原样报错。
+           */
+          const offline = g.navigator && g.navigator.onLine === false;
+          const reason = e && e.name === 'AbortError' ? '接口超时' : (offline ? '当前处于离线状态' : e.message);
+          rej(new Error(reason + ' · ' + (Date.now() - t0) + 'ms'));
         });
     });
   }
@@ -273,21 +306,56 @@
     async login(mode) {
       const N = g.RippleNative;
       if (!N || typeof N.login !== 'function') throw new Error('当前环境不支持账号登录');
-      const text = await new Promise((res, rej) => {
-        const id = 'login_' + (++_seq);
-        const timer = setTimeout(() => {
-          _pending.delete(id);
-          rej(new Error('登录超时（3 分钟）'));
-        }, 180000);
-        _pending.set(id, (t) => { clearTimeout(timer); res(t); });
-        try {
-          N.login(mode || 'phone', id);
-        } catch (e) {
-          clearTimeout(timer);
-          _pending.delete(id);
-          rej(e);
+      let timedOut = false;
+      let text;
+      try {
+        text = await new Promise((res, rej) => {
+          const id = 'login_' + (++_seq);
+          const timer = setTimeout(() => {
+            _pending.delete(id);
+            timedOut = true;
+            /*
+             * 超时不能只清自己的 pending 表：原生登录页还开着、Java 侧还会
+             * 继续轮询 cookie 并在成功时回调，而 JS 这边的接收方已经被删掉，
+             * 回调落到 __rippleNativeResult 的「无主回调」分支被吞掉 ——
+             * 用户明明扫码成功了，界面上最后一条消息却是「登录超时」。
+             * 先把登录页收掉（loginCancel → HttpBridge.loginClose），
+             * 让原生侧也停下来，代价是用户可能需要重开一次登录；
+             * 但「真正的已登录」还会由下面的 status() 探测兜住（见 catch）。
+             */
+            try { this.loginCancel(); } catch (e) {}
+            rej(new Error('登录超时（3 分钟）'));
+          }, 180000);
+          _pending.set(id, (t) => { clearTimeout(timer); res(t); });
+          try {
+            N.login(mode || 'phone', id);
+          } catch (e) {
+            clearTimeout(timer);
+            _pending.delete(id);
+            rej(e);
+          }
+        });
+      } catch (e) {
+        /*
+         * 超时路径的自愈：loginCancel 与 Java 侧的「登录成功」是两条独立的时间线，
+         * 存在「cookie 已经写好、回调刚好错过超时」的窗口。这里补一次 status()
+         * 探测 —— 已经登录就当作成功返回，而不是把一次真实的成功报成失败。
+         * 只在超时路径探测：其他错误（登录页打不开等）说明 cookie 根本没写，
+         * 多发一次 status 只会白打 4 个请求。
+         */
+        if (timedOut) {
+          try {
+            const p = await this.status();
+            if (p && p.userId) {
+              try {
+                if (g.Log) g.Log.add('ACCOUNT', '登录回调虽已超时，但账号实际已登录，按成功处理');
+              } catch (_) {}
+              return this._profile;
+            }
+          } catch (_) {}
         }
-      });
+        throw e;
+      }
       let json = {};
       try { json = JSON.parse(text || '{}'); } catch (e) {}
       if (!json.profile) throw new Error('没有读到登录信息，请重试');
@@ -518,7 +586,15 @@
 
     /** 私人 FM：兜底无限流 */
     async personalFm() {
-      const r = await this.call('personal_fm', {});
+      /*
+       * noDedupe：私人 FM 是**刷新型读** —— 每次调用都该返回新的一批歌。
+       * 它的参数恒为 {}，去重签名永远相同，于是快速连点两次「下一首」时
+       * 第二次直接复用第一次还在飞的 Promise，两批完全一样的歌进了队列
+       * （上一版刚给漫游队列加了去重，这里又把重复从源头送进来）。
+       * 去重的语义只对「同一请求重复发起应当得到同一答案」的读成立，
+       * 比如 search / song_url；刷新型读必须显式跳过。
+       */
+      const r = await this.call('personal_fm', {}, { noDedupe: true });
       return (r.data || []).map((s) => this.mapSong(s));
     },
 

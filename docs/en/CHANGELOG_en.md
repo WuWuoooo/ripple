@@ -6,6 +6,97 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.2.3 — Sixth Version
+
+### 1. Rectification According to the Code Review Report from GLM-5.3 Flash (Full Coverage of 71 Items)
+
+A full review targeting 1.2.2, with a report of 665 lines and 71 items (**0 blocker** / 5 high / 28 medium / 26 low / 12 info). **All were processed**, of which 65 were actually modified and 6 were verified as not to be changed with reasons given.
+
+The dominant theme this round is "**one list copied into three, and then each one drifting its own way**" — the previous round unified the equaliser preset lists, but two structurally identical spots were missed, and the consequences are exactly the same.
+
+**Three List Mismatches (half of this round's highs)**
+
+- **Five quality tiers, only four recognised**: the data model is `standard/higher/exhigh/lossless/hires`, but the whitelist has four values and **is missing `hires`**, while the settings buttons are yet another set of four that **is missing `higher`**. Picking Hi-Res works for the session and silently falls back to "Extreme" after a restart; and `higher` has no UI entry at all, so the first step of the five-tier downgrade chain is dead. All three are now five tiers, with a "Higher" button added to settings.
+- **Six play modes, only three persisted**: the mode button cycles through 6 states but the whitelist holds 4 values, so choosing "Repeat One / Play in Order / Shuffle" is discarded on save. Worse, the derived `shuffle` / `repeat` fields *are* whitelisted and survive — so after a restart **the UI says "List Loop" while playback is actually still repeat-one**. The choice is reset and the interface lies about it, which is worse than simply losing a setting.
+- **`.local` hostnames were matched by an arbitrary-suffix wildcard**: the previous round correctly unified issuance and authentication onto one decision function, but that function itself matched `*.local` on any suffix, so `x.y.attacker.local` passed. mDNS only handles single-label names; multi-label ones fall through to unicast DNS, which lets an attacker pick a resolvable name pointing at this machine and bypass the whole same-origin defence. Tightened to the RFC 6762 single-label form, with rejection-direction tests added (the existing tests only pinned the allow direction, which is why the hole never went red).
+
+**The foreground-service failure path really does crash**
+
+- After `startForegroundService()` Android 8+ allows 5 seconds, but the retry schedule landed the third attempt at T+7.5s — the system kills the process with `ForegroundServiceDidNotStartInTimeException` before the retry even runs. On top of that, two exit paths called `stopSelf()` while the foreground state had never been established, which triggers the same class of system exception, and try-catch cannot catch it (the system decides asynchronously). The retry is now two attempts within 1 second and gives up on the third, and every exit path establishes the foreground state first.
+
+**Token window and offline fallback**
+
+- The token table was a global 3 slots, so a third device refreshing would evict the first one's token — the 30-minute TTL could never be used in practice. Widened to 6 slots, with the multi-device coexistence limit documented in SECURITY.
+- The token issuance endpoint was entered **before** the method restriction, so `HEAD` / `POST` also issued tokens and rotated the window — prefetches and prerenders were quietly consuming it. Non-GET now returns 405.
+- The Service Worker cached `/ripple-token.js`: the server sends `no-store`, but `Cache.put` ignores HTTP cache semantics and stored it anyway. On a weak network or during a server restart the fetch fails → falls back to the stale token script → the token has long been rotated out → a wave of 401s. Worse, that script is not in the precache list, so **opening the PWA offline for the first time** falls back to `index.html` — feeding HTML to a JS loader. The token script is now passed through uncached, and code requests no longer fall back to HTML.
+
+**Places where the comments said more than the code did**
+
+- A comment promised "tap 'I'm already logged in' to retry", and the bridge method existed, but no button called it — the control B-2 intended to give users was never wired up. By the same standard, 5 bridge methods with zero frontend callers were still present, while the header comment justified deleting three others precisely on "delete anything with zero callers".
+- Java calls `window.__rippleMediaUnavailable` to let the page show "background playback restricted", but a repo-wide grep finds zero references — the channel is dead and the comment is an IOU.
+- The `#i-order` icon was reported as dead code but **that was a false positive** (it is consumed via a dynamically concatenated play-mode name) and was kept. 4 false positives were disproven this round.
+
+**Accessibility**
+
+- The library grouping, theme, performance and quality segmented controls encoded their selected state only in a CSS class, so screen readers could not perceive it at all; `<b>` is not focusable by default, so keyboard users could not enter the group. They now have `role="tablist"/"tab"/"radiogroup"` with `aria-selected`/`aria-checked`, roving tabindex, and arrow-key / Home / End handling. The bottom capsule and the sidebar gained `aria-current="page"`.
+
+**Visuals and contrast**
+
+- The expanded-lyrics translation line was "`--text3` with an extra 0.7 opacity", measuring below WCAG AA in both themes (about 2.5:1 in light) — the same mistake as the `.about-note` fixed last round, just missed here.
+- `.eq-note.warn` hardcoded `#e0a84f`, about 1.8:1 in the light theme: the floating-window permission warning is nearly invisible there, so the permission guidance flow simply breaks.
+- The VIP gold `#F0C86A` measured about 1.4:1 in light at 8-9px, practically invisible.
+- The bottom capsule toast ("press back again to exit") was positioned at 96px while the dock top edge sits at 138px — about 42px of overlap, covering most of the mini player for those 2.5 seconds.
+- The `>=600px` breakpoint had lost the "+40px off-screen margin" of the sheet's collapse transform, so short sheets peeked at the top.
+- The low-power tier re-added a 46px full-screen parent blur on the ambient light, while the reason it was removed was precisely that "parent-layer blur is the source of halved frame rates"; and since accent has a colour transition registered, every track change re-computed that whole layer.
+
+### 2. Layout Alignment Fixes (Widescreen Single Column / Landscape Double Bar)
+
+Once the left sidebar landed, the positioning baseline of the bottom bars (mini player, bottom capsule) changed, and three spots had to be fixed in a row:
+
+- **Desktop mini player floated 78px above the bottom**: the `.dock` `bottom` still carried the `+78px` meant to make room for the bottom capsule, but on widescreen the capsule had been replaced by the sidebar and there is no capsule at the bottom any more — so the mini player hovered 78px up with a big empty band underneath. Reduced to `+13px` breathing room, flush with the bottom.
+- **Landscape / short-wide windows: the mini player and the bottom capsule were not the same width**: `.dock`'s horizontal padding was written as `padding-left:var(--safe-l)`, wiping out the `14px` from `layouts.css`, so the dock stretched edge-to-edge (full width) while the capsule stayed at `left/right:12px` — two bars of similar width directly stacked, and a 2px difference is already obvious at that size. Unified to 12px so both share identical left and right edges.
+- **Desktop mini player was 34px wider than the content area on each side**: the content area's horizontal padding is `max(--pad-x, (100% - --content-max) / 2)`, while the dock only had `max-width` plus `margin:auto`, centering within the "already minus sidebar" box — two different algorithms that inevitably disagree on widescreen. Using the exact same formula as `.page` makes all three alignment lines come from one source.
+
+**The settings page's two columns no longer have a big blank gap**
+
+After splitting settings into two columns on large screens, there was always a block of whitespace between "Interface" and "Playback". Measurement showed it was the grid stretching both cells in a row to equal height: "Playback" has 8 rows (557px) while "Interface" has 6 (424px), so the shorter side left 133px blank underneath. Adding `align-items:start` only stops the cell from stretching — the empty space still occupies a layout position, so it still reads as "a gap".
+
+Replaced with two independent column containers (`.set-cols > .set-col`) that stack naturally with no alignment constraint; the two columns are now within 8px of each other and the hole is gone. On phones the column container degrades to `block`, where order equals DOM order, so the HTML has been reordered by reading priority (Interface → Playback → Lyrics → Notifications → NetEase → Storage).
+
+Two alternatives were tried and rejected (reasons recorded in the comments): `columns` in a scrollable container slices content by inline width and lays it out as one long horizontal strip (measurements showed group `left` climbing to 3918px); `grid-auto-flow:dense` produces no backfill at all for equal-width cells.
+
+### 3. New Collapsible Sidebar for Landscape / Desktop
+
+Widescreen used to get a "vertical capsule": a floating 56px pill in the top-left with icons but no labels. That fit poorly on landscape and desktop — the 62px bottom capsule plus the 60px dock stack up to nearly a quarter of the screen height, while horizontal space is actually abundant.
+
+Widescreen breakpoints now use a left sidebar instead:
+
+- **Expanded**: brand mark, four main nav entries (icon + label), account summary card at the bottom
+- **Collapsed**: icon strip only, content area yields the space automatically
+- **State memory**: expanded/collapsed is written to `localStorage` and survives restarts; with no history the default depends on width (`>=1180` expands, narrower tablets collapse)
+- **Keyboard**: `[` collapses/expands directly (not triggered while typing in a field)
+
+Three deliberate trade-offs in the implementation:
+
+- **Width converges on one variable**: `--rail-w` drives both the sidebar width and the `.app` `padding-left`, so "sidebar grows" and "content yields" are always the same layout pass with no chance of two sets of numbers drifting apart. The collapsed state just swaps in `--rail-mini`.
+- **Both forms share one DOM and one `go()`**: the bottom capsule and the sidebar are two shells over the same navigation. Keeping a separate "current page" in each would eventually drift into "the highlight moved but the page did not".
+- **The sidebar must disappear completely on phones**: the `data-rail` attribute persists across devices, so a collapse rule without a breakpoint would leave an empty strip on phones — that rule must live inside the media query.
+
+The collapse button, brand name and account card are laid out on **three separate rows**. On one row, icon 30 + brand ~70 + button 28 plus three gaps does not fit in a 130px column, and the brand name gets truncated to "Ripp".
+
+### 4. Two Items Judged Not to Change
+
+- **Token TTL stays at 30 minutes**: a shorter TTL looks safer on paper, but the frontend only fetches a token once at page load and does not auto-renew on 401 — shortening it would trade a security worry for an availability bug (the page starts returning 401 after a while). And for the actual threat model of "an attacker on the same machine", a shorter TTL adds almost nothing. This judgement was made last round and the review raised it again; the conclusion stands.
+- **`info` toasts stay hidden when "In-app notifications" is off**: that is the intent, with `check` / `warn` as exceptions.
+
+### 5. Regression Testing
+
+- Test cases **60 → 79** (new cases for multi-label `.local` rejection, Host/Origin consistency, token expiry and IP binding, upstream path traversal)
+- Five-tier quality and six-tier play mode were verified round-trip in practice (select → persist → reload → still in effect)
+- The sidebar was verified item by item at three viewports: 1280×800 (expand / collapse / memory after reload / nav highlight), 390×844 (must be hidden), and 844×390 phone landscape (must be hidden)
+
+---
+
 ## 1.2.2 — Fifth Version
 
 ### 1. Rectification According to the Code Review Report from Hy4 Flash (Full Coverage of 32 Items)

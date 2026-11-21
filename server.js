@@ -6,7 +6,7 @@
  * 2. POST /ncm/<cmd>  —— 真·网易云代理：Node 侧做 weapi 加密 + 带登录 cookie，
  *    和 APK 里 Java 的 NeteaseClient 是同一套协议（见 app/js/netease.js）
  *    鉴权：同源 + X-Ripple-Token，另按 IP 做令牌桶限流
- * 3. /ripple-token.js —— 页面加载时下发一次性短期令牌（见 settlePageNonce）
+ * 3. /ripple-token.js —— 页面加载时下发短期令牌（签发走 issueToken + 浏览器信号判定）
  *
  * 用法：node server.js [PORT] [--data-dir <目录>]
  * 手机与电脑同一 Wi-Fi 时，用打印出来的局域网地址访问即可。
@@ -137,8 +137,12 @@ function weapiForm(obj) {
  *
  * 现在改成「页面加载时签发的短期令牌」：
  *  · 令牌 = 16 字节随机数，默认 30 分钟 TTL，并且绑定签发时的客户端 IP；
- *  · 每次页面请求 /ripple-token.js 就轮换一次：新令牌入列，只保留 2 个旧令牌
- *    当灰度窗口（正在飞的在途请求不至于立刻 401），更早的立即失效；
+ *  · 每次页面请求 /ripple-token.js 就轮换一次：新令牌入列，只保留 TOKEN_KEEP_PREV
+ *    个旧令牌当灰度窗口（正在飞的在途请求不至于立刻 401），更早的立即失效；
+ *    窗口从 2 提到 5 是 S-02 的整改：令牌表是**全局**的，两台以上局域网设备
+ *    先后刷新页面时，3 个槽位不够用 —— 第三台一加载，第一台正在听的令牌就被
+ *    挤出窗口，成片 401。5 个旧令牌 = 最多约 6 台设备交替刷新还能共存
+ *    （见 SECURITY.md「访问令牌」一节的多设备上限），TTL 不变，安全窗口没被拉长；
  *  · 令牌表落在 .ripple-token（0600，JSON），服务重启后已打开的页面还能继续用；
  *  · 签发端保留 Host 白名单 + Sec-Fetch-Site，并追加
  *    「Sec-Fetch-Mode 或 Origin/Referer 必须是本站」这一条（见 browserSignalOk）。
@@ -146,6 +150,8 @@ function weapiForm(obj) {
  *    偷偷 fetch 你的令牌会被挡。但它拦不住同机上能执行程序的伪造 ——
  *    实测同时带头 `Sec-Fetch-Site: same-origin` + `Sec-Fetch-Mode: no-cors`
  *    就能签出令牌。真正的约束是 TTL + IP 绑定 + 轮换（见 SECURITY.md 的威胁模型）。
+ *  · 只接受 GET：签发即轮换（会挤掉别人的槽位），HEAD/POST 签发纯属白耗窗口，
+ *    预取/预渲染/杂散请求都可能踩到（S-02）。
  *
  * 前端协议保持不变：仍然请求 /ripple-token.js，仍然读 window.RIPPLE_TOKEN。
  */
@@ -165,7 +171,17 @@ const TOKEN_TTL_MS = (() => {
   if (!Number.isFinite(raw) || raw <= 0) return 30 * 60 * 1000;
   return Math.min(Math.max(raw, 10 * 1000), 24 * 60 * 60 * 1000);
 })();
-const TOKEN_KEEP_PREV = 2;          // 轮换时保留的旧令牌个数
+/*
+ * 轮换时保留的旧令牌个数。
+ *
+ * S-02：这里曾经是 2（全局 3 槽）。令牌表是**全局**的，不分设备 ——
+ * 三台设备先后加载页面，第一台的令牌就被挤出去了，表现为「谁刷新谁好使、别人全 401」，
+ * 30 分钟 TTL 根本来不及用。提到 5 之后，最多约 6 个「设备 + 页面」可以交替
+ * 刷新而互不挤兑；再多的设备就该走「令牌按 IP 分桶」那种改造了，本轮不做。
+ * 注意：加长的是**数量**不是**时间** —— 每个令牌的 exp 仍然由 TOKEN_TTL_MS 决定，
+ * 安全窗口一点没变宽，只是同时能容纳更多在用的设备。
+ */
+const TOKEN_KEEP_PREV = 5;
 const TOKEN_ISSUE_PER_MIN = 30;     // 每个 IP 每分钟最多签发多少个（防刷爆轮换窗口）
 
 /** 当前有效令牌：新的在前，每项 { t, ip, exp } */
@@ -918,6 +934,12 @@ function handleRequest(req, res) {
       return res.end(JSON.stringify({
         code: 401,
         msg: 'missing or expired X-Ripple-Token',
+        /*
+         * S-03：这句话是前端「唯一可行动作」的权威口径 —— 失败原因可能是令牌过期、
+         * 被别的设备挤出轮换窗口、或 Service Worker 回落的旧脚本，
+         * 三种都只有「刷新页面重新签发」这一个解法。改动时务必同步前端
+         * app/js/netease.js 里 401 的提示文案，别让两边说法打架。
+         */
         hint: '令牌按来源 IP 绑定且有有效期，刷新页面即可重新签发',
       }));
     }
@@ -993,15 +1015,29 @@ function handleRequest(req, res) {
   /*
    * R-13：页面加载时签发一份**新的**短期令牌（30 分钟、绑定来源 IP、每次加载轮换）。
    * 协议不变：前端仍然请求 /ripple-token.js，仍然只读 window.RIPPLE_TOKEN。
-   * 旧令牌保留 2 个在灰度窗口内，正在飞的在途请求不会立刻 401。
+   * 旧令牌保留 TOKEN_KEEP_PREV 个在灰度窗口内，正在飞的在途请求不会立刻 401。
    */
   if (u.pathname === '/ripple-token.js') {
+    /*
+     * S-02：签发即轮换 —— 一次调用就会挤掉窗口里最旧的那一份。
+     * 因此只认 GET：浏览器预取/预渲染、某些代理的健康探测会发 HEAD，
+     * 一个不该动状态的请求凭空消耗别人的槽位不划算。405 而不是 404，
+     * 这样排查的人一眼能看出是方法不对。
+     */
+    if (req.method !== 'GET') {
+      res.writeHead(405, {
+        'Allow': 'GET',
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      return res.end('method not allowed: use GET');
+    }
     if (!tokenEndpointAllowed(req)) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
       /* 别在 403 文案里承诺「同机一定拿不到」—— 伪造请求头可以过这一层（S-02） */
       return res.end('forbidden: token is only served to browser requests from this page');
     }
-    /* 轮换窗口只有 3 个槽位，不对签发做限流的话别人能把它一直刷掉 */
+    /* 轮换窗口只有 TOKEN_KEEP_PREV+1 个槽位，不对签发做限流的话别人能把它一直刷掉 */
     const waitS = issueTokenLimited(req);
     if (waitS > 0) {
       res.writeHead(429, {
@@ -1040,9 +1076,14 @@ server.on('error', (e) => {
 });
 
 /*
- * 兜底：只打印，不退出。单个请求的畸形输入已经在 handleRequest 里接住了，
- * 走到这里通常是没人 await 的偶发异常；让服务继续活着比杀进程对用户更友好。
- * 端口非法这一类「启动参数错」的问题在加载阶段就显式 exit(1)，不靠这里兜。
+ * 兜底：只打印，不退出。
+ *
+ * 真实边界要说清（U-04）：Node 的 uncaughtException 拿到的是**注册点之后**
+ * 逃出事件循环调用栈的一切同步异常 —— 不只是「没人 await 的偶发异常」，
+ * 还包括某个请求处理函数自己抛出来、又没被 try-catch 兜住的那种。
+ * 后者本该逐个请求 500，现在却会被这里吞成一条日志、那个请求永远不返回
+ * （浏览器侧表现为超时）。所以正常路径的 try-catch 不能省，这里只是最后一道网。
+ * 端口非法这类「启动参数错」在加载阶段就显式 exit(1)，不靠这里兜。
  */
 process.on('uncaughtException', (e) => {
   console.error('[ripple] uncaught:', e && (e.stack || e.message || e));

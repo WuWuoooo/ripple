@@ -22,13 +22,33 @@ import java.util.concurrent.atomic.AtomicInteger;
  *  网页只发命令名和参数，不再需要自建代理（老接口 /api/search/get 明文那套已弃用）。
  *
  *  其余保留：notify（低优先级静默通知，不打断播放）、
- *  login / loginClose（内嵌官方登录页）。
+ *  login / loginClose / loginFinish（内嵌官方登录页）、
+ *  mediaState / mediaProgress / setPlaying（通知栏与计时器联动）、
+ *  日志与状态栏歌词那一组。
  *
- *  已经删除的桥方法（前端零调用，删掉等于直接砍掉攻击面）：
+ *  == 删除口径（J-07）==
+ *  判定标准只有一条：**前端零调用、Java 侧也没有内部调用** → 纯暴露面，删。
+ *  每个 @JavascriptInterface 方法都是「页面一旦被注入就能白嫖的 API」，
+ *  留着不用的等于白送攻击面（`logout` 甚至能静默登出用户）。
+ *
+ *  已删除的桥方法：
  *    · httpGet / httpGetAsync —— 通用 GET，虽然限了域名，但任意页面脚本都能借它
- *      以用户身份去请求网易云；而前端从来没用过（全项目 grep 零命中）。
+ *      以用户身份去请求网易云；前端零调用。
  *    · exitApp  —— 网页可直接退出 App。
- *    · platform  —— 常量，页面自己就能判断，留着只是多一个暴露面。
+ *    · platform  —— 常量，页面自己就能判断。
+ *    · loggedIn —— 前端用的是 `Netease.loggedIn` 这个**属性**（netease.js 按 _profile
+ *      自己判定），从不走桥；留着等于多一个「探登录态」的口子。
+ *    · logout   —— 前端登出走的是 `netease('logout')` 命令通道（NeteaseClient 会先
+ *      让服务端注销会话再清 cookie）；桥上的这个只清本地 cookie，语义还不完整。
+ *    · mediaStop —— 撤通知的收尾由 MainActivity.onDestroy 兜住（前端从不调它，
+ *      这是当初 E-06 那条「服务被 FGS 白养」的成因之一）。
+ *    · lockLyricOverlay —— 浮层锁定状态由 showLyricOverlay 一次带下去，前端没有
+ *      「运行中改锁定」的需求，MainActivity 侧也无内部调用方。
+ *
+ *  == 保留但前端也暂时零调用（不是漏删，理由在此）==
+ *    · loginFinish —— 见其方法注释：B-2 承诺的「我已登录」手动重试入口，
+ *      前端按钮还没接。删掉等于把「登录被限流时用户唯一能自救的动作」一起删了，
+ *      所以保留并把契约写清楚，等前端补按钮。
  */
 public class HttpBridge {
 
@@ -125,13 +145,6 @@ public class HttpBridge {
         }
     }
 
-    /** 当前是否已登录（有 MUSIC_U） */
-    @JavascriptInterface
-    public boolean loggedIn() {
-        return ncm.isLoggedIn();
-    }
-
-
     /**
      * 打开官方登录页；登录成功后回调 cbId，payload 是 status 接口的返回
      * @param mode "phone" = 手机号/短信登录，"qr" = 扫码登录
@@ -146,14 +159,29 @@ public class HttpBridge {
         act.closeLoginFromWeb();
     }
 
+    /**
+     * 用户手动点「我已登录」→ 立刻放弃冷却、重新校验当前 cookie（J-06）。
+     *
+     * 保留理由：登录被网易云限流时，自动轮询的冷却会指数放宽到 30 秒封顶，
+     * 用户看不出「其实只是在等」，会以为卡死。这个入口让用户能主动推一把。
+     *
+     * 现状要写清（审查 1.2.2 的 J-06 就是骂这里「注释承诺了按钮，前端压根没有」）：
+     * **前端目前没有任何按钮调用它**（全目录 grep `loginFinish` 零命中）。
+     * 要么前端在登录浮层补一个「我已登录」按钮，要么这条桥方法应连同
+     * MainActivity.finishLoginFromWeb 一起删 —— 二选一，别留半截。
+     *
+     * 契约（前端补按钮时照这个接）：
+     *   · 前端：`RippleNative.loginFinish(cbId)`
+     *   · 时机：登录浮层还开着、用户刚在手机/网页上完成扫码或短信验证时手动点按；
+     *   · 回调：校验成功 → `window.__rippleNativeResult(cbId, <status 接口的 JSON>)`
+     *     然后登录层自动关闭；校验失败 → **没有回调**（Java 侧保持登录层开着，
+     *     用户可以再点一次，冷却已清零所以会立即重试）。
+     *   · cbId：要跟 `RippleNative.login(mode, cbId)` 用同一套 `__rippleNativeResult`
+     *     pending 表；传空串则回落到打开登录页时那个 pendingLoginCb。
+     */
     @JavascriptInterface
     public void loginFinish(String cbId) {
         act.finishLoginFromWeb(cbId);
-    }
-
-    @JavascriptInterface
-    public void logout() {
-        ncm.clearCookie();
     }
 
     /* ================= 通用 ================= */
@@ -394,18 +422,6 @@ public class HttpBridge {
         }
     }
 
-    /**
-     * 停止播放并撤掉通知（用户主动暂停到底 / 关闭 App 时）。
-     * 幂等：服务没起 / 已经停止时重复调用什么都不会发生。
-     */
-    @JavascriptInterface
-    public void mediaStop() {
-        try {
-            act.stopMediaNotification();
-        } catch (Throwable ignored) {
-        }
-    }
-
     /* ---------- 状态栏歌词浮层 ---------- */
 
     @JavascriptInterface
@@ -440,11 +456,6 @@ public class HttpBridge {
     @JavascriptInterface
     public void hideLyricOverlay() {
         try { act.hideLyricOverlay(); } catch (Throwable ignored) {}
-    }
-
-    @JavascriptInterface
-    public void lockLyricOverlay(boolean locked) {
-        try { act.lockLyricOverlay(locked); } catch (Throwable ignored) {}
     }
 
     /**

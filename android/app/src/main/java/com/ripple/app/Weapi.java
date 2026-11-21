@@ -66,7 +66,17 @@ final class Weapi {
         BigInteger m = new BigInteger(1, block);
         BigInteger c = m.modPow(EXPONENT, MODULUS);
         byte[] raw = c.toByteArray();
-        // 去掉 BigInteger 可能带的前导 0，再左补到 128 字节
+        /*
+         * 去掉 BigInteger 可能带的前导 0，再左补到 128 字节。
+         *
+         * toByteArray() 的符号位规则有两种情况（两者数学结果一致，都不影响 RSA）：
+         *   ① 数值高位为 1 → 头前多补一个 0x00，总长 129 字节；
+         *      这时 raw.length > MOD_BYTES && raw[0] == 0，走 off 分支砍掉它。
+         *   ② 恰好 128 字节但最高位为 0 → raw[0] 也是 0x00，但长度没超；
+         *      这种**不做裁剪**，原样右对齐拷进 128 字节的 out。
+         *      之所以不改：密文块左侧本来就要补 0，先砍 0 再补 0 与直接原样拷
+         *      得到的 128 字节完全一样（只是多一次拷贝），刻意保留简单路径。
+         */
         int off = (raw.length > MOD_BYTES && raw[0] == 0) ? raw.length - MOD_BYTES : 0;
         int len = raw.length - off;
         byte[] out = new byte[MOD_BYTES];

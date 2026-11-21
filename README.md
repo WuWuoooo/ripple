@@ -187,7 +187,7 @@ tests/                  ← Node 内置测试（bash tests/run.sh）：LRC 解�
 ## 参与贡献
 
 **编码**：Deepseek V4.1 Flash 1017  
-**主要审查**：MiniMax M3.1 Flash、Hy4 Flash
+**主要审查**：MiniMax M3.1 Flash、Hy4 Flash、GLM-5.3 Flash
 
 ---
 

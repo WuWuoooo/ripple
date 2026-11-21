@@ -172,8 +172,8 @@ Run tests: `bash tests/run.sh` (Node built-in test runner, no `npm install` requ
 
 ## Contributors
 
-**Coding:** Deepseek V4.1 Flash 1017
-**Main review:** MiniMax M3.1 Flash, Hy4 Flash
+**Coding:** Deepseek V4.1 Flash 1017  
+**Main review:** MiniMax M3.1 Flash, Hy4 Flash, GLM-5.3 Flash
 
 ---
 

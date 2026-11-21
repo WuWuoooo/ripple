@@ -127,9 +127,20 @@
     },
 
     _pickEl(track) {
-      if (track && track.source === 'online') return this.elA;
-      // B-4：跨域直链走不带 crossOrigin 的 elC
+      /*
+       * 判定顺序很关键：remoteUrl（跨域直链）必须**先于** source==='online'。
+       *
+       * 「从链接添加」的曲目是用户自己加进来的本地曲目（source:'local'），
+       * 音频在第三方直链上、不返回 CORS 头，所以首播时走 elC（不带 crossOrigin）。
+       * 以前这条判定排在 source==='online' 之后，一旦某条记录被还原成
+       * source:'online'（历史上的 restoreLocal 就是这么写的），首发走 elC、
+       * 重启恢复后走 elA —— 同一首歌的播放元素路由自相矛盾，
+       * 第三方直链不返 CORS 头时 elA 会静音或判音源失效。
+       * 现在无论 source 是什么，只要带 remoteUrl 就一定走 elC，
+       * 保证「首次播放」和「重启恢复」走同一个元素。
+       */
       if (track && (track.remoteUrl || track.crossOrigin === false)) return this.elC;
+      if (track && track.source === 'online') return this.elA;
       return this.elB;
     },
 

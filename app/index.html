@@ -157,6 +157,54 @@
 <div class="grain"></div>
 
 <div class="app">
+  <!--
+    左侧导航栏：只在「横屏 / 桌面」这类宽屏档位出现，手机上仍然用底部胶囊。
+    两种形态共用同一份 DOM，靠 <html data-rail="full|mini"> 切换展开 / 收起，
+    宽度由 --rail-w 统一驱动（.app 的 padding-left 也读它，两者永远同步）。
+
+    为什么收起态还要留着：宽屏上把它整个藏起来会让内容区左右跳一大截，
+    用户找不回导航；收成图标条既省了横向空间，又保留了「点一下就回来」的入口。
+  -->
+  <nav class="rail" id="rail" aria-label="主导航">
+    <!--
+      收起按钮单独占一行、靠右放，而不是挤在品牌名旁边。
+      挤在一行里时，图标(30) + 品牌名(约 70) + 按钮(28) + 三处间距
+      在 130px 的栏宽里根本放不下，品牌名会被截成「Ripp」。
+      参考主流桌面播放器也是这么排的：开关在上、标识在下、导航居中、账号在底。
+    -->
+    <div class="rail-foldrow">
+      <button type="button" class="rail-fold" id="railFold" aria-label="收起导航" aria-expanded="true">
+        <svg><use href="#i-chev-right"/></svg>
+      </button>
+    </div>
+
+    <div class="rail-brand">
+      <span class="rail-logo"><svg><use href="#i-eq"/></svg></span>
+      <b>Ripple<span>涟漪</span></b>
+    </div>
+
+    <div class="rail-nav">
+      <a href="#" data-nav="home" class="on"><svg><use href="#i-home"/></svg><em>发现</em></a>
+      <a href="#" data-nav="library"><svg><use href="#i-lib"/></svg><em>曲库</em></a>
+      <a href="#" data-nav="search"><svg><use href="#i-search"/></svg><em>搜索</em></a>
+      <a href="#" data-nav="settings"><svg><use href="#i-settings"/></svg><em>我的</em></a>
+    </div>
+
+    <!--
+      底部账号卡：与「我的」页顶部的账号卡是同一个状态源（Netease.profile），
+      这里只做摘要 + 快捷入口，登录 / 退出仍然走那边的按钮，不重复实现一套。
+    -->
+    <div class="rail-foot">
+      <button type="button" class="rail-acct" id="railAcct">
+        <span class="ava"><img id="railAva" alt="" hidden></span>
+        <span class="who">
+          <b id="railWho">未登录</b>
+          <i id="railSub">同步收藏</i>
+        </span>
+      </button>
+    </div>
+  </nav>
+
   <header class="topbar">
     <div class="hello">
       <small id="helloDate">—</small>
@@ -214,8 +262,13 @@
 
     <!-- ============ 曲库 ============ -->
     <section class="page" data-page="library">
-      <div class="segline" id="segline">
-        <b class="on" data-seg="songs">歌曲</b><b data-seg="albums">专辑</b><b data-seg="artists">艺人</b><b data-seg="downloads">下载</b>
+      <!--
+        分组切换：补上 role="tablist"/"tab" 与 aria-selected。
+        原来选中态只编码在 CSS 类 .on 里，读屏完全感知不到当前在哪个分组；
+        <b> 天生不可聚焦，键盘用户也进不来 —— 这里补 tabindex 与方向键处理（见 app.js）。
+      -->
+      <div class="segline" id="segline" role="tablist" aria-label="曲库分组">
+        <b class="on" data-seg="songs" role="tab" tabindex="0" aria-selected="true">歌曲</b><b data-seg="albums" role="tab" tabindex="-1" aria-selected="false">专辑</b><b data-seg="artists" role="tab" tabindex="-1" aria-selected="false">艺人</b><b data-seg="downloads" role="tab" tabindex="-1" aria-selected="false">下载</b>
       </div>
       <div class="chiprow" id="libChips">
         <button class="chip on" data-filter="all">全部</button>
@@ -316,6 +369,21 @@
         </div>
       </div>
 
+      <!--
+        设置页大屏两栏：左栏放「界面 / 歌词 / 网易云 / 关于」，右栏放「播放 / 通知与后台 / 存储」。
+        为什么用两个列容器而不是 CSS grid：
+          grid 按行对齐，同一行左右必须等高。而各分组的行数差别很大
+          （「播放」8 行 vs 「界面」6 行），矮的那一侧下方会空出一大块 ——
+          加 align-items:start 只让格子不拉伸，空位依然占着，
+          表现就是「两个设置分区之间莫名隔了一段」。
+        两个独立列容器里，各自按内容高度自然堆叠，不存在任何对齐约束。
+        手机上（窄屏）列容器退化为 block，顺序变成 DOM 顺序 ——
+        所以这里把常用组按「界面→播放→歌词→通知→网易云→存储→关于」
+        重新分配，保证手机单栏时阅读顺序依然合理。
+        左栏：界面、歌词、网易云；右栏：播放、通知与后台、存储；关于横跨到底。
+      -->
+      <div class="set-cols">
+        <div class="set-col">
       <div class="set-group">
         <div class="lbl">界面</div>
         <div class="set-card glass">
@@ -363,15 +431,87 @@
           -->
         </div>
       </div>
-
+      <div class="set-group">
+        <div class="lbl">歌词</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>显示歌词</b><span>播放页底部歌词面板</span></div>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="showLyric" aria-label="显示歌词"></button>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>翻译</b><span>有译文时显示第二行</span></div>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="showTrans" aria-label="显示歌词翻译"></button>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>歌词字号</b><span id="lyricSizeHint">标准</span></div>
+            <div class="sld"><input type="range" min="11" max="19" step="1" data-set="lyricSize" aria-label="歌词字号（像素）"></div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>歌词偏移</b><span id="lyricOffsetHint">0.0s</span></div>
+            <div class="sld"><input type="range" min="-2" max="2" step="0.1" data-set="lyricOffset" aria-label="歌词偏移（秒）"></div>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
+            <div class="tx"><b>状态栏歌词</b><span id="sbHint">关闭</span></div>
+            <button type="button" class="sw" role="switch" aria-checked="false" data-set="sbLyric" aria-label="状态栏歌词"></button>
+          </div>
+          <div class="set-row" id="rowSbTune">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>状态栏歌词样式</b><span>颜色 / 字号 / 位置 / 锁定</span></div>
+            <div class="val" id="sbLockVal">已锁定 ›</div>
+          </div>
+        </div>
+      </div>
+      <div class="set-group">
+        <div class="lbl">网易云</div>
+        <div class="set-card glass">
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-link"/></svg></div>
+            <div class="tx"><b>接口通道</b><span id="apiHint">检测中…</span></div>
+            <div class="val" id="apiVal">—</div>
+          </div>
+          <div class="set-row" id="rowApiBase">
+            <div class="ic"><svg><use href="#i-link"/></svg></div>
+            <div class="tx"><b>接口地址</b><span id="apiBaseHint">留空 = 同源 / 原生通道</span></div>
+            <div class="val" id="apiBaseVal">设置 ›</div>
+          </div>
+          <div class="set-row" id="rowApiTest">
+            <div class="ic"><svg><use href="#i-cloud"/></svg></div>
+            <div class="tx"><b>测试连接</b><span>搜索一次「周杰伦」看返回耗时</span></div>
+            <div class="val">测试 ›</div>
+          </div>
+          <div class="set-row" id="rowRefreshLike">
+            <div class="ic"><svg><use href="#i-heart"/></svg></div>
+            <div class="tx"><b>同步「我喜欢」</b><span>把网易云收藏同步到本机列表</span></div>
+            <div class="val">同步 ›</div>
+          </div>
+          <div class="set-row" id="rowLogout" hidden>
+            <div class="ic"><svg><use href="#i-trash"/></svg></div>
+            <div class="tx"><b>退出网易云账号</b><span>只清本地登录态，不改动账号</span></div>
+            <div class="val">退出 ›</div>
+          </div>
+        </div>
+      </div>
+        </div>
+        <div class="set-col">
       <div class="set-group">
         <div class="lbl">播放</div>
         <div class="set-card glass">
           <div class="set-row">
             <div class="ic"><svg><use href="#i-volume"/></svg></div>
             <div class="tx"><b>音质偏好</b><span>取不到就自动往下降一档</span></div>
-            <div class="segmini" id="qualitySeg">
-              <button data-q="standard">标准</button><button data-q="exhigh">极高</button><button data-q="lossless">无损</button><button data-q="hires">Hi-Res</button>
+            <!--
+              音质按钮必须与 netease.js 的 LEVELS 五档、store.js 的 ENUMS.quality 五档
+              完全一致。以前这里是 4 个按钮（缺 higher、含 hires），而白名单反过来
+              （含 higher、缺 hires），实现是 5 档 —— 三份名单各不相同，后果是
+              选 Hi-Res 重启回落、且 higher 没有任何入口。三处现在统一为 5 档。
+            -->
+            <div class="segmini" id="qualitySeg" role="radiogroup" aria-label="音质偏好">
+              <button type="button" data-q="standard" role="radio" aria-checked="false">标准</button><button type="button" data-q="higher" role="radio" aria-checked="false">较高</button><button type="button" data-q="exhigh" role="radio" aria-checked="false">极高</button><button type="button" data-q="lossless" role="radio" aria-checked="false">无损</button><button type="button" data-q="hires" role="radio" aria-checked="false">Hi-Res</button>
             </div>
           </div>
           <div class="set-row">
@@ -413,43 +553,6 @@
           </div>
         </div>
       </div>
-
-      <div class="set-group">
-        <div class="lbl">歌词</div>
-        <div class="set-card glass">
-          <div class="set-row">
-            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
-            <div class="tx"><b>显示歌词</b><span>播放页底部歌词面板</span></div>
-            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="showLyric" aria-label="显示歌词"></button>
-          </div>
-          <div class="set-row">
-            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
-            <div class="tx"><b>翻译</b><span>有译文时显示第二行</span></div>
-            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="showTrans" aria-label="显示歌词翻译"></button>
-          </div>
-          <div class="set-row">
-            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
-            <div class="tx"><b>歌词字号</b><span id="lyricSizeHint">标准</span></div>
-            <div class="sld"><input type="range" min="11" max="19" step="1" data-set="lyricSize" aria-label="歌词字号（像素）"></div>
-          </div>
-          <div class="set-row">
-            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
-            <div class="tx"><b>歌词偏移</b><span id="lyricOffsetHint">0.0s</span></div>
-            <div class="sld"><input type="range" min="-2" max="2" step="0.1" data-set="lyricOffset" aria-label="歌词偏移（秒）"></div>
-          </div>
-          <div class="set-row">
-            <div class="ic"><svg><use href="#i-lyric"/></svg></div>
-            <div class="tx"><b>状态栏歌词</b><span id="sbHint">关闭</span></div>
-            <button type="button" class="sw" role="switch" aria-checked="false" data-set="sbLyric" aria-label="状态栏歌词"></button>
-          </div>
-          <div class="set-row" id="rowSbTune">
-            <div class="ic"><svg><use href="#i-eq"/></svg></div>
-            <div class="tx"><b>状态栏歌词样式</b><span>颜色 / 字号 / 位置 / 锁定</span></div>
-            <div class="val" id="sbLockVal">已锁定 ›</div>
-          </div>
-        </div>
-      </div>
-
       <div class="set-group">
         <div class="lbl">通知与后台</div>
         <div class="set-card glass">
@@ -480,38 +583,6 @@
           </div>
         </div>
       </div>
-
-      <div class="set-group">
-        <div class="lbl">网易云</div>
-        <div class="set-card glass">
-          <div class="set-row">
-            <div class="ic"><svg><use href="#i-link"/></svg></div>
-            <div class="tx"><b>接口通道</b><span id="apiHint">检测中…</span></div>
-            <div class="val" id="apiVal">—</div>
-          </div>
-          <div class="set-row" id="rowApiBase">
-            <div class="ic"><svg><use href="#i-link"/></svg></div>
-            <div class="tx"><b>接口地址</b><span id="apiBaseHint">留空 = 同源 / 原生通道</span></div>
-            <div class="val" id="apiBaseVal">设置 ›</div>
-          </div>
-          <div class="set-row" id="rowApiTest">
-            <div class="ic"><svg><use href="#i-cloud"/></svg></div>
-            <div class="tx"><b>测试连接</b><span>搜索一次「周杰伦」看返回耗时</span></div>
-            <div class="val">测试 ›</div>
-          </div>
-          <div class="set-row" id="rowRefreshLike">
-            <div class="ic"><svg><use href="#i-heart"/></svg></div>
-            <div class="tx"><b>同步「我喜欢」</b><span>把网易云收藏同步到本机列表</span></div>
-            <div class="val">同步 ›</div>
-          </div>
-          <div class="set-row" id="rowLogout" hidden>
-            <div class="ic"><svg><use href="#i-trash"/></svg></div>
-            <div class="tx"><b>退出网易云账号</b><span>只清本地登录态，不改动账号</span></div>
-            <div class="val">退出 ›</div>
-          </div>
-        </div>
-      </div>
-
       <div class="set-group">
         <div class="lbl">存储</div>
         <div class="set-card glass">
@@ -530,6 +601,8 @@
             <div class="tx"><b>恢复默认设置</b><span>布局、主题、播放选项全部重置</span></div>
             <div class="val">重置 ›</div>
           </div>
+        </div>
+      </div>
         </div>
       </div>
 
@@ -571,8 +644,9 @@
     </div>
   </div>
 
-  <nav class="tabbar" id="tabbar">
-    <a href="#" data-nav="home" class="on"><svg><use href="#i-home"/></svg>发现</a>
+  <!-- 底部胶囊：与左侧导航栏是同一套导航的两种形态，aria-current 由 go() 同步 -->
+  <nav class="tabbar" id="tabbar" aria-label="主导航">
+    <a href="#" data-nav="home" class="on" aria-current="page"><svg><use href="#i-home"/></svg>发现</a>
     <a href="#" data-nav="library"><svg><use href="#i-lib"/></svg>曲库</a>
     <a href="#" data-nav="search"><svg><use href="#i-search"/></svg>搜索</a>
     <a href="#" data-nav="settings"><svg><use href="#i-settings"/></svg>我的</a>

@@ -44,6 +44,15 @@ These are here to give you peace of mind and to serve as a baseline for contribu
 - **Tokens are short-lived, rotating, and bound to the source IP**: Tokens are issued by `/ripple-token.js` on every page load,
   expire after 30 minutes by default, with a maximum of 30 issued per IP per minute, and only recognize the source IP at the time of issuance.
   So even if a token leaks, the usable window is very short.
+  Keeping the TTL from being shortened further is intentional: the frontend does not auto-renew on a 401, and this is a player that stays open for long stretches —
+  a TTL shorter than the actual usage time would produce a wave of 401s. Shortening the TTL also cannot stop an attacker on the same machine (they can just issue another).
+- **Multi-device coexistence limit is about 6 "devices + pages"**: the token table is global, and every page load evicts the oldest entry in the window;
+  the server keeps "the current token + 5 previous ones" (`TOKEN_KEEP_PREV = 5`).
+  So with up to about 6 devices/tabs refreshing alternately, the one opened first will not be squeezed out into a 401;
+  beyond that you get "whoever refreshes works, everyone else gets 401" — a known limit, not a vulnerability.
+  In that case either close unused tabs or give Ripple its own dedicated device.
+  Note that what was increased is the **count**, not the **time**: each token's expiry is still governed by the TTL, so the security window is not widened.
+  The issuing endpoint only accepts `GET` (issuing rotates the window, so HEAD/POST should not consume it).
 - **Cross-site requests initiated by browsers are rejected**: `/ripple-token.js` validates the Host whitelist, `Sec-Fetch-Site`,
   `Sec-Fetch-Mode` / Origin / Referer, so requests initiated from other sites in a browser cannot obtain a token.
   **But this is not "all headless requests are 403"** — these request headers can be forged by clients; in practice,
@@ -71,7 +80,11 @@ These are here to give you peace of mind and to serve as a baseline for contribu
   - Please **install only from this repository's Releases**, and do not install APKs with the same package name from other sources;
   - If you distribute it yourself, you can switch to your own release keystore, but be aware that old users must uninstall and reinstall.
   - **It cannot be listed on app stores**: certificates with public passwords are not accepted by stores.
-- **`usesCleartextTraffic="true"`**: Allows http cleartext because some users' private proxies use http. In production, it is recommended to change this to https.
+- **Cleartext (http) is denied by default; only loopback gets a debugging exception**: the manifest no longer declares `usesCleartextTraffic="true"`;
+  it uses `network_security_config.xml` instead — `cleartextTrafficPermitted="false"` is the global default,
+  and only `127.0.0.1` / `localhost` are allowed (for adb reverse and local proxy debugging; those are not network-reachable addresses).
+  That is stricter than the old documentation's "cleartext open across the app": all online requests are https.
+  If you configure an http private proxy at the system level, add a line for it in `network_security_config.xml`.
 - **Status bar lyrics require overlay permission**: This is an Android mechanism limitation, not an extra request by this project.
 - **`.ripple-cookie` is plaintext**: The NetEase Cloud Music login state is itself a cookie and cannot be stored encrypted.
   The server attempts `chmod 0600`, but it does not take effect on `/sdcard` (fuseblk); in practice it is `660` (see above).

@@ -66,12 +66,6 @@
     sleepUntil: 0,        // 睡眠定时的绝对结束时刻，重启后据此恢复
   };
 
-  /* ---------------- 示例曲库（已移除） ----------------
-     早期版本内置过示例歌曲，现在曲库只包含「本机导入」和网易云在线内容。
-     保留空数组是为了兼容旧代码里对 DEMO 的引用。
-     ---------------------------------------------------- */
-  const DEMO = [];
-
   /* ---------------- 设置项的坏值收敛 ----------------
    *
    * localStorage 里的 settings 是纯字符串，任何字段都可能被写坏：
@@ -108,7 +102,13 @@
   // 白名单枚举：不在这几个值里的直接回落默认
   const ENUMS = {
     theme: ['auto', 'dark', 'light'],
-    quality: ['standard', 'higher', 'exhigh', 'lossless'],
+    /*
+     * quality 以 netease.js 的 LEVELS 为准：5 档（standard/higher/exhigh/lossless/hires）。
+     * 以前白名单只有 4 档、漏了 hires —— 这是「eq 三处名单统一」整改的姊妹漏网：
+     * 播放设置面板能选到 Hi-Res 并落盘，但 coerceSettings 不认这个值，
+     * 重启后静默回落 exhigh。表现为「Hi-Res 只在当次会话有效」。
+     */
+    quality: ['standard', 'higher', 'exhigh', 'lossless', 'hires'],
     /*
      * eq 以 player.js 的 EQ_PRESETS 与均衡器面板的按钮为准。
      * 以前这里是 off/pop/rock/jazz/classical/vocal/custom —— 和实现、UI 三份名单
@@ -119,7 +119,15 @@
      */
     eq: ['off', 'pop', 'rock', 'vocal', 'bass', 'night', 'custom'],
     repeat: ['off', 'one', 'all'],
-    playMode: ['list', 'shuffle', 'heart', 'roam'],
+    /*
+     * playMode 以 app.js 的 MODES 为准：6 档 list/one/seq/rand/heart/roam。
+     * 以前白名单只有 list/shuffle/heart/roam 四档，与 MODES 相差 one/seq/rand ——
+     * 选「单曲循环 / 顺序播放 / 随机播放」时落盘的值不在白名单里，重启后被
+     * 静默回落 list；而派生出来的 shuffle/repeat 各自都在白名单内被保留下来，
+     * 于是界面显示「列表循环」、行为却还是单曲循环/随机（播放行为由
+     * player.js 的 shuffle/repeat 决定）。白名单与 UI 名单必须同步维护。
+     */
+    playMode: ['list', 'one', 'seq', 'rand', 'heart', 'roam'],
   };
   /*
    * 已废弃的枚举值 → 现行值（按设置项分组）。
@@ -146,9 +154,23 @@
       if (typeof def === 'boolean') { if (typeof v === 'boolean') out[k] = v; return; }
       /* 数组项（eqCustom / lastQueue）：必须是数组，否则回落默认 */
       if (Array.isArray(def)) {
-        if (Array.isArray(v)) out[k] = def.length && k === 'eqCustom'
-          ? v.slice(0, def.length).map((n) => (Number.isFinite(Number(n)) ? Number(n) : 0))
-          : v.filter((x) => typeof x === 'string');
+        if (Array.isArray(v)) {
+          if (def.length && k === 'eqCustom') {
+            /*
+             * eqCustom 必须补齐到 5 段：老版本/手工改过的数据可能只有 2~3 个元素，
+             * 而 player.js 的 setEQBands 是按 5 个滤波器索引取值的，越界就是
+             * undefined → 那几段静默按 0dB 下发。界面上的自定义曲线是「补齐后」
+             * 的样子，实际下发却不是 —— 用户调了没反应，还找不到原因。
+             * 只截长不补短就是漏了这一半。
+             */
+            const out5 = v.slice(0, def.length).map((n) => (Number.isFinite(Number(n)) ? Number(n) : 0));
+            while (out5.length < def.length) out5.push(0);
+            out[k] = out5;
+          } else {
+            out[k] = v.filter((x) => typeof x === 'string');
+          }
+          return;
+        }
         return;
       }
       if (ENUMS[k]) {
@@ -354,18 +376,37 @@
         tx.onabort = () => rej(tx.error || new Error('IndexedDB 清空被中止'));
       });
     },
+    /**
+     * 按主键删一条记录（restoreLocal 自清理坏条用）。
+     * 以前坏记录只能跳过：记录一直留在 IDB 里，于是每次冷启动都要重新解析、
+     * 重新告警一次，永远没有尽头；而用户侧也没有「只删坏条」的入口，
+     * 唯一能清掉它们的办法是把整个曲库清空。
+     */
+    async dbDelete(id) {
+      if (!id) return;
+      const db = await this.db();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).delete(id);
+        tx.oncomplete = () => res();
+        tx.onerror = () => rej(tx.error);
+        tx.onabort = () => rej(tx.error || new Error('IndexedDB 删除被中止'));
+      });
+    },
 
     /* ---------- 曲库 ---------- */
     /**
      * 完整曲库 = 本机导入 + 播放过的在线曲目。
      *
-     * 以前这里只返回 DEMO + 本地导入，而在线曲目只存在 onlineCache 里，
-     * 结果：曲库页的「在线」筛选永远 0 首、没有本地文件时曲库永远是空的、
+     * 早年这里还拼过一份内置的演示曲目（DEMO），示例曲库移除后它变成恒空数组，
+     * 只在 concat 时白跑一趟，现在一并删掉。
+     * 曾经的问题（保留记录，避免再犯）：这里只返回本地导入、在线曲目只存在
+     * onlineCache 里 → 曲库页的「在线」筛选永远 0 首、没有本地文件时曲库永远是空的、
      * 播放页在空曲库下打开毫无反应、队列 sheet 也是空列表。
      * 现在把在线缓存一起并进来（它们都排在本地之后，不抢本地文件的位置）。
      */
     all() {
-      const local = DEMO.concat(this.localTracks);
+      const local = this.localTracks;
       const seen = new Set(local.map((t) => t.id));
       const online = this.cached().filter((t) => !seen.has(t.id));
       return local.concat(online);
@@ -403,24 +444,39 @@
        *
        * 现在：逐条 try/catch，坏记录跳过并记日志，其余正常恢复。
        * 链接导入的记录（有 remoteUrl 或没有 blob）走另一条路单独重建。
+       *
+       * 坏记录还要**顺手删掉**：只跳过的话它会一直躺在 IDB 里，
+       * 每次冷启动都重新解析、重新告警一次，日志被同一句刷满，
+       * 而用户没有「只删坏条」的入口，只能整库清空。
        */
       try {
         const recs = await this.dbAll();
         const out = [];
-        let bad = 0;
+        const badIds = [];
         for (const r of recs) {
-          if (!r || !r.id) { bad++; continue; }
-          /* 链接导入的曲目：没有 blob，src 是远端地址，直接还原成在线曲目形态 */
+          if (!r || !r.id) { continue; }        // 连主键都没有，无法定位，只能跳过
+          /* 链接导入的曲目：没有 blob，src 是远端地址。
+             注意 source 必须保持 'local' —— 它确实是用户自己加进曲库的本地曲目，
+             只是音频在远端。以前这里写成 'online'，连锁出三个问题：
+               ① 「下载」视图要求 source==='local' && _blob，两种条件都不满足，
+                  链接导入的歌重启后从下载视图里消失；
+               ② player.js 的 _pickEl 据此走 elA（在线流元素），而首播走的是
+                  elC（跨域直链专用，不带 crossOrigin）—— 同一首歌的播放元素路由
+                  自相矛盾，第三方直链不返 CORS 头时 elA 会静音或判失败；
+               ③ 它出现在「在线」筛选里，但语义是「我的链接」。
+             */
           if (!r.blob) {
             if (r.remoteUrl && r.src) {
               out.push({
-                id: r.id, source: 'online', title: r.title || '', artist: r.artist || '',
+                id: r.id, source: 'local', title: r.title || '', artist: r.artist || '',
                 album: r.album || '', duration: r.duration || 0,
                 cover: r.cover || '', src: r.src, format: r.format || 'ONLINE',
                 sampleRate: '', size: r.size || 0, addedAt: r.addedAt || 0,
                 remoteUrl: true,
               });
-            } else { bad++; }
+            } else {
+              badIds.push(r.id);
+            }
             continue;
           }
           try {
@@ -432,15 +488,23 @@
             });
           } catch (e) {
             /* 单条坏掉不影响其它条 */
-            bad++;
+            badIds.push(r.id);
             try { if (window.Log) Log.err('STORE', e, 'restoreLocal 单条记录失败: ' + r.id); } catch (_) {}
           }
         }
         this.localTracks = out;
-        if (bad) {
+        if (badIds.length) {
           try {
-            if (window.Log) Log.info('STORE', bad + ' 条本机曲库记录无法恢复（缺少音频数据），已跳过');
+            if (window.Log) {
+              Log.info('STORE', badIds.length + ' 条本机曲库记录已损坏（缺少音频数据），已从曲库移除');
+            }
           } catch (_) {}
+          /*
+           * 逐条删，且每条都吞掉自己的失败：清理是「顺手做的事」，
+           * 删不掉（配额/事务被中止）也不能影响这一轮曲库恢复的结果 ——
+           * 下一次启动还会再试一遍。
+           */
+          await Promise.all(badIds.map((id) => this.dbDelete(id).catch(() => {})));
         }
       } catch (e) {
         /* 读库本身失败（IDB 不可用/被占用）：这才是真的没有本地曲库 */
@@ -507,16 +571,46 @@
         a.src = u;
       });
     },
+    /**
+     * 清空本机曲库。
+     *
+     * ⚠️ 以前这里对所有本地曲目无条件 revokeObjectURL —— 包括**正在播放的那一首**。
+     * 在播本地歌时点清空 → 当前音源立刻失效 → 触发 sourcefail → 自动跳歌，
+     * 用户被连打断两次（歌断了，还被跳到别的曲目），而确认框文案
+     * （「会删除本机保存的音频文件」）完全没提这件事。
+     *
+     * 现在留一个口子给「正在播的那一条」：不 revoke 它的 blob，
+     * 这样正在听的歌不会被掐断；但曲库与 imports 照常清空（清空语义不变）。
+     * 判断放在 store 这一层是为了让修复立刻生效 —— 如果要求调用方先做判断，
+     * 所有入口（设置页、以后新增的入口）都得各自记住这一步，漏一个就复发。
+     * 这里只「读」播放器的当前曲目，不反向驱动它（暂停/切歌的决定权仍在 app.js）。
+     *
+     * @returns {Promise<{revoked:string[], kept:string[]}>}
+     *   revoked：本次被 revoke 掉的曲目 id；kept：为在播曲目保留下来、未 revoke 的 id。
+     *   调用方可以据此提示「正在播放的歌已从曲库移除，播放结束后再回收音源」，
+     *   或在切歌之后自行 revoke 那一条。
+     */
     async clearLocal() {
+      /* 找出「正在播放、且音源确实是本次要 revoke 的 blob」的那一条 */
+      const cur = (g.Player && g.Player.track) || null;
+      const playingSrc = cur && cur.source === 'local'
+        && typeof cur.src === 'string' && /^blob:/i.test(cur.src) ? cur.src : '';
       await this.dbClear();
       /* 每个本地曲目的 src 都是 URL.createObjectURL(blob)，
          不 revoke 的话 blob 会一直挂在内存里（导入多张大专辑后很明显）。 */
+      const revoked = [];
+      const kept = [];
       this.localTracks.forEach((t) => {
-        try { if (t.src && /^blob:/.test(t.src)) URL.revokeObjectURL(t.src); } catch (e) {}
+        if (!t) return;
+        if (playingSrc && t.src === playingSrc) { kept.push(t.id); return; }
+        try {
+          if (t.src && /^blob:/.test(t.src)) { URL.revokeObjectURL(t.src); revoked.push(t.id); }
+        } catch (e) {}
       });
       this.localTracks = [];
       this.state.imports = [];
       this.save();
+      return { revoked, kept };
     },
 
     /* ---------- 喜欢 / 记录 ---------- */
@@ -554,6 +648,9 @@
   };
 
   g.Store = Store;
-  g.DEMO = DEMO;
+  /*
+   * 这里原本还导出过 g.DEMO（内置示例曲库）。示例曲库早已移除，
+   * DEMO 恒为空数组、全仓没有任何消费方，留着只会让人以为「里面还有演示歌」。
+   */
   g.DEFAULTS = DEFAULTS;
 })(window);

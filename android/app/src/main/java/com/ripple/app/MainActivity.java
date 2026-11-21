@@ -90,7 +90,7 @@ public class MainActivity extends Activity {
             setupWindow();
             CrashLog.step(this, "window ok");
         } catch (Throwable e) {
-            CrashLog.record(this, "window", e);
+            CrashLog.recordAsync(this, "window", e);
         }
 
         // 只在 debug 包打开：release 里开调试，连接上 DevTools 就能读 cookie 和本地状态
@@ -105,21 +105,21 @@ public class MainActivity extends Activity {
             getAssets().open("www/index.html").close();
             CrashLog.step(this, "assets/www/index.html present");
         } catch (Throwable e) {
-            CrashLog.record(this, "assets-missing", e);
+            CrashLog.recordAsync(this, "assets-missing", e);
         }
 
         try {
             netease = new NeteaseClient(this);
             CrashLog.step(this, "netease client ok");
         } catch (Throwable e) {
-            CrashLog.record(this, "netease-init", e);
+            CrashLog.recordAsync(this, "netease-init", e);
         }
 
         try {
             buildUi();
             CrashLog.step(this, "buildUi ok");
         } catch (Throwable e) {
-            CrashLog.record(this, "webview-init", e);
+            CrashLog.recordAsync(this, "webview-init", e);
             showFatal("WebView 初始化失败", e);
             return;
         }
@@ -193,7 +193,7 @@ public class MainActivity extends Activity {
                 }
                 LogBridge.add(this, "WINDOW", "edge-to-edge enabled");
             } catch (Throwable e) {
-                CrashLog.record(this, "edge-to-edge", e);
+                CrashLog.recordAsync(this, "edge-to-edge", e);
                 LogBridge.add(this, "WINDOW", "edge-to-edge failed: " + e);
             }
         }
@@ -381,7 +381,7 @@ public class MainActivity extends Activity {
         safe(() -> s.setJavaScriptCanOpenWindowsAutomatically(true));
         // 页面本身是本地 file://、在线资源全是 https，没有任何混用需求，直接禁掉明文子资源
         safe(() -> s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW));
-        // UA 里的版本号跟真实 APK 对齐（以前写死 1.1.1，和实际 1.3.x 差了好几个版本）
+        // UA 里的版本号跟真实 APK 对齐（以前写死一个固定版本号，和实际版本差了好几个版本）
         safe(() -> s.setUserAgentString(s.getUserAgentString() + " RippleApp/" + versionName()));
 
         if (!StrictModes.safeMode) {
@@ -389,7 +389,7 @@ public class MainActivity extends Activity {
                 CookieManager.getInstance().setAcceptCookie(true);
                 CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
             } catch (Throwable e) {
-                CrashLog.record(this, "cookie-init", e);
+                CrashLog.recordAsync(this, "cookie-init", e);
             }
         }
 
@@ -398,7 +398,7 @@ public class MainActivity extends Activity {
             w.setOverScrollMode(View.OVER_SCROLL_NEVER);
             w.addJavascriptInterface(new HttpBridge(this, netease), "RippleNative");
         } catch (Throwable e) {
-            CrashLog.record(this, "bridge", e);
+            CrashLog.recordAsync(this, "bridge", e);
         }
 
         // 同一份 WebViewClient / ChromeClient 给重建出来的 WebView 复用
@@ -443,7 +443,7 @@ public class MainActivity extends Activity {
                      * 正确做法（官方文档要求）：先把 View 从布局里摘掉，再 destroy，
                      * 然后把引用置空；这里再重建一个 WebView，用户不至于被迫退出。
                      */
-                    CrashLog.recordMessage(MainActivity.this, "render-gone",
+                    CrashLog.recordMessageAsync(MainActivity.this, "render-gone",
                             "WebView renderer gone, didCrash=" + (detail != null && detail.didCrash()));
                     discardWeb(view);
                     recreateWeb();
@@ -453,14 +453,14 @@ public class MainActivity extends Activity {
                 @Override
                 public void onReceivedError(WebView view, WebResourceRequest req, android.webkit.WebResourceError err) {
                     if (req != null && req.isForMainFrame()) {
-                        CrashLog.recordMessage(MainActivity.this, "page-error",
+                        CrashLog.recordMessageAsync(MainActivity.this, "page-error",
                                 "主页面加载失败: " + err.getErrorCode() + " " + err.getDescription()
                                         + " url=" + req.getUrl());
                     }
                 }
             });
         } catch (Throwable e) {
-            CrashLog.record(this, "webview-client", e);
+            CrashLog.recordAsync(this, "webview-client", e);
         }
 
         try {
@@ -516,7 +516,7 @@ public class MainActivity extends Activity {
         try {
             w.loadUrl("file:///android_asset/www/index.html");
         } catch (Throwable e) {
-            CrashLog.record(this, "load-index", e);
+            CrashLog.recordAsync(this, "load-index", e);
         }
         // 页面脚本可能晚于 insets 回调执行，补推几次
         w.postDelayed(this::measureAndPushInsets, 300);
@@ -567,7 +567,7 @@ public class MainActivity extends Activity {
             loadIndex();
             LogBridge.add(this, "UI", "WebView 已重建（渲染进程曾被杀）");
         } catch (Throwable e) {
-            CrashLog.record(this, "webview-recreate", e);
+            CrashLog.recordAsync(this, "webview-recreate", e);
             showFatal("页面渲染进程被系统回收", e);
         }
     }
@@ -665,7 +665,7 @@ public class MainActivity extends Activity {
             }
             lastBarKey = key;
         } catch (Throwable e) {
-            CrashLog.record(this, "system-bars", e);
+            CrashLog.recordAsync(this, "system-bars", e);
         }
     }
 
@@ -847,7 +847,7 @@ public class MainActivity extends Activity {
                         : "https://music.163.com/login?targetUrl=%2F");
                 startLoginPoll(cbId);
             } catch (Throwable e) {
-                CrashLog.record(this, "login-open", e);
+                CrashLog.recordAsync(this, "login-open", e);
                 closeLogin();
                 replyToWeb(cbId, "{\"code\":-1,\"msg\":\"登录页打不开\"}");
             }
@@ -986,7 +986,7 @@ public class MainActivity extends Activity {
                 payload = netease.call("status", null);
                 ok = hasProfile(payload);
             } catch (Throwable e) {
-                CrashLog.record(MainActivity.this, "login-status", e);
+                CrashLog.recordAsync(MainActivity.this, "login-status", e);
                 payload = "{\"code\":-1,\"msg\":\"登录后读取账号失败\"}";
             }
             LogBridge.add(MainActivity.this, "LOGIN", ok ? "verify ok" : "verify failed");
@@ -1272,7 +1272,7 @@ public class MainActivity extends Activity {
             startActivity(it);
             LogBridge.add(this, "LYRIC", "request overlay permission");
         } catch (Throwable e) {
-            CrashLog.record(this, "lyric-perm", e);
+            CrashLog.recordAsync(this, "lyric-perm", e);
             try {
                 Intent it = new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -1310,10 +1310,6 @@ public class MainActivity extends Activity {
 
     void hideLyricOverlay() {
         if (lyricOverlay != null) lyricOverlay.hide();
-    }
-
-    void lockLyricOverlay(boolean locked) {
-        if (lyricOverlay != null) lyricOverlay.setLocked(locked);
     }
 
     private static boolean parseBool(String v, boolean fallback) {
@@ -1362,7 +1358,7 @@ public class MainActivity extends Activity {
                     started = true;
                 } catch (Throwable e) {
                     // R-12：失败原因要留痕，否则通知永久消失且无声无息
-                    CrashLog.recordMessage(this, "media-fgs",
+                    CrashLog.recordMessageAsync(this, "media-fgs",
                             "startForegroundService 被拒: " + e);
                     LogBridge.add(this, "MEDIA", "startForegroundService failed: " + e);
                 }
@@ -1371,32 +1367,81 @@ public class MainActivity extends Activity {
                         startService(it);
                         started = true;
                     } catch (Throwable e2) {
-                        CrashLog.recordMessage(this, "media-svc",
+                        CrashLog.recordMessageAsync(this, "media-svc",
                                 "startService 也失败: " + e2);
                         LogBridge.add(this, "MEDIA", "startService failed: " + e2);
                         /*
                          * 服务起不来（省电策略 / 后台启动限制）。
-                         * 不再静默放弃：让网页知道通知栏这次没起来，
-                         * 它可以在界面上给一条「后台播放受限」的提示。
+                         *
+                         * J-03 说明：这里发的 **window.__rippleMediaUnavailable(原因)**
+                         * 以前是「Java 在调、前端根本没定义」的死通道。现在保留调用，
+                         * 由前端注册同名函数来接（形状见回调下方注释）：
+                         *   参数：1 个字符串 = 失败原因的类型名（如 "SecurityException"），
+                         *         仅用于日志/排查，界面文案不必依赖它；
+                         *   时机：startForegroundService 与 startService **双双**失败时，
+                         *         每次这样的上报都会调一次（本函数每秒可能被调一次，
+                         *         前端自己要按原因去重，别每秒弹一条 toast）；
+                         *   语义：通知栏/锁屏控制这次彻底起不来了，网页侧该提示
+                         *         「后台播放受系统限制，回到 App 内恢复」。
+                         * 前端没注册时 `window.__rippleMediaUnavailable &&` 短接，
+                         * 不会报错 —— 所以这条调用可以安全地一直留着。
                          */
                         replyToWebQuietly("window.__rippleMediaUnavailable && "
                                 + "window.__rippleMediaUnavailable('" + e2.getClass().getSimpleName() + "')");
                         return;
                     }
                 }
-                // 服务刚起时实例还是 null，稍等一拍再写状态
-                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                    PlaybackService svc = PlaybackService.get();
-                    if (svc != null) svc.update(title, artist, album, coverUrl,
-                            durationMs, positionMs, playing);
-                }, 260);
+                /*
+                 * J-02：服务刚起时 PlaybackService.get() 还是 null，而这条上报携带的是
+                 * **唯一一次**完整元数据（title/artist/album/cover）—— 后续每秒的
+                 * mediaProgress 只带进度。以前这里只等固定 260ms，服务 onCreate 稍慢
+                 * （低端机、系统忙、通知渠道首次创建）就永久丢掉标题，通知栏在整首歌
+                 * 期间都停在「Ripple 涟漪 · 未在播放」，而且没有任何自愈。
+                 *
+                 * 改成带上限的重试：50ms 起每次翻倍（50/100/200/400/800/1600ms，
+                 * 最坏累计约 3.2 秒），足以覆盖服务冷启动的常见耗时；仍拿不到就
+                 * 记一条日志放弃 —— 不做无限轮询（每秒都有新的 progress 上报，
+                 * 不会把播放本身卡住）。
+                 */
+                scheduleMediaStateRetry(title, artist, album, coverUrl,
+                        durationMs, positionMs, playing, 0);
                 return;
             }
             PlaybackService svc = PlaybackService.get();
             if (svc != null) svc.update(title, artist, album, coverUrl, durationMs, positionMs, playing);
         } catch (Throwable e) {
-            CrashLog.record(this, "media-notif", e);
+            CrashLog.recordAsync(this, "media-notif", e);
         }
+    }
+
+    /**
+     * J-02：把首条完整 mediaState 交给服务，最多重试 {@code MEDIA_STATE_MAX_TRIES} 次。
+     * 只在「刚把服务拉起来、实例还没就绪」这条路上用；服务已经在跑时直接写状态。
+     */
+    private static final int MEDIA_STATE_MAX_TRIES = 6;
+
+    private void scheduleMediaStateRetry(final String title, final String artist,
+                                         final String album, final String coverUrl,
+                                         final String durationMs, final String positionMs,
+                                         final boolean playing, final int attempt) {
+        PlaybackService svc = PlaybackService.get();
+        if (svc != null) {
+            svc.update(title, artist, album, coverUrl, durationMs, positionMs, playing);
+            return;
+        }
+        if (attempt >= MEDIA_STATE_MAX_TRIES) {
+            LogBridge.add(this, "MEDIA", "服务启动后 " + MEDIA_STATE_MAX_TRIES
+                    + " 次重试仍拿不到实例，首条元数据放弃（后续 progress 仍会驱动通知）");
+            return;
+        }
+        long delay = 50L << attempt;   // 50 / 100 / 200 / 400 / 800 / 1600
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+            try {
+                scheduleMediaStateRetry(title, artist, album, coverUrl,
+                        durationMs, positionMs, playing, attempt + 1);
+            } catch (Throwable ignored) {
+            }
+        }, delay);
     }
 
     /** 给网页推一段 JS（已经在主线程时也能安全调用） */
@@ -1418,27 +1463,6 @@ public class MainActivity extends Activity {
             } catch (Throwable e) {
                 /* 进度更新失败不打扰 */
             }
-        });
-    }
-
-    /**
-     * 停掉播放通知（幂等）。
-     *
-     * 服务可能已经不存在（系统回收过 / 从没起过），这时候 stopService 兜底，
-     * 再显式 cancel 一次通知 id —— 保证不会留下滑不掉的僵尸通知。
-     */
-    void stopMediaNotification() {
-        runOnUiThread(() -> {
-            try {
-                PlaybackService svc = PlaybackService.get();
-                if (svc != null) svc.stopAndQuit();
-            } catch (Throwable ignored) {
-            }
-            try {
-                stopService(new Intent(this, PlaybackService.class));
-            } catch (Throwable ignored) {
-            }
-            cancelPlaybackNotification();
         });
     }
 
@@ -1505,14 +1529,51 @@ public class MainActivity extends Activity {
 
     /** 网页是否正在播放音频（由 JS 通过 setPlaying 上报） */
     private volatile boolean webPlaying = false;
+    /** Activity 是否在前台（onResume / onPause 维护，供 J-09 判断要不要补 pauseTimers） */
+    private volatile boolean isForeground = false;
 
     void setWebPlaying(boolean playing) {
         webPlaying = playing;
+        /*
+         * J-09：补上一次「后台暂停」漏掉的 pauseTimers()。
+         *
+         * onPause 是按**当时**的 webPlaying 决定要不要暂停计时器的。
+         * 常见路径是：切到后台（当时在播 → 不暂停计时器，正确），
+         * 然后用户在通知栏/耳机键上按了暂停 —— 这时 Activity 已经在后台，
+         * onPause 不会再跑，于是「该暂停计时器」的时机永远不会出现，
+         * WebView 的 setInterval 在后台一直空转，正好把这段代码想省的电耗回去。
+         *
+         * 所以状态翻转就补判一次：不在前台且已停止播放 → 立刻暂停计时器。
+         * 回到前台时 onResume 会 resumeTimers()，不会把播放逻辑长期冻住。
+         *
+         * 反方向同样要处理（否则上面这一步会挖出新坑）：
+         * 后台暂停 → 计时器被 pauseTimers() 停掉 → 用户又从通知栏点了播放，
+         * 这时播放动作是 evaluateJavascript 送进来的（能执行），
+         * 但驱动「进度推进 / 播完自动下一首」的 setInterval 仍然是暂停的 ——
+         * 表现为「回到播放态但进度条不动、一首放完就没声」。
+         * 所以恢复播放时，只要还没回前台就补一次 resumeTimers()。
+         */
+        if (!playing && !isForeground) {
+            runOnUiThread(() -> {
+                try {
+                    if (web != null && !webPlaying && !isForeground) web.pauseTimers();
+                } catch (Throwable ignored) {
+                }
+            });
+        } else if (playing && !isForeground) {
+            runOnUiThread(() -> {
+                try {
+                    if (web != null && webPlaying && !isForeground) web.resumeTimers();
+                } catch (Throwable ignored) {
+                }
+            });
+        }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        isForeground = false;
         try {
             if (web != null) {
                 /*
@@ -1523,6 +1584,9 @@ public class MainActivity extends Activity {
                  *
                  * 例外：正在播放时不暂停计时器 —— 网页要靠 setInterval 驱动
                  * 「播完自动下一首」和进度保存，停了就变成一首放完就没声了。
+                 * 这个例外也带来 J-09 那个坑：如果用户是「切后台之后」才从通知栏
+                 * 暂停的，onPause 早就跑过去了，pauseTimers() 永远不会被补上，
+                 * 计时器一直空转到回前台。补的时机在 setWebPlaying()（见那里）。
                  */
                 if (!webPlaying) {
                     web.onPause();
@@ -1536,6 +1600,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        isForeground = true;
         try {
             if (web != null) {
                 web.resumeTimers();
@@ -1548,6 +1613,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        isForeground = false;
         /*
          * E-06：退出 App 必须把前台服务一起停掉。
          *
@@ -1558,6 +1624,14 @@ public class MainActivity extends Activity {
          * 顺序：先 Stop 服务（撤通知 + stopForeground），再拆 WebView。
          * stopService 是幂等的：服务没起时什么都不发生。
          * 同时清掉残留通知（服务若已被系统回收，stopService 也收不掉那条通知）。
+         *
+         * J-01 ③：这条退出路径也是「FGS 没坐实就退」的高危点 ——
+         * startForegroundService() 已经发出去、startForeground 还没成功时用户就退出，
+         * 系统记的那笔「5 秒内必须 startForeground」的账不会因为 stopService 消失。
+         * stopAndQuit()（上面那次调用）内部会先补一次 enterForeground 再收尾；
+         * 但如果服务实例已经拿不到（get() == null），就只剩下面这层兜底 ——
+         * 保留这次调用顺序：先 setSink(null) → stopService → stopAndQuit，
+         * stopAndQuit 里的补前台动作才是真正销账的那一步。
          */
         try {
             PlaybackService.setSink(null);
@@ -1602,6 +1676,22 @@ public class MainActivity extends Activity {
          */
         destroyWeb();
         webRoot = null;
+        /*
+         * C-10：正常退出时把内存里还没落盘的那段运行日志写下去。
+         *
+         * 以前只有显式 logFlush 才会写盘，于是「用户点返回退出」这条最常见的路径上，
+         * 最后若干条日志（包括这次退出的原因链）直接随进程消失 ——
+         * 用户反馈「放着放着没声了」时，日志恰好停在事故发生之前。
+         * LogBridge.flush 是**异步**的（排给它的守护线程），调用点不会拖慢退出；
+         * 它也可能早就 forceWrite 过（内容没变就跳过），重复调用是幂等的。
+         *
+         * 顺序放在这里而不是更前面：前面的服务/浮层收尾本身还会产生日志，
+         * 等它们都写完再 flush 才能一并带上。
+         */
+        try {
+            LogBridge.flush(this);
+        } catch (Throwable ignored) {
+        }
         super.onDestroy();
     }
 

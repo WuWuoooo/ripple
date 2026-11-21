@@ -20,8 +20,14 @@ const LOCAL_HOST_NAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0
  * mDNS 主机名（dshgo.local 这类）。
  * 这类名字只能由同一局域网内的设备解析到本机，与「本机网卡 IP」同一信任级别；
  * README 里就是用 http://<主机名>:8080 这种写法访问的，所以放行。
+ *
+ * 只认**单标签**：RFC 6762 的 mDNS 名就是 `<单标签>.local`，
+ * 多级名（a.b.local）不走 mDNS，而是落到普通单播 DNS —— 解析成什么取决于
+ * 解析器/转发策略，攻击者可以自己注册一个「能被受害者解析到本机」的多级名，
+ * 于是 os Host 头/Origin 全都对得上，DNS rebinding 防线换个名字域就绕回来了。
+ * 以前的 `(\.[a-z0-9-]+)*` 正是这个洞（审查 1.2.2 的 S-01）。
  */
-const MDNS_HOST_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.local$/;
+const MDNS_HOST_RE = /^[a-z0-9-]+\.local$/;
 
 /* 上游路径两道闸：拼 URL 之前的原始 path 只允许这组字符，归一化后的 pathname 还得对得上前缀 */
 const SAFE_PATH_SEG_RE = /^[a-z0-9/_-]+$/i;
@@ -70,6 +76,12 @@ function hostMatches(req, candidate, hostSet) {
   if (!candidate) return false;
   try {
     const u = new URL(candidate);
+    /*
+     * 只认 http / https。URL 构造器对 ftp://、ws:// 之类同样能解析出 host，
+     * 而浏览器根本不会在这些 scheme 上发 Origin —— 放行等于白白加宽判定面
+     * （审查 1.2.2 的 S-05）。
+     */
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
     const host = String(u.host || '').toLowerCase();
     if (!hostIsAllowed(host, hostSet)) return false;
     const reqHost = String((req && req.headers && req.headers.host) || '').toLowerCase();
@@ -112,9 +124,17 @@ function browserSignalOk(req, hostSet) {
   if (!site && !mode && !sameOriginRef) return false;
   /* 有 Sec-Fetch-Site 就必须是 same-origin（cross-site/same-site 都不行） */
   if (site && site !== 'same-origin') return false;
-  /* Sec-Fetch-Mode 的取值是浏览器定的；不在这些值里说明是伪造的杂值 */
+  /*
+   * Sec-Fetch-Mode 的取值是浏览器定的；不在这些值里说明是伪造的杂值。
+   *
+   * cors 为什么在白名单里：**同源**的 fetch() 也会发 mode: cors ——
+   * 它不是「跨域」的意思，而是「这次是个 fetch/XHR 请求」。
+   * 真正的跨域拦截靠上面的 Sec-Fetch-Site 必须是 same-origin，
+   * 所以这里的 cors 不会成为绕过口（审查 1.2.2 的 S-06 就是注释没写清这一点）。
+   * iframe 加载（mode: navigate）同理由 site 那一关约束。
+   */
   if (mode && mode !== 'navigate' && mode !== 'no-cors' && mode !== 'cors') return false;
-  /* <script src> 加载是 no-cors，地址栏直开是 navigate；两者都不看来源 */
+  /* <script src> 加载是 no-cors，fetch() 是 cors，地址栏直开是 navigate；三者都不看来源 */
   if (mode === 'no-cors' || mode === 'cors' || mode === 'navigate') return true;
   return sameOriginRef;
 }

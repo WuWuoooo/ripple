@@ -53,13 +53,37 @@ test('Host 白名单：IPv6 各种写法都放行', () => {
   assert.equal(sec.hostAllowed(req({ host: '[fe80::1]:' + PORT }), set6), true);
 });
 
-test('Host 白名单：.local（mDNS）放行，含多级子域', () => {
+test('Host 白名单：.local（mDNS）单标签放行', () => {
   const set = hostSet();
   assert.equal(sec.hostAllowed(req({ host: 'dshgo.local:' + PORT }), set), true);
   assert.equal(sec.hostAllowed(req({ host: 'dshgo.local' }), set), true);
-  assert.equal(sec.hostAllowed(req({ host: 'a-b.c1.local:' + PORT }), set), true);
+  assert.equal(sec.hostAllowed(req({ host: 'a-b.local:' + PORT }), set), true);
   // 大小写不敏感
   assert.equal(sec.hostAllowed(req({ host: 'DSHGO.LOCAL:' + PORT }), set), true);
+});
+
+test('S-01 回归：多级 .local 一律拒（修前是全后缀通配，这些全放行）', () => {
+  /*
+   * 多级名（x.y.local）按 RFC 6762 不走 mDNS，而是落到普通单播 DNS ——
+   * 解析成什么取决于解析器转发策略，等于让攻击者自选一个能被指向本机的名字，
+   * 一旦可达，Host/Origin 全对得上，DNS rebinding 防线就白设了。
+   * 修前 MDNS_HOST_RE 是 /^[a-z0-9-]+(\.[a-z0-9-]+)*\.local$/，下面每一条都返回 true。
+   */
+  const set = hostSet();
+  const bad = [
+    'x.y.attacker.local',
+    'a-b.c1.local',
+    'a.b.local',
+    'evil.local.attacker.local',
+    'x.y.z.local',
+  ];
+  bad.forEach((h) => {
+    assert.equal(sec.hostAllowed(req({ host: h }), set), false, '应当拒绝：' + h);
+    assert.equal(sec.hostAllowed(req({ host: h + ':' + PORT }), set), false, '应当拒绝带端口：' + h);
+    // hostMatches 走同一套判定，Origin 也得跟着拒
+    assert.equal(sec.hostMatches(req({ host: h + ':' + PORT }), 'http://' + h + ':' + PORT, set),
+      false, 'Origin 也应当拒绝：' + h);
+  });
 });
 
 test('Host 白名单：外部域名与畸形写法一律拒（DNS rebinding 挡在这里）', () => {
@@ -128,6 +152,25 @@ test('Origin 非法 / 缺失 / 请求缺 Host 时一律拒', () => {
   assert.equal(sec.hostMatches(req({ host: '127.0.0.1:' + PORT }), 'chrome-extension://abc/x', set), false);
   // 请求没有 Host 头时，Origin 再白也没用
   assert.equal(sec.hostMatches(req({}), 'http://127.0.0.1:' + PORT, set), false);
+});
+
+test('S-05 回归：非 http(s) scheme 的 candidate 一律拒（修前只比 host，ftp:// 也过）', () => {
+  const set = hostSet('192.168.1.7');
+  const host = '127.0.0.1:' + PORT;
+  /*
+   * 浏览器不会在 ftp:// / ws:// / file:// 上发 Origin，放行它们纯属加宽判定面。
+   * 修前 hostMatches 只取 u.host 比对，下面这些的 host 都能对上。
+   */
+  ['ftp://', 'ws://', 'wss://', 'file://', 'chrome-extension://'].forEach((scheme) => {
+    assert.equal(sec.hostMatches(req({ host: host }), scheme + host + '/x', set), false,
+      '应当拒绝 scheme：' + scheme);
+  });
+  // http / https 不受影响
+  assert.equal(sec.hostMatches(req({ host: host }), 'http://' + host, set), true);
+  assert.equal(sec.hostMatches(req({ host: host }), 'https://' + host, set), true);
+  // .local 站点同样只用 http
+  assert.equal(sec.hostMatches(req({ host: 'dshgo.local:' + PORT }),
+    'https://dshgo.local:' + PORT, set), true);
 });
 
 test('originAllowed：无 Origin 时只看 Sec-Fetch-Site（same-origin / none）', () => {
@@ -201,6 +244,27 @@ test('S-02 现状固化：Sec-Fetch 全套伪造能过这一层（安全边界�
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors',
   }), set), true);
+});
+
+test('S-06 现状固化：Sec-Fetch-Mode: cors 放行（它是同源 fetch()，不是「跨域」）', () => {
+  /*
+   * 浏览器对**同源** fetch() / XHR 也发 mode: cors —— 这个值描述的是请求种类，
+   * 不是跨域。真正的跨域拦截靠 Sec-Fetch-Site 必须是 same-origin（下面第 2 条）。
+   * 这里把语义固化成用例，避免以后有人照着缺注释的实现把 cors 删掉/加上去。
+   */
+  const set = hostSet();
+  const host = '127.0.0.1:' + PORT;
+  // 同源 fetch()：放行
+  assert.equal(sec.browserSignalOk(req({
+    host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors',
+  }), set), true);
+  // 跨站 fetch()：site 那一关就拒了，cors 本身不放水
+  assert.equal(sec.browserSignalOk(req({
+    host: host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'cors',
+  }), set), false);
+  assert.equal(sec.browserSignalOk(req({
+    host: host, 'sec-fetch-site': 'same-site', 'sec-fetch-mode': 'cors',
+  }), set), false);
 });
 
 test('browserSignalOk：.local 站点同样能通过（S-01 的签发端回归）', () => {

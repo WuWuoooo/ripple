@@ -37,6 +37,17 @@
   --safe-l:env(safe-area-inset-left,0px);
   --safe-r:env(safe-area-inset-right,0px);
 
+  /*
+   * --anim 目前是「有写入方、无读取方」的死链路：JS 每帧都会
+   * setProperty('--anim', k)（app.js 的 applyVars()），而 CSS 里没有任何
+   * var(--anim) 消费点 —— 动画速度实际是靠下面 --dur / --dur-s / --dur-l
+   * 三个时长令牌分别换算生效的。
+   *
+   * 这里暂时保留定义并注明原因：单删 CSS 这行只会让死链少一半
+   * （JS 侧仍在写一个没人读的变量），要么两边一起删，要么留着给将来
+   * 想用「一个倍率令牌统一换算所有时长」的方案当锚点。
+   * 若决定彻底删掉，JS 侧 applyVars() 里那一行必须同批删除。
+   */
   --anim:1;
   --dur:.42s;
   --dur-s:.22s;
@@ -57,9 +68,6 @@
   --ease-inout:linear(0, 0.118 4.27%, 0.1983 6.29%, 0.2921 9.89%, 0.4154 14.38%, 0.493 18.5%, 0.5781 22.12%, 0.6482 27.7%, 0.7206 32.87%, 0.787 41.02%, 0.858 50.85%, 0.9148 62.99%, 0.9504 74.71%, 1);
   /* 展开/收回动画时长：0.3s，由 applyVars() 按「动画速度」换算 */
   --dur-ani:.3s;
-  --r-lg:26px;
-  --r-md:18px;
-  --r-sm:12px;
   --glass-blur:26px;
   /* 玻璃饱和度统一成一个令牌。
      以前四个档位（180% / 190% / 120% / 无）混用，
@@ -77,7 +85,6 @@
              --accent2 .5s var(--ease-soft),
              --accent3 .5s var(--ease-soft);
   --accent-ink:#17102b;
-  --radius:26px;
 }
 /*
  * 注意：必须写 :root[data-theme=...]，不能只写 [data-theme=...]。
@@ -95,13 +102,35 @@
      再往上提会和 --text2(.62) 撞色，歌词就失去层次了。 */
   --text:#fff;--text2:rgba(255,255,255,.62);--text3:rgba(255,255,255,.50);
   --lyric-dim:rgba(255,255,255,.55);   /* 歌词非当前行专用，实测 6.26:1 */
+  /* 歌词译文（小字）：比非当前行的译词还弱一档，但仍是正文级内容。
+     以前是 --text3 再叠 opacity:.7，两层不透明度相乘后实测只有 3.11:1（深色）/
+     2.29:1（浅色），11.5px 的小字根本读不清。这里改成一个独立令牌、不叠 opacity，
+     实测 5.32:1（深色）。层次靠「比 --lyric-dim 再暗一点」体现。 */
+  --lyric-tr:rgba(255,255,255,.50);
   --line:rgba(255,255,255,.10);--line2:rgba(255,255,255,.16);
+  /* ---------- 语义色（两套主题各自给值，任何一处都不要硬编码） ----------
+   * --warn：警告文案（如均衡器面板里「悬浮窗权限没给」那类要去处理的提示）。
+   * --gold / --gold-line / --gold-bg：VIP 角标（行内格式标、播放页角标、账号卡徽章）。
+   * 这两个色族以前都是硬编码，只在深色底上验过，浅色主题下对比度低到看不见：
+   *   警告 #e0a84f 在 #F1EEEA 上 1.84:1、VIP 金 #F0C86A 只有 1.38:1
+   *   （WCAG AA 正常文字要 4.5:1），而这两处字号恰恰是 8~9px 的小字。
+   * 深色主题保持原色（9.46:1 / 12.62:1，都很充裕）；浅色主题换成
+   * 压暗到同色相的一档（4.5:1 以上），见 light 块里的实测注释。 */
+  --warn:#e0a84f;
+  --gold:#F0C86A;
+  /*
+   * 边框与底色各收敛成一个令牌。原先三处 VIP 角标各写各的：
+   * 行内角标边框 .35、播放页角标 .45、账号卡徽章 .40，底色 .14/.12 ——
+   * 同一枚「VIP」标记在三个地方透明度都不同，1px 边框上这种差别肉眼也看不出来，
+   * 只是三份独立的硬编码需要各自适配主题。统一取 .40 / .13（中间值）。
+   */
+  --gold-line:rgba(240,200,106,.40);
+  --gold-bg:rgba(240,200,106,.13);
   /* 深色主题本来就足够透，保持原样（.15/.05/.08） */
   --glass:linear-gradient(150deg,rgba(255,255,255,.15),rgba(255,255,255,.05) 48%,rgba(255,255,255,.08));
   --glass-border:rgba(255,255,255,.16);--glass-hl:rgba(255,255,255,.34);
   --shadow:0 24px 50px -24px rgba(0,0,0,.9);
   --dock-bg:rgba(24,21,34,.66);
-  --shade:rgba(6,6,10,.55);
   --accent-ink:#120a24;
   /* 投影：深色主题用浓黑才压得住；浅色主题必须换成很淡的暖灰，
      否则黑投影溢到浅底上就是一条「抹不掉的黑色带子」 */
@@ -117,7 +146,21 @@
      凡是要读成句子的正文级小字（如 .about-note）单独用 --text2，不继承 --text3。 */
   --text:#17131B;--text2:rgba(23,19,27,.62);--text3:rgba(23,19,27,.52);
   --lyric-dim:rgba(23,19,27,.68);
+  /* 同上：浅色主题 .64 实测 5.20:1，仍比 --lyric-dim(.68 → 5.95:1) 弱一档 */
+  --lyric-tr:rgba(23,19,27,.64);
   --line:rgba(23,19,27,.10);--line2:rgba(23,19,27,.16);
+  /* ---------- 语义色（浅色主题必须压暗，深色主题的原色在这里会隐形） ----------
+   * --warn：原 #e0a84f → #8a5a00。在 #F1EEEA 上 1.84:1 → 5.12:1（#F7F4F0 上 5.41:1）。
+   * --gold：原 #F0C86A → #8a5c08。在 #F1EEEA 上 1.38:1 → 5.02:1（#F7F4F0 上 5.30:1）。
+   *   VIP 角标字号只有 8~9px，按 WCAG「正常文字」一档要 4.5:1；
+   *   压暗后的色相仍是金黄（hue 约 40°），含义一眼能认出来，只是不再"发光"。
+   * --gold-line / --gold-bg：边框与底色跟着同一族色压暗，否则浅色主题里
+   *   会出现「暗金字配亮金框」的割裂感。边框本身不承载文字，取半透明即可。
+   * 深色主题沿用原色（--warn 9.46:1、--gold 12.62:1），观感不变。 */
+  --warn:#8a5a00;
+  --gold:#8a5c08;
+  --gold-line:rgba(138,92,8,.45);
+  --gold-bg:rgba(138,92,8,.10);
   /*
    * 液态玻璃需要「能看见背后」才有折射感。
    * 原来 .72/.42/.56 的白太重，玻璃几乎不透明，折射全被盖住 ——
@@ -127,7 +170,6 @@
   --glass-border:rgba(255,255,255,.9);--glass-hl:rgba(255,255,255,1);
   --shadow:0 20px 40px -26px rgba(50,35,20,.45);
   --dock-bg:rgba(255,253,250,.78);
-  --shade:rgba(255,255,255,.5);
   --accent-ink:#fff;
   /* 浅色主题：投影只起「轻轻托起」的作用，不能出现明显的深色块。
      另外投影必须在 .cover-wrap 内部（底部还有约 20px 余量）就淡完，
@@ -406,7 +448,7 @@ html:not(.perf-low) .dock-inner{
   font-size:8px;padding:2px 5px;border-radius:6px;border:1px solid var(--line2);
   color:var(--text2);letter-spacing:.04em;line-height:1.3}
 .row .r-fmt.hi{color:var(--accent);border-color:var(--accent)}
-.row .r-fmt.vip{color:#F0C86A;border-color:rgba(240,200,106,.35)}
+.row .r-fmt.vip{color:var(--gold);border-color:var(--gold-line)}
 .row .r-du{font-size:10.5px;color:var(--text3);font-variant-numeric:tabular-nums;flex:none}
 .row.on .r-tx b{color:var(--accent)}
 .row .r-al{display:none}
@@ -566,8 +608,8 @@ body.no-cover .np-bg{opacity:0}
 /* VIP 角标：紧跟在歌名右边 */
 .np-vip{flex:none;font-size:9px;font-weight:700;letter-spacing:.06em;
   padding:2px 6px;border-radius:6px;line-height:1.4;
-  color:#F0C86A;border:1px solid rgba(240,200,106,.45);
-  background:rgba(240,200,106,.14);transform:translateY(-1px)}
+  color:var(--gold);border:1px solid var(--gold-line);
+  background:var(--gold-bg);transform:translateY(-1px)}
 .np-like{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;flex:none;
   color:var(--text3);border:1px solid var(--line);transition:.22s var(--ease)}
 .np-like.on{color:#ff4f8b;border-color:rgba(255,79,139,.45);background:rgba(255,79,139,.13)}
@@ -773,7 +815,7 @@ body.no-cover .np-bg{opacity:0}
 
 /* ---------- 均衡器面板 ---------- */
 .eq-note{font-size:10.5px;line-height:1.7;color:var(--text3);padding:2px 4px 10px}
-.eq-note.warn{color:#e0a84f}
+.eq-note.warn{color:var(--warn)}
 .eq-presets{display:flex;flex-wrap:wrap;gap:7px;padding:0 2px 14px}
 .eq-presets button{padding:7px 13px;border-radius:11px;font-size:11.5px;
   background:var(--panel);border:1px solid var(--line);color:var(--text2);transition:var(--dur-s)}
@@ -1019,7 +1061,17 @@ body.no-cover .np-bg{opacity:0}
 .lyric::-webkit-scrollbar{display:none}
 .lyric .ln{padding:9px 2px;font-size:var(--ln-size,14px);line-height:1.55;color:var(--text3);
   transition:.36s var(--ease);text-align:center}
-.lyric .ln .tr{display:block;font-size:11.5px;color:var(--text3);opacity:.7;margin-top:4px}
+/*
+ * 译文行：用独立的 --lyric-tr 令牌，**不要再叠 opacity**。
+ *
+ * 以前这里是 `color:var(--text3);opacity:.7` —— 两层不透明度相乘之后
+ * 有效 alpha 只剩 .52×.7≈.36（浅色）/ .50×.7≈.35（深色），实测对比度
+ * 2.29:1 / 3.11:1，而它是 11.5px 的正文级小字。这跟 1.2.x 修掉的
+ * .about-note 是同一类错误（低对比次要色再乘 opacity），只是漏改了这一处。
+ * 现在一个令牌给一个实测值：深色 5.32:1、浅色 5.20:1，两套主题都过 AA。
+ * 层次感仍保留 —— 译文比 --lyric-dim（非当前行）再弱一档。
+ */
+.lyric .ln .tr{display:block;font-size:11.5px;color:var(--lyric-tr);margin-top:4px}
 /* 当前行放大：用 calc(变量 × 1.12) 而不是固定 16px，
    否则设置里的「歌词字号」一改，播放页三行和展开层就对不上；
    也避免再用行内 font-size 把它压掉（那正是它以前完全失效的原因）。
@@ -1027,7 +1079,11 @@ body.no-cover .np-bg{opacity:0}
 .lyric .ln.on{color:var(--text);font-weight:600;
   font-size:calc(var(--ln-size, 14px) * 1.12);
   text-shadow:0 0 22px var(--accent-soft)}
-.lyric .ln.on .tr{opacity:.65;font-weight:400}
+/* 当前行的译文：**不能再叠一层 opacity**。
+   基色已是弱化档（--lyric-tr），再乘 .65 后实测只剩 2.83:1（深色）/ 2.63:1（浅色）——
+   而这是正在唱的那一句的对照译文，恰好是最该看清的一行。
+   层次改用字重表达：正文行放大加粗，译文保持 400 常规。 */
+.lyric .ln.on .tr{font-weight:400}
 .lyric .ln.near{color:var(--text2)}
 .lyric .empty{text-align:center;color:var(--text3);font-size:12px;padding:30px 0;line-height:1.8}
 
@@ -1121,10 +1177,18 @@ body.no-cover .np-bg{opacity:0}
 
 /* ---------- 底部 dock 胶囊提示 ----------
    顶部 toasts 是「通知」语义（一排，从上落下）；底部这个是「操作确认」语义，
-   贴着 dock 上面浮着，只保留一条，做成胶囊形状更像界面上长出来的东西。 */
+   贴着 dock 上面浮着，只保留一条，做成胶囊形状更像界面上长出来的东西。
+
+   位置必须让开 dock，否则会压在迷你播放器的歌名/控制区上：
+     dock 的 bottom = safe-b + 78（layouts.css），自身高 60 → 顶边在 safe-b + 138
+     toast 自身高约 40~47，底边若停在 safe-b + 96 就会与 dock 重叠 ~42px ——
+     「再按一次返回退出」这类提示出现的 2.5 秒里，正好盖住歌名和控制区
+     （pointer-events:none 不挡点击，但挡视线，看着像界面坏了）。
+   146 = 138（让开 dock 顶边）+ 8（呼吸余量）。
+   窄屏（<360px）的 dock 是 bottom +72 / 高 54 → 顶边 +126，146 在那档只会更宽松。 */
 .toasts.bottom{
   top:auto;left:50%;right:auto;transform:translateX(-50%);
-  bottom:calc(var(--safe-b) + 96px);
+  bottom:calc(var(--safe-b) + 146px);
   width:auto;max-width:min(90vw,380px);
   align-items:center;gap:6px;
 }

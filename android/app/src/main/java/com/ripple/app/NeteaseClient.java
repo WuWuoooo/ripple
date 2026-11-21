@@ -23,9 +23,15 @@ import java.util.zip.GZIPInputStream;
  * 所以网页不需要任何代理服务，也不需要跨域权限。
  *
  * 支持的命令（NeteaseClient.call）：
- *   status / login_qr_key / login_qr_check / logout
+ *   status / logout
  *   search / song_detail / song_url / lyric / playlist / toplist
  *   recommend / likelist / like / user_playlist / personalized
+ *
+ * J-07：`login_qr_key` / `login_qr_check` 两条原语已从白名单删除。
+ * 它们是把网易云扫码登录的两个底层接口直接暴露给页面 —— 而前端登录全程走
+ * 内嵌 WebView（`RippleNative.login`），从头到尾没有调用过这两条命令
+ * （全目录 grep 零命中）。每个命令白名单项都是「页面被注入后能白嫖的 API 面」，
+ * 没有调用方的就该删。将来真要做原生扫码登录，再加回来并同时补前端调用。
  */
 final class NeteaseClient {
 
@@ -163,14 +169,24 @@ final class NeteaseClient {
 
                 byte[] raw = body.getBytes("UTF-8");
                 conn.setFixedLengthStreamingMode(raw.length);
-                // 只取一次输出流：getOutputStream() 每调用一次都可能重新开流
-                java.io.OutputStream os = conn.getOutputStream();
-                os.write(raw);
-                os.flush();
+                /*
+                 * 只取一次输出流：getOutputStream() 每调用一次都可能重新开流。
+                 *
+                 * C-13：必须 close —— HttpURLConnection 的 keep-alive 池要靠
+                 * 「输出流写完 + 响应读完」两个信号都到齐才把连接还回去。
+                 * 以前只 flush 不 close，连接在池里一直挂着自己那份流，
+                 * 复用到一定次数就该新建连接了（TLS 握手重来一遍），
+                 * 表现为「用久了每次请求都变慢」。try-with-resources 保证异常路径也关。
+                 */
+                try (java.io.OutputStream os = conn.getOutputStream()) {
+                    os.write(raw);
+                    os.flush();
+                }
 
                 String text = readBody(conn);
                 absorbCookies(conn);
-                return text;            } finally {
+                return text;
+            } finally {
                 conn.disconnect();
             }
         }
@@ -278,13 +294,7 @@ final class NeteaseClient {
         p = p == null ? new JSONObject() : p;
         switch (cmd) {
             case "status":        return status();
-            case "login_qr_key":  return post("login/qrcode/unikey", json("type", 3));
-            case "login_qr_check": {
-                JSONObject o = new JSONObject();
-                o.put("key", p.optString("key"));
-                o.put("type", 3);
-                return post("login/qrcode/client/login", o.toString());
-            }
+            /* J-07：login_qr_key / login_qr_check 已删除（前端从不调用，见类注释） */
             /*
              * 先让服务端注销会话，再清本地 cookie。
              * 反过来（先 clearCookie）会让 post 带着空 cookie 去请求 logout，
@@ -333,7 +343,13 @@ final class NeteaseClient {
             case "recommend": {
                 // 登录后是真正的「每日推荐」，未登录退化为公开的新歌推荐
                 String r = post("v3/discovery/recommend/songs", "{}");
-                if (!isLoggedIn() || r.contains("\"code\":301")) {
+                /*
+                 * U-07：以前用 r.contains("\"code\":301") 字符串匹配判未登录。
+                 * 响应带空格（"code": 301）或转义、或 301 出现在别的字符串里，
+                 * 都会漏判 —— 于是「未登录却拿到了每日推荐失败体」直接甩给前端。
+                 * 走 JSON 解析拿真正的数字，解析失败就当没登录（退回公开推荐更安全）。
+                 */
+                if (!isLoggedIn() || codeOf(r) == 301) {
                     r = post("personalized/newsong", json("limit", 30));
                 }
                 return r;
@@ -417,6 +433,22 @@ final class NeteaseClient {
         JSONObject o = new JSONObject();
         o.put(k, v);
         return o.toString();
+    }
+
+    /**
+     * 取响应体里的 code 数字；解析不出来返回 0（当作「没有 code」而不是失败）。
+     *
+     * 为什么要它：以前用 `r.contains("\"code\":301")` 判断未登录 ——
+     * 网易云换一下输出格式（"code": 301 带空格、或者 301 出现在某个字符串字段里）
+     * 判定就失效，用户会看到「每日推荐」位置弹出一个错误体。走 JSON 解析稳得多。
+     */
+    private static int codeOf(String body) {
+        if (body == null || body.isEmpty()) return 0;
+        try {
+            return new JSONObject(body).optInt("code", 0);
+        } catch (Throwable e) {
+            return 0;
+        }
     }
 
     private String status() throws Exception {

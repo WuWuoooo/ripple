@@ -57,10 +57,11 @@
     App.context = Store.all().slice();
     bindEvents();
     bindPlayer();
+    initRail();
     renderAll();
     /*
-     * restoreLast 里可能会为在线曲目串行试好几档音质（每档最长 22s，最多 5 次）。
-     * 以前用 await 挡在 boot 里：界面和 toast 全被推迟，最坏十几秒才刷新。
+     * restoreLast 里可能会为在线曲目串行试好几档音质（每次都是一次 song_url 请求）。
+     * 以前用 await 挡在 boot 里：界面和 toast 全被推迟，联网慢时要等上十几秒才刷新。
      * 现在是「先让界面正常起来，续播在后台补上」。
      */
     restoreLast().catch((e) => Log.err('RESTORE', e, 'restoreLast failed'));
@@ -241,7 +242,7 @@
     refreshSystemBars();
     $('#btnTheme').innerHTML = theme === 'light'
       ? '<svg><use href="#i-moon"/></svg>' : '<svg><use href="#i-sun"/></svg>';
-    $$('#themeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.theme === S().theme));
+    syncSegAria('#themeSeg', S().theme, 'theme');
   }
 
   /**
@@ -606,7 +607,6 @@
         ${artHTML(t, 'r-th')}
         <div class="r-tx"><b>${esc(t.title)}</b><span>${esc(t.artist)}${t.album ? ' · ' + esc(t.album) : ''}</span></div>
       </div>
-      <div class="r-al">${esc(t.album || '')}</div>
       <div class="r-fmt${cls}">${esc(fmt || 'AUDIO')}</div>
       <div class="r-du">${fmtTime(t.duration)}</div>
     </div>`;
@@ -1116,7 +1116,96 @@
   /* 切回「歌曲」tab，并把分段高亮同步过去 */
   function setLibSeg(seg) {
     App._libSeg = seg;
-    $$('#segline b').forEach((x) => x.classList.toggle('on', x.dataset.seg === seg));
+    syncSegAria('#segline', seg, 'seg');
+  }
+
+  /*
+   * 分段控件的选中态同步（曲库分组 / 主题 / 性能 / 音质都走这一支）。
+   *
+   * 为什么要有这个函数：这些控件原来只把「当前选中」编码在 CSS 类 .on 里，
+   * 读屏用户完全得不到信息。现在 DOM 上有 role="tab"/"radio" + aria-selected /
+   * aria-checked，但状态切换仍发生在 class 上 —— 两套状态必须一起改，
+   * 否则就是「视觉对了、读屏还是旧的」，比不写 aria 更糟。
+   *
+   * 每一项「当前值」存在哪个 data-* 属性上由调用方给：曲库分组是 data-seg，
+   * 音质是 data-q，而主题是 data-theme、画面性能是 data-perf。
+   * 以前这里按一个固定的 dataKey 猜，猜不中的组（主题、性能）整组都不亮，
+   * 所以改成显式传入 —— 组名和属性名分开，就不会再出现「哪一组忘了登记」。
+   *
+   * roving tabindex：同组里只有当前项 tabindex=0，其余 -1，
+   * 这样 Tab 键是一组进一次，组内用方向键移动（WAI-ARIA 的标准做法）。
+   */
+  function syncSegAria(sel, value, dataKey) {
+    const box = $(sel);
+    if (!box) return;
+    const key = dataKey || 'q';
+    const items = $$('b, button', box);
+    const attr = box.getAttribute('role') === 'tablist' ? 'aria-selected' : 'aria-checked';
+    let hit = false;
+    items.forEach((el) => {
+      /* 显式指定了 key 就用它；否则按元素上实际存在的 data-* 兜底取 */
+      const v = key === 'seg' ? el.dataset.seg
+        : key === 'theme' ? el.dataset.theme
+          : key === 'perf' ? el.dataset.perf
+            : el.dataset.q;
+      const on = v === value;
+      if (on) hit = true;
+      el.classList.toggle('on', on);
+      el.setAttribute(attr, on ? 'true' : 'false');
+      el.tabIndex = on ? 0 : -1;
+    });
+    /* 值不在这一组里（比如音质白名单有、UI 没这个按钮）：点亮第一个，别让整组全灭 */
+    if (!hit && items.length) {
+      items[0].classList.add('on');
+      items[0].setAttribute(attr, 'true');
+      items[0].tabIndex = 0;
+    }
+  }
+
+  /*
+   * 分段控件的键盘操作：左右方向键在同组内移动并激活，Home/End 跳首尾。
+   * 曲库分组（role=tablist）走 setLibSeg；单选的按钮组（音质/主题/画面性能）
+   * 由各自的 click 处理器处理，这里只负责把「方向键=移动+选中」这套
+   * 标准行为补上，然后把目标元素的 click 事件打出去 ——
+   * 复用它自己的处理逻辑，不在这里重写一遍「选中后要做什么」。
+   */
+  function bindSegKeys() {
+    const groups = [
+      { sel: '#segline', key: 'seg' },
+      { sel: '#qualitySeg', key: 'q' },
+      { sel: '#themeSeg', key: 'theme' },
+      { sel: '#perfSeg', key: 'perf' },
+    ];
+    groups.forEach(({ sel, key }) => {
+      const box = $(sel);
+      if (!box) return;
+      box.addEventListener('keydown', (e) => {
+        const k = e.key;
+        if (k !== 'ArrowLeft' && k !== 'ArrowRight' && k !== 'Home' && k !== 'End') return;
+        const items = $$('b[data-' + key + '], button[data-' + key + ']', box);
+        if (!items.length) return;
+        e.preventDefault();
+        const cur = items.findIndex((x) => x.classList.contains('on'));
+        let next = cur < 0 ? 0 : cur;
+        if (k === 'ArrowLeft') next = (cur - 1 + items.length) % items.length;
+        else if (k === 'ArrowRight') next = (cur + 1) % items.length;
+        else if (k === 'Home') next = 0;
+        else if (k === 'End') next = items.length - 1;
+        const target = items[next];
+        target.focus();
+        /*
+         * 曲库分组没有自己的 click 处理器（它是 b 元素），
+         * 这里直接走它唯一的状态入口；其余组都是 button，点一下走原逻辑。
+         */
+        if (sel === '#segline') {
+          setLibSeg(target.dataset.seg);
+          App._libGroup = null;
+          renderLibrary();
+        } else {
+          target.click();
+        }
+      });
+    });
   }
 
   function renderLibrary() {
@@ -1231,6 +1320,7 @@
     if (intro) intro.hidden = false;
     const sbody = $('#searchBody');
     if (sbody) sbody.innerHTML = '';
+    dropSearchSession();
     const hot = $('#hotWords');
     if (!hot) return;                      // 结构被挪动时不再炸掉 renderAll()
     hot.innerHTML = ['周杰伦', '草东没有派对', 'City Pop', '陈粒', 'Lofi', '钢琴']
@@ -1315,6 +1405,13 @@
       $('#btnLogin').onclick = chooseLoginMode;
       $('#rowLogout').hidden = true;
     }
+    /*
+     * 左侧导航栏的账号摘要是同一个状态源的第二份 DOM。
+     * 在唯一刷账号卡的地方顺手同步它，比在每个登录/登出/刷新点各调一次
+     * 可靠得多 —— 那些调用点有六七处，漏一个就会出现「我的页显示已登录、
+     * 导航栏还是未登录」。
+     */
+    railSyncAccount();
   }
 
   /* 登录：先选方式（手机号 / 扫码），再打开官方页面 */
@@ -1387,11 +1484,28 @@
     toast('已退出网易云', '在线演奏仍可用（非会员曲目）', 'check');
   }
 
+  /*
+   * 本机主动「取消喜欢」的曲目 id。
+   *
+   * 「同步我喜欢」是把云端 likelist 全量并回本地，这个方向上没有任何东西
+   * 记得「用户刚在本机取消过这一首」—— 于是取消完再同步一次，
+   * 那首歌又被并回「我喜欢」，用户的操作被静默回滚。
+   * 这里记下本机取消过的 id，并在并集时把它们从云端那份里剔掉。
+   *
+   * 不落盘：它只用于「同一次会话里，云端列表可能还没更新完」这段窗口。
+   * 用户下次启动时云端 likelist 已经反映了取消操作，不需要这份记忆；
+   * 而写进持久化反而会让「后来又重新喜欢」被这份旧记录挡住。
+   * 重新喜欢（on=true）时把 id 从这个集合里移除。
+   */
+  const _localUnliked = new Set();
+
   async function syncLikes() {
     if (!Netease.loggedIn) return toast('需要先登录', '', 'warn');
     try {
       const ids = await Netease.likelist();
-      const mapped = ids.map((id) => 'ne_' + id);
+      const mapped = ids.map((id) => 'ne_' + id)
+        /* 本机取消过、云端还没反映的，不进并集（否则取消被静默回滚） */
+        .filter((id) => !_localUnliked.has(id));
       const merged = Array.from(new Set(Store.state.liked.concat(mapped)));
       Store.state.liked = merged;
       Store.save();
@@ -1443,6 +1557,17 @@
      * 刚点的歌换掉、或者把旧进度写进新歌。
      */
     App._restoreSeq++;
+    /*
+     * 用户接管 = 这次冷启动恢复彻底作废，连「进度待落地」的闸门一起摘掉。
+     *
+     * restoreLast 会给 App._restorePending 置位，让 rememberProgress 在
+     * 「上次的位置还没写回元素」期间不要落盘（否则会把 0 写进持久化）。
+     * 但它自己的 applyPos 可能要等 loadedmetadata 或 1200ms 兜底才跑，
+     * 这期间用户已经在听新歌了 —— 闸门若还挂着，新歌的进度也不会落盘。
+     * 这里立刻摘掉：接管之后该由新歌自己的 rememberProgress 负责写。
+     */
+    App._restorePending = null;
+    App._restoring = false;
     let list = context && context.length ? context : Store.all();
     let i = list.findIndex((t) => t.id === track.id);
     if (i < 0) { list = [track]; i = 0; }
@@ -1451,6 +1576,12 @@
      * 而 ctx 里放的是搜索结果里的那份。两份对象各自有 src 字段，
      * 解析结果写在 A 上，Player 却去播 B 的空 src —— 于是「解析成功但永远不播」。
      * 这里统一引用：ctx 里同 id 的位置直接换成 track 这一份。
+     *
+     * 这一步也是 Player.playAt 的 defer 分支（player.js 里
+     * `g.RippleApp.play(track, list)`）能安全工作的前提：那条分支把 track
+     * 单独传出来，如果 list[i] 是另一份对象，「解析结果落在这份、播的却是那份」
+     * 的错位就会重现。保证 list[i] === track 之后，「播 list[i]」和
+     * 「解析 track」在两条分支上是同一个对象。
      */
     if (list[i] !== track) list[i] = track;
     App.context = list;
@@ -1472,8 +1603,15 @@
     }
     _resolveSeq++;                    // 本地曲目立即生效，作废所有在飞的在线解析
     Player.playAt(list, i);
+    /*
+     * 只记 lastTrackId，不再记 lastIndex。
+     *
+     * lastIndex 曾是「这一首在列表里的下标」，但恢复播放的路径改用
+     * findIndex(lastTrackId) 之后，全仓再没有任何地方读它 ——
+     * 每切一首歌白落一次盘，且它和真实队列位置会随截断/去重慢慢对不上，
+     * 留着只会让人误以为它是可信的。
+     */
     Store.set('lastTrackId', track.id);
-    Store.set('lastIndex', i);
   }
 
   /*
@@ -1620,8 +1758,34 @@
     return track.lyric;
   }
 
+  /*
+   * 音质档位：**唯一的名单来源**。
+   *
+   * 音质这条链上曾经有三份名单各不相同：设置页只有 standard/exhigh/lossless/hires
+   * 四个按钮、store.js 的白名单是 standard/higher/exhigh/lossless、
+   * 而 netease.js 的实现是五档 —— 于是「较高」没有任何入口，
+   * 补上入口后按钮点亮又对不上（比较时少一档就整组不亮）。
+   * 现在档位、中文名、网易云 level 序号都从这一张表派生：
+   *   · 设置页按钮由它渲染（index.html 里那 5 个 button 是它的静态副本）
+   *   · 按钮点亮用 s.quality 精确比 data-q
+   *   · qualityLevel() 查它的 level 字段
+   *   · 播放设置面板的循环与副标题也读它
+   * 新增一档时只改这里，别再散落出去。
+   */
+  const QUALITY_TIERS = [
+    { key: 'standard', name: '标准', level: 0 },
+    { key: 'higher', name: '较高', level: 1 },
+    { key: 'exhigh', name: '极高', level: 2 },
+    { key: 'lossless', name: '无损', level: 3 },
+    { key: 'hires', name: 'Hi-Res', level: 4 },
+  ];
+  const QUALITY_NAME = {};
+  QUALITY_TIERS.forEach((q) => { QUALITY_NAME[q.key] = q.name; });
+
   function qualityLevel() {
-    return { standard: 0, higher: 1, exhigh: 2, lossless: 3, hires: 4 }[S().quality] ?? 2;
+    const tier = QUALITY_TIERS.find((q) => q.key === S().quality);
+    /* 值不在名单里（localStorage 被改坏）：退回「极高」，与设置页的历史默认一致 */
+    return tier ? tier.level : 2;
   }
 
   /**
@@ -1671,7 +1835,16 @@
 
   function bindPlayer() {
     Player.on('track', (t) => {
-      if (t) { S().lastPosition = 0; rememberProgress(true); }
+      /*
+       * 「换歌就把进度归零」对真正的换歌是对的（否则新歌会继承上一首的秒数），
+       * 但冷启动恢复走的是 Player.load()，load 内部同样会发 track 事件 ——
+       * 于是恢复刚开始就把持久化的 lastPosition 清成 0 并强制落盘，
+       * 之后 applyPos 只把进度写回 <audio> 元素，持久化字段要等下一次
+       * rememberProgress tick（最长 12 秒）才写回正确值。
+       * 这 12 秒里杀掉进程，续播进度就真的丢了。
+       * 恢复路径由 restoreLast 打上 App._restoring 标记，这里整段跳过清零。
+       */
+      if (t && !App._restoring) { S().lastPosition = 0; rememberProgress(true); }
       paletteFor(t);
       updateDock();
       // renderNP() 内部已经把封面/背景/队列/歌词/模式按钮都刷过了，
@@ -1689,6 +1862,16 @@
        * 所以正常切歌路径（playOnline 已拉过）不会产生额外请求。
        */
       if (t && !Array.isArray(t.lyric)) ensureLyric(t).catch(() => {});
+      /*
+       * 换歌时把评论面板收掉。
+       *
+       * showComments 里的 wantId 守卫只保证「旧歌的评论不会漏进新歌面板」，
+       * 但面板本身会一直开着，里面还是上一首的评论和旧的评论数 ——
+       * 用户看到的是「面板开着，歌已经换了」，会以为评论串了。
+       * 收起而不是重置成骨架屏：评论是「针对某一首」的临时视图，
+       * 换歌后这个视图已无意义，留着还要再发一次请求，不如让用户自己点开。
+       */
+      if (t && $('#cmtSheet') && $('#cmtSheet').classList.contains('on')) closeComments();
     });
     Player.on('state', (playing) => {
       // 告诉原生「现在在不在放」，决定切后台时要不要停 WebView 计时器
@@ -1734,7 +1917,8 @@
           renderQueue();
         }).catch(() => {}).then(() => { _heartBusy = false; });
       } else {
-        extendRoam(t.neId, t);
+        /* auto=true：播放到见底时的后台续队列，不弹 toast（见 extendRoam） */
+        extendRoam(t.neId, t, true);
       }
     });
     /* 审查 3.2：缓冲状态可视化，至少让用户知道「在转圈」而不是死机 */
@@ -1771,7 +1955,26 @@
         return;
       }
       toast('这首放不了', (t && t.title) + ' · 已跳过', 'warn');
-      setTimeout(() => Player.next(), 600);
+      /*
+       * 600ms 后才切下一首，是为了让「这首放不了」的提示被看一眼；
+       * 但这 600ms 里用户完全可能自己点了另一首歌。
+       *
+       * 那时再无条件 Player.next()，就会把用户刚点的歌顶掉 ——
+       * 与 restoreLast 那套「用户已接管」守卫同构的竞态，只是入口换成了自动跳歌。
+       * 这里用同一个接管序号（App._restoreSeq，任何 playTrack 都会 ++）：
+       * 记下失败时的序号，回调里序号变了就说明用户已经接管，这次跳歌作废。
+       */
+      const failSeq = App._restoreSeq;
+      const failTrack = t;
+      setTimeout(() => {
+        if (App._restoreSeq !== failSeq) {
+          Log.add('PLAY', 'skip cancelled: user took over');
+          return;
+        }
+        /* 序号虽没变，也再核一次当前曲目：别把一首被别的路径换掉的歌再往下顶 */
+        if (failTrack && Player.track && Player.track.id !== failTrack.id) return;
+        Player.next();
+      }, 600);
     });
     /*
      * 连续跳过计数：
@@ -1891,7 +2094,14 @@
     const vipEl = $('#npVip');
     if (vipEl) vipEl.hidden = !isVipTrack(t);
     $('#npArtist').textContent = [t.artist, t.album, t.format].filter(Boolean).join(' · ');
-    $('#npFrom').textContent = t.source === 'online' ? '网易云 · 在线' : t.source === 'local' ? '本地文件' : '示例曲库';
+    /*
+     * source 只有 'online' / 'local' 两种（见 netease.js 与 store.js 的构造点）。
+     * 以前这里还挂着第三个分支「示例曲库」——内置示例曲库早就删了，
+     * 那个分支永远不会命中，却把「示例曲库」这个概念留在了代码里。
+     * 兜底改成破折号：真出现第三种来源时，显示「—」比显示一个不存在的曲库诚实。
+     */
+    $('#npFrom').textContent = t.source === 'online' ? '网易云 · 在线'
+      : t.source === 'local' ? '本地文件' : '—';
     const liked = Store.isLiked(t.id);
     $('#npLike').classList.toggle('on', liked);
     $('#npLike').innerHTML = `<svg><use href="#i-${liked ? 'heart' : 'heart-o'}"/></svg>`;
@@ -2181,8 +2391,21 @@
     return !!(sheet && sheet.classList.contains('on'));
   }
 
+  /**
+   * 队列面板「显示什么」的唯一来源。
+   *
+   * 没有正在播放的歌时（Player.queue 为空），面板会退而展示整个曲库 ——
+   * 这个兜底本身没问题，问题是点击处理用的是 Player.queue 而不是同一份数据：
+   * 空队列时点任何一条都是 playAt([], i) → list[i] 为 undefined → 直接 return，
+   * 整列看起来可以点、点下去毫无反应。
+   * 抽成一个函数，让「渲染用的列表」和「点击后播的列表」在结构上不可能分叉。
+   */
+  function queueList() {
+    return Player.queue.length ? Player.queue : Store.all();
+  }
+
   function renderQueue(force) {
-    const q = Player.queue.length ? Player.queue : Store.all();
+    const q = queueList();
     const sig = queueSignature(q);
     // 面板没打开时不做 DOM 重建，只记个标记（打开时会强制渲染）
     if (!force && !queueVisible()) {
@@ -2238,7 +2461,9 @@
   function renderOptSheet() {
     const s = S();
     const EQ_NAMES = { off: '关闭', pop: '流行', rock: '摇滚', vocal: '人声', bass: '低频', night: '夜间' };
-    const Q_NAMES = { standard: '标准', higher: '较高', exhigh: '极高', lossless: '无损', hires: 'Hi-Res' };
+    /* 音质名单只有 QUALITY_NAME 一份（见 QUALITY_TIERS），这里不再另抄一份 */
+    const Q_NAMES = QUALITY_NAME;
+    const qName = Q_NAMES[s.quality] || '极高';
     const html = `
       <div class="opt-sec">
         <div class="h">分享</div>
@@ -2253,8 +2478,8 @@
         <div class="opt-card">
           ${optRow('i-volume', '音量', Math.round((s.volume == null ? 0.85 : s.volume) * 100) + '%',
             `<div class="sld"><input type="range" min="0" max="1" step="0.05" data-opt="volume"></div>`)}
-          ${optRow('i-cloud', '音质偏好', Q_NAMES[s.quality] || '极高',
-            `<div class="val">${Q_NAMES[s.quality] || '极高'} ›</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="quality"')}
+          ${optRow('i-cloud', '音质偏好', qName,
+            `<div class="val">${qName} ›</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="quality"')}
           ${optRow('i-eq', '音量归一化',
             Player.normalizeUsable()
               ? '按实测响度拉平（本地/同源音源）'
@@ -2331,7 +2556,7 @@
       const sub = r.querySelector('.tx span'); if (sub) sub.textContent = txt;
       const val = r.querySelector('.val'); if (val) val.textContent = txt + ' ›';
     };
-    setSub('quality', { standard: '标准', higher: '较高', exhigh: '极高', lossless: '无损', hires: 'Hi-Res' }[s.quality] || '极高');
+    setSub('quality', QUALITY_NAME[s.quality] || '极高');
     setSub('sleep', s.sleepMin ? s.sleepMin + ' 分钟' : '关闭');
     setSub('sbtune', s.sbLocked ? '已锁定 · 不可拖动' : '可拖动 · 点一下可调整');
     /*
@@ -2523,11 +2748,10 @@
       return;
     }
     if (what === 'quality') {
-      const list = ['standard', 'higher', 'exhigh', 'lossless', 'hires'];
-      const names = ['标准', '较高', '极高', '无损', 'Hi-Res'];
-      const i = list.indexOf(S().quality);
-      const next = list[(i + 1) % list.length];
-      S().quality = next; Store.save();
+      /* 名单与 level 都来自 QUALITY_TIERS，循环顺序即档位顺序 */
+      const i = QUALITY_TIERS.findIndex((q) => q.key === S().quality);
+      const next = QUALITY_TIERS[(i + 1) % QUALITY_TIERS.length];
+      S().quality = next.key; Store.save();
       /*
        * F-12：换音质不能把当前曲目的 src 置空。
        * 旧代码 `Player.track.src = null`：<audio> 里已经加载的地址还能响，
@@ -2537,7 +2761,7 @@
        */
       reResolveQuality();
       syncOptSheet(); syncSettingsUI();
-      toast('音质偏好', names[list.indexOf(next)], 'cloud');
+      toast('音质偏好', next.name, 'cloud');
       return;
     }
     if (what === 'eq') {
@@ -3116,10 +3340,6 @@
     Log.add('LYRIC', 'collapsed');
   }
 
-  function toggleLyric() {
-    if (isLyricExpanded()) collapseLyric(); else expandLyric();
-  }
-
   /* ================= 心动模式 ================= */
   async function applyHeartMode() {
     const t = Player.track;
@@ -3169,12 +3389,18 @@
     await extendRoam(t.neId, t);
   }
 
-  /** 往队列尾部续一批相似歌曲 */
-  async function extendRoam(seedId, seedTrack) {
+  /**
+   * 往队列尾部续一批相似歌曲。
+   *
+   * auto 是「播放到队列见底时自动续」这条后台路径：它不该弹 toast ——
+   * 漫游模式下每 2-3 首就会触发一次，入口提示 + 成功提示成对出现，
+   * 等于周期刷屏，与「通知不打扰」的设计初衷相反。手动切到漫游时才提示。
+   */
+  async function extendRoam(seedId, seedTrack, auto) {
     if (_roamBusy) return;
     _roamBusy = true;
     try {
-      toast('正在续漫游队列…', '', 'cloud');
+      if (!auto) toast('正在续漫游队列…', '', 'cloud');
       let list = [];
       try { list = await Netease.roamSongs(seedId, 20); } catch (e) { list = []; }
       if (!list.length) {
@@ -3198,19 +3424,50 @@
         add.push(x);
       }
       if (!add.length) {
-        toast('漫游中', '暂时没有新的相似歌曲', 'infinite');
+        if (!auto) toast('漫游中', '暂时没有新的相似歌曲', 'infinite');
+        else Log.add('ROAM', 'no new similar songs');
         return;
       }
-      const queue = base.concat(add).slice(-ROAM_QUEUE_MAX);
-      /* 截掉的是队头，当前这首歌的下标要跟着前移，否则会指向别的歌 */
-      const index = Math.max(0, Player.index - Math.max(0, base.length + add.length - queue.length));
+      let queue = base.concat(add);
+      /*
+       * 截断只能砍队尾之外的部分，绝不能让「正在播的那首」被砍掉。
+       * 旧写法 slice(-ROAM_QUEUE_MAX) 之后再按「前移了多少」修 index：
+       * 一般情形（index 落在截断点之后）确实对，但种子歌恰好在队头时
+       * （index=0，base 不长、add 又很多）那一截正好把当前歌自己切掉，
+       * 而 index 被夹回 0 指向了别的歌 —— Player.track 仍是旧那首，
+       * next() / 队列高亮 / 点队列项全部错位。
+       * 这里先截断，再核对「截断后的队列里 index 处的还是不是当前歌」，
+       * 不是就把当前歌补回队头。
+       */
+      if (queue.length > ROAM_QUEUE_MAX) {
+        queue = queue.slice(-ROAM_QUEUE_MAX);
+      }
+      const cur = Player.track;
+      let index = 0;
+      if (cur) {
+        const found = queue.findIndex((x) => x && x.id === cur.id);
+        if (found >= 0) {
+          index = found;
+        } else {
+          /* 当前歌被截掉了：重新插到队头，index 归 0，行为与「刚进这首歌」一致 */
+          queue.unshift(cur);
+          if (queue.length > ROAM_QUEUE_MAX) queue.length = ROAM_QUEUE_MAX;
+          index = 0;
+          Log.add('ROAM', 'current track re-inserted after truncate: ' + cur.title);
+        }
+      } else {
+        index = Math.max(0, Math.min(queue.length - 1, Player.index));
+      }
       Player.queueSet(queue, index);
       App.context = queue;
       renderQueue();
       syncModeButtons();
-      toast('漫游中', '队列已扩展到 ' + queue.length + ' 首', 'infinite');
+      if (!auto) toast('漫游中', '队列已扩展到 ' + queue.length + ' 首', 'infinite');
+      else Log.add('ROAM', 'queue extended to ' + queue.length);
     } catch (e) {
-      toast('漫游取不到歌', e.message, 'warn');
+      /* 自动续失败只记日志：用户没主动要这次操作，弹警告只会变成噪音 */
+      if (auto) Log.err('ROAM', e, 'auto extend failed');
+      else toast('漫游取不到歌', e.message, 'warn');
     } finally {
       _roamBusy = false;
     }
@@ -3314,7 +3571,7 @@
       ['歌手', t.artist],
       ['专辑', t.album || '—'],
       ['时长', fmtTime(t.duration)],
-      ['来源', t.source === 'online' ? '网易云' : t.source === 'local' ? '本地文件' : '示例曲库'],
+      ['来源', t.source === 'online' ? '网易云' : t.source === 'local' ? '本地文件' : '—'],
       ['音质', t.format || '—'],
     ];
     if (t.source === 'online') {
@@ -3433,12 +3690,122 @@
     }
     App.page = page;
     $$('.page').forEach((p) => p.classList.toggle('on', p.dataset.page === page));
-    $$('#tabbar a').forEach((a) => a.classList.toggle('on', a.dataset.nav === page));
+    /*
+     * 底部胶囊与左侧导航栏是同一套导航的两种形态：
+     * 两者都要切高亮，也都要切 aria-current（读屏靠它知道当前在哪一页）。
+     * 漏掉任何一个都会出现「看得见的高亮了、读屏还在念旧页」。
+     */
+    $$('#tabbar a, #rail [data-nav]').forEach((a) => {
+      const on = a.dataset.nav === page;
+      a.classList.toggle('on', on);
+      if (on) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    });
     document.title = (TITLES[page] ? TITLES[page] + ' · ' : '') + 'Ripple 涟漪';
     setTimeout(refreshSystemBars, 30);
     if (page === 'library') { renderLibrary(); loadMyPlaylists(); }
     if (page === 'home') { renderHome(); loadHomeOnline(); }
     if (page === 'settings') updateAccountCard();
+  }
+
+  /* ================= 左侧导航栏（横屏 / 桌面） =================
+   *
+   * 只做三件事：记住展开/收起状态、切宽度、同步账号摘要。
+   * 「切到哪一页」仍然走 go()，与底部胶囊共用同一条路径 ——
+   * 两套导航各自维护一份当前页，迟早会漂移出「点了高亮了但没切页」。
+   *
+   * 状态落 localStorage 而不是 Store.settings：它不是一项「设置」
+   * （设置页里没有对应开关，也不该出现在导出/重置设置的行为里），
+   * 只是这台设备上一次的界面形态。
+   */
+  const RAIL_KEY = 'ripple.rail.v1';
+
+  function railSet(open, persist) {
+    const root = document.documentElement;
+    root.dataset.rail = open ? 'full' : 'mini';
+    const btn = $('#railFold');
+    if (btn) {
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.setAttribute('aria-label', open ? '收起导航' : '展开导航');
+    }
+    if (persist !== false) {
+      try { localStorage.setItem(RAIL_KEY, open ? 'full' : 'mini'); } catch (e) {}
+    }
+    /*
+     * 宽度变了，底部那几个 fixed/absolute 元素的定位虽然都读 --rail-w 自动跟随，
+     * 但状态栏取色是按当前页顶部内容算的，横向让位后取到的颜色可能变，
+     * 所以这里补一次刷新（和 go() 里同一套节流，不会多打桥）。
+     */
+    refreshSystemBars();
+  }
+
+  function railToggle() {
+    railSet(document.documentElement.dataset.rail !== 'full');
+  }
+
+  function initRail() {
+    const rail = $('#rail');
+    if (!rail) return;
+    /* 冷启动时先按上次的形态摆好，再绑定按钮，避免先画一帧展开态再跳 */
+    let saved = '';
+    try { saved = localStorage.getItem(RAIL_KEY) || ''; } catch (e) {}
+    if (!saved) {
+      /*
+       * 没有历史记录时的默认形态：窄一点的平板（<1180）默认收起，
+       * 宽屏桌面默认展开。
+       * 判据用 1180 是因为那一档 --content-max 已经到 1240，
+       * 展开 92px 导航之后正文仍有足够宽度；更窄的屏上展开会挤压内容。
+       */
+      saved = innerWidth >= 1180 ? 'full' : 'mini';
+    }
+    railSet(saved === 'full', false);
+
+    $('#railFold').addEventListener('click', railToggle);
+
+    /* 导航链接与底部胶囊共用 [data-nav] 的委派绑定（见 bindEvents） */
+
+    /*
+     * 键盘快捷键：宽屏用户按 [ 直接收起/展开。
+     * 只在导航栏可见的档位生效，否则手机上按 [ 会改一个看不见的状态。
+     */
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== '[' || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (!railRailVisible()) return;
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
+      e.preventDefault();
+      railToggle();
+    });
+
+    railSyncAccount();
+  }
+
+  /* 导航栏当前是否真的显示着（手机档 display:none） */
+  function railRailVisible() {
+    const rail = $('#rail');
+    return !!rail && getComputedStyle(rail).display !== 'none';
+  }
+
+  /*
+   * 账号摘要与「我的」页的账号卡同源（Netease.profile），
+   * 但两者是不同 DOM，updateAccountCard 只刷那一份。
+   * 这里单独刷导航栏这份，并在同一处调用点触发，避免两边不一致。
+   */
+  function railSyncAccount() {
+    const who = $('#railWho');
+    if (!who) return;
+    const p = Netease.profile;
+    const ava = $('#railAva');
+    if (p && p.avatar) {
+      ava.src = safeCoverUrl(p.avatar);
+      ava.hidden = false;
+    } else {
+      ava.hidden = true;
+    }
+    who.textContent = p ? p.nickname : '未登录';
+    $('#railSub').textContent = p
+      ? ('Lv.' + (p.level || 0) + (p.vip ? ' · VIP' : ''))
+      : '同步收藏';
   }
 
   /* ================= 每日推荐（当成一个歌单展示） ================= */
@@ -3491,6 +3858,27 @@
     if (plLoad) plLoad.textContent = '读取中…';
 
     let data = App._plCache.get(String(plId));
+    /*
+     * 缓存命中也要校验曲目是否齐。
+     *
+     * Map 没有 TTL：首次打开时若 playlistTracks 因网络抖动返回空数组，
+     * `tracks: []` 已经被缓存下来，此后命中缓存就直接跳过补齐 ——
+     * 同一张歌单在本次会话里永远是「空歌单」，且没有任何重试入口。
+     * 所以「有没有曲目」才是可复用的判据，缓存只是省掉详情请求。
+     */
+    if (data && (!data.tracks || !data.tracks.length)) {
+      try {
+        const tracks = await Netease.playlistTracks(plId, 300);
+        if (tracks && tracks.length) {
+          data.tracks = tracks;
+          if (my === _plSeq) App._plCache.set(String(plId), data);
+        }
+      } catch (e) {
+        /* 补不齐就照旧渲染（会显示空歌单），不能把整个详情页打成错误页 */
+        Log.err('PLAYLIST', e, 'refill tracks failed: ' + plId);
+      }
+      if (my !== _plSeq) return;
+    }
     if (!data) {
       try {
         data = await Netease.playlist(plId);
@@ -3575,14 +3963,19 @@
       av.textContent = (v.name || '?') + ' · build ' + (v.code == null ? '?' : v.code);
     }
     /* 窗口信息跟着设置页一起刷新：断点/方向变了以后这一行要跟着变 */
-    $$('#themeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.theme === s.theme));
+    /*
+     * 分段控件统一走 syncSegAria：它同时切 .on 与 aria-checked/tabindex。
+     * 以前这里是裸的 classList.toggle，视觉状态对了但读屏拿不到 —— 两套状态
+     * 必须一起改，否则就是「看得见的人是对的、看不见的人是错的」。
+     */
+    syncSegAria('#themeSeg', s.theme, 'theme');
     $$('#fadeSeg button').forEach((b) => b.classList.toggle('on', +b.dataset.fade === +s.fade));
-    $$('#qualitySeg button').forEach((b) => b.classList.toggle('on', b.dataset.q === s.quality));
+    syncSegAria('#qualitySeg', s.quality, 'q');
     /* 画面性能档位：读 RipplePerf 的真实状态（它还有一档是「实测帧率后自动降级」，
        所以不能只看 localStorage，要看 html 上实际挂着的类）。 */
     const perfMode = (window.RipplePerf && RipplePerf.mode()) || 'auto';
     const perfLow = !!(window.RipplePerf && RipplePerf.isLow());
-    $$('#perfSeg button').forEach((b) => b.classList.toggle('on', b.dataset.perf === perfMode));
+    syncSegAria('#perfSeg', perfMode, 'perf');
     const perfHint = $('#perfHint');
     if (perfHint) {
       perfHint.textContent = perfMode === 'high' ? '高画质（始终开启毛玻璃与模糊）'
@@ -3728,6 +4121,18 @@
       e.preventDefault();
       go(el.dataset.nav);
     }));
+    /*
+     * 左侧导航栏底部的账号卡：只是一个快捷入口 ——
+     * 已登录去「我的」看账号详情，未登录直接拉起登录方式选择。
+     * 不在这里做登录/退出，避免同一件事出现两套实现。
+     */
+    const railAcct = $('#railAcct');
+    if (railAcct) {
+      railAcct.addEventListener('click', () => {
+        go('settings');
+        if (!Netease.profile) setTimeout(() => chooseLoginMode(), 220);
+      });
+    }
     $('#btnSearch').addEventListener('click', () => { go('search'); setTimeout(() => $('#searchInput').focus(), 260); });
     $('#btnSettings').addEventListener('click', () => go('settings'));
     $('#btnTheme').addEventListener('click', () => {
@@ -3907,7 +4312,12 @@
       if (!t) return;
 
       if (card.closest('#npQueue')) {
-        Player.playAt(Player.queue, +card.dataset.i);
+        /*
+         * 必须用 renderQueue 渲染时那一份列表（queueList()）：
+         * 没有在播的歌时面板展示的是整个曲库，若这里还拿空的 Player.queue
+         * 取下标，点下去就是「看得见、点不动」。
+         */
+        Player.playAt(queueList(), +card.dataset.i);
         return;
       }
       if (card.closest('#plTracks') && App._plCurrent) {
@@ -3948,8 +4358,7 @@
       seg.addEventListener('click', (e) => {
         const b = e.target.closest('b[data-seg]');
         if (!b) return;
-        $$('#segline b').forEach((x) => x.classList.toggle('on', x === b));
-        App._libSeg = b.dataset.seg;
+        setLibSeg(b.dataset.seg);
         /*
          * 用户主动切到别的 tab 就不再保留分组筛选，
          * 否则再点「歌曲」时列表里只剩上次那个专辑的歌，看起来像丢歌了。
@@ -3957,6 +4366,8 @@
         App._libGroup = null;
         renderLibrary();
       });
+      /* 键盘操作（方向键 / Home / End）单独立一处，点击逻辑不掺进来 */
+      bindSegKeys();
     }
     /* 分组筛选的「返回全部」提示：点它就清掉筛选 */
     const libHead = $('#libCount');
@@ -3983,7 +4394,22 @@
       const files = Array.from(e.target.files || []);
       if (!files.length) return;
       toast('正在导入…', files.length + ' 个文件', 'folder');
-      const added = await Store.addFiles(files);
+      /*
+       * addFiles 内部虽然有逐条 try/catch，但外层仍可能抛（IndexedDB 打不开、
+       * 配额写满、目录被撤权）。以前这里不接，异常往上冒进 unhandled rejection ——
+       * 用户看到的是「正在导入…」永远停在那儿，既没有结果也没有错误。
+       * 失败必须给一句明确的话，输入框的值也要清（否则同名文件选第二次不触发 change）。
+       */
+      let added = [];
+      try {
+        added = await Store.addFiles(files);
+      } catch (err) {
+        Log.err('IMPORT', err, 'addFiles failed');
+        e.target.value = '';
+        renderAll();
+        toast('导入失败', (err && err.message) || '请检查文件是否可读', 'warn');
+        return;
+      }
       e.target.value = '';
       renderAll();
       toast(added.length ? '导入完成' : '没有可导入的音频',
@@ -4019,15 +4445,22 @@
        *     但把元数据存下来可以让「曲库」列表在重启后完整恢复。
        */
       Store.localTracks.unshift(t);
-      const imps = Store.state.imports = Store.state.imports || [];
-      if (!imps.some((x) => x && x.id === t.id)) {
-        imps.unshift({
-          id: t.id, source: 'local', title: t.title, artist: t.artist,
-          album: t.album, duration: t.duration, cover: t.cover,
-          src: t.src, format: t.format, remoteUrl: true,
-          at: Date.now(),
-        });
-      }
+      /*
+       * state.imports 里只放 id 字符串 —— 与 store.js 的 addFiles 保持同一种形态。
+       *
+       * 以前这一处写的是完整对象数组，而 addFiles 写的是纯 id，两套写入方各自
+       * 维护一份没人消费的清单：混形态意味着将来真要用它时必须同时处理两种结构，
+       * 而且每条记录都跟着每次 save() 全量序列化进 localStorage。
+       * 曲库的实际恢复走 IndexedDB 的 restoreLocal()，元数据由下面的 dbPut 负责，
+       * 这份清单只作为「本机导入过哪些 id」的轻量索引，id 足够。
+       *
+       * 顺带把读取侧也对旧数据做一次归一：老版本可能已经把对象写进去过，
+       * 这里按 x.id 取 id，两种形态都能正确判重，不会因为换了形态就重复插入。
+       */
+      const imps = Store.state.imports = (Store.state.imports || [])
+        .map((x) => (typeof x === 'string' ? x : (x && x.id)))
+        .filter(Boolean);
+      if (!imps.includes(t.id)) imps.unshift(t.id);
       Store.save();
       /* IndexedDB 写元数据：失败只记日志，不影响「本次会话可用」 */
       if (!Store._volatile) {
@@ -4117,8 +4550,21 @@
     $('#npPrev').addEventListener('click', () => Player.prev());
     $('#npNext').addEventListener('click', () => Player.next());
 
-    // 播放模式：一个按钮循环切换
-    $('#npMode').addEventListener('click', async () => {
+    /*
+     * 播放模式：一个按钮循环切换。
+     *
+     * 六档里「心动」「漫游」不只是改个枚举值 —— 它们会真的拉一次队列并
+     * 整体替换 Player.queue（各打一组接口）。而按钮的语义是「切模式」，
+     * 从「列表循环」按到「随机」要路过这两档，以前每路过一次就真拉一次队列：
+     * 队列连换两次、白打两组接口，连点快切时几个请求还会互相踩。
+     *
+     * 现在改成「停下来才算选中」：点击只改 S().playMode 与 UI，
+     * 新档位若是心动/漫游，等它在位超过一个小停顿再生成队列；
+     * 这期间用户又切了别的档，这次副作用直接作废（回调里再核对一次 playMode，
+     * 因为歌单页的「播放全部/随机」也会改 playMode，那条路径不经过这里）。
+     */
+    let _modeSettleTimer = 0;
+    $('#npMode').addEventListener('click', () => {
       let next = (currentModeIndex() + 1) % MODES.length;
       const m = MODES[next];
       if (m.need === 'login' && !Netease.loggedIn) {
@@ -4131,8 +4577,15 @@
       Store.save();
       syncModeButtons();
       toast('播放模式', mode.name, 'repeat');
-      if (mode.key === 'heart') await applyHeartMode();
-      if (mode.key === 'roam') await applyRoamMode();
+
+      clearTimeout(_modeSettleTimer);
+      if (mode.key !== 'heart' && mode.key !== 'roam') return;
+      const wantKey = mode.key;
+      _modeSettleTimer = setTimeout(() => {
+        if (S().playMode !== wantKey) return;      // 停留期间又换档了：作废
+        if (wantKey === 'heart') applyHeartMode();
+        else applyRoamMode();
+      }, 420);
     });
 
     // 播放列表
@@ -4233,6 +4686,16 @@
       if (!Player.track) return;
       const t = Player.track;
       const on = Store.toggleLike(t.id);
+      /*
+       * 记下本机会话里的取消动作（见 _localUnliked 的说明）：
+       * 取消的记进去、重新喜欢的摘出来，让「同步我喜欢」的并集不把
+       * 用户刚取消的那首又加回来。只对在线曲目有意义 ——
+       * 本地曲目不在云端 likelist 里，并集根本不会碰它。
+       */
+      if (t.source === 'online' && t.neId) {
+        const key = 'ne_' + t.neId;
+        if (on) _localUnliked.delete(key); else _localUnliked.add(key);
+      }
       $('#npLike').classList.toggle('on', on);
       $('#npLike').innerHTML = `<svg><use href="#i-${on ? 'heart' : 'heart-o'}"/></svg>`;
       renderAll();
@@ -4288,6 +4751,13 @@
     $('#qualitySeg').addEventListener('click', (e) => {
       const b = e.target.closest('button[data-q]');
       if (!b) return;
+      /*
+       * 只接受名单里的档位。按钮是 index.html 里写死的静态副本，
+       * 名单只认 QUALITY_TIERS —— 两边漂移时（比如 HTML 上多了一个已下线的档）
+       * 宁可这次点击不生效，也不要把一个 store.js 白名单不认的值写进设置：
+       * 那个值会在下次启动被 coerceSettings 静默丢掉、回落成「极高」。
+       */
+      if (!QUALITY_TIERS.some((q) => q.key === b.dataset.q)) return;
       S().quality = b.dataset.q; Store.save(); syncSettingsUI();
       // F-12：同上 —— 不置空 src，改为后台重新解析地址
       reResolveQuality();
@@ -4655,6 +5125,17 @@
   const SEARCH_PAGE = 30;
   let _searchSession = null;   // { kw, loaded, total, plLoaded }
 
+  /*
+   * 作废当前搜索会话（回到默认态 / 切到在线介绍页时用）。
+   *
+   * 为什么必须清：清空搜索框或回到 intro 页之后，_searchSession 若还留着
+   * 上一次的关键词与 offset，用户在 intro 态下滑动页面仍会触发预取 ——
+   * 那一页已经不含 #searchSongList，append 只能走兜底路径，
+   * 把旧关键词的下一页结果插到 intro 区域里，页面冒出孤儿结果行，
+   * 计数也和实际可见行数对不上。
+   */
+  function dropSearchSession() { _searchSession = null; }
+
   /** 单曲行 + 末尾的「加载更多 / 已全部加载」提示 */
   function searchSongsTailHTML(sess) {
     if (!sess) return '';
@@ -4820,6 +5301,8 @@
 
   function showOnlineIntro() {
     App.onlineResults = null;
+    /* 这一页没有单曲列表了，旧的搜索会话必须一起作废（见 dropSearchSession） */
+    dropSearchSession();
     const ok = Netease.ready;
     const intro = $('#searchIntro');
     if (intro) intro.hidden = false;
@@ -4962,11 +5445,34 @@
     openSbTune();
   };
 
-  /** 拖动结束，原生回传新位置 */
+  /**
+   * 拖动结束，原生回传新位置。
+   *
+   * 坐标来自原生侧，必须是「有限数值」才能落盘：以前是原样写进 settings ——
+   * 原生算出一个 NaN（浮层被回收、尺寸为 0 时的除法）或超大值，
+   * 就会被持久化，下次启动浮层直接显示到屏幕外，且只有「恢复默认位置」能救回。
+   * 这里做两道校验：有限性 + 落在屏幕范围内的钳制。
+   * 校验不过就整次丢弃而不是写个坏值 —— 保留上一次的合法位置更安全。
+   */
   window.__rippleLyricMoved = function (x, y) {
-    S().sbX = x; S().sbY = y;
+    const nx = Number(x);
+    const ny = Number(y);
+    if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+      Log.add('LYRIC', 'overlay moved: rejected non-finite (' + x + ',' + y + ')');
+      return;
+    }
+    /*
+     * 上界用视口尺寸（浮层是覆盖在屏幕上的原生窗口，坐标系与视口一致；
+     * 内核对不齐时宁可多留一点余量）。下界给 0：负坐标会把浮层左上角推出屏幕。
+     */
+    const maxX = Math.max(0, Math.round(innerWidth || screen.width || 0));
+    const maxY = Math.max(0, Math.round(innerHeight || screen.height || 0));
+    S().sbX = Math.min(Math.max(0, Math.round(nx)), maxX);
+    S().sbY = Math.min(Math.max(0, Math.round(ny)), maxY);
     Store.save();
-    Log.add('LYRIC', 'overlay moved to ' + x + ',' + y);
+    /* 原生侧可能还留着拖动前的旧位置：把钳制后的坐标显式推回去，两边对齐 */
+    applySbOverlay(true);
+    Log.add('LYRIC', 'overlay moved to ' + S().sbX + ',' + S().sbY);
   };
 
   /* ---------- 调整面板 ---------- */
@@ -5710,23 +6216,48 @@
         box.style.transition = '';
         box.style.transform = '';
       };
-      grab.addEventListener('touchstart', (e) => {
+      const down = (y) => {
         active = true; dy = 0;
-        y0 = e.touches[0].clientY;
+        y0 = y;
         box.style.transition = 'none';
-      }, { passive: true });
-      grab.addEventListener('touchmove', (e) => {
+      };
+      const move = (y) => {
         if (!active) return;
-        dy = e.touches[0].clientY - y0;
+        dy = y - y0;
         if (dy > 0) box.style.transform = `translateY(${dy}px)`;
-      }, { passive: true });
-      grab.addEventListener('touchend', () => {
+      };
+      const up = () => {
         if (!active) return;
         active = false;
         reset();
         if (dy > 60) close();
-      });
-      // 鼠标（桌面调试）也支持
+      };
+      /*
+       * 手势用 Pointer Events 统一处理。
+       *
+       * 以前只绑了 touchstart/touchmove/touchend，注释却写「鼠标（桌面调试）也支持」
+       * —— 那句话是错的：鼠标按住小白条往下拖什么都不会发生。
+       * Pointer Events 一套事件同时覆盖触摸、鼠标、触控笔，且比分别绑 touch+mouse
+       * 更省心：同一设备的 touch 与 mouse 不会各触发一遍（那会让 dy 被算两次）。
+       * 触摸拖拽的语义完全不变：CSS 的 touch-action:none 已经阻止页面跟着滚。
+       *
+       * setPointerCapture 让手指/鼠标拖出小白条范围后仍能收到 move/up，
+       * 否则拖歪一点手势就断在半路、面板停在位移状态。
+       */
+      if (window.PointerEvent) {
+        grab.addEventListener('pointerdown', (e) => {
+          if (e.button != null && e.button !== 0) return;   // 只认主键（鼠标左键）
+          down(e.clientY);
+          try { grab.setPointerCapture(e.pointerId); } catch (err) {}
+        });
+        grab.addEventListener('pointermove', (e) => { move(e.clientY); });
+        grab.addEventListener('pointerup', up);
+        grab.addEventListener('pointercancel', up);
+      } else {
+        grab.addEventListener('touchstart', (e) => { down(e.touches[0].clientY); }, { passive: true });
+        grab.addEventListener('touchmove', (e) => { move(e.touches[0].clientY); }, { passive: true });
+        grab.addEventListener('touchend', up);
+      }
       grab.style.touchAction = 'none';
     });
 
@@ -5845,9 +6376,11 @@
   }
 
   /**
-   * 第 4 条：窗口信息并入「软件日志」。
-   * 以前它单独占一行，但它的用途只是排查（窄栏/断点没命中），
-   * 和日志是同一类东西；合在一起以后复制日志时窗口信息会一起带出去。
+   * 窗口信息已并入「软件日志」。
+   *
+   * 它不再单独占设置页一行（那段说明现在写在 index.html 的注释里），
+   * 但它的用途只是排查（窄栏 / 断点没命中），和日志是同一类东西 ——
+   * 于是由 showLog() 拼在日志最前面，复制日志时窗口信息会一起带出去。
    */
   function winInfoText() {
     const w = Math.round(innerWidth || 0), h = Math.round(innerHeight || 0);
@@ -6016,6 +6549,15 @@
   function rememberProgress(force) {
     const t = Player.track;
     if (!t) return;
+    /*
+     * 冷启动恢复还没把上次的位置写回元素之前，绝不能落盘。
+     *
+     * 恢复路径是「先 load 元素、1.2 秒后才 applyPos」的后台异步过程，
+     * 这期间 Player.time() 还是 0。如果此时 tick 或 state 事件把 0 写进
+     * lastPosition，用户恰好在这段时间退出，续播进度就永久丢了 ——
+     * App._restorePending 记录着「还有一次恢复待落地」，落地（或作废）时清掉。
+     */
+    if (App._restorePending != null) return;
     const now = Date.now();
     if (!force && now - _progressAt < PROGRESS_EVERY) return;
     /* 「已听分钟」统计：顺手把两次调用之间真正在播的秒数累加进去。
@@ -6052,7 +6594,8 @@
     /*
      * 接管序号必须在函数最开头登记。
      *
-     * 下面解析在线直链要串行试档、每档最长 22s，这期间用户完全可能自己点了歌。
+     * 下面解析在线直链要串行试几档音质，每档都是一次完整的 song_url 请求，
+     * 这期间用户完全可能自己点了歌。
      * 序号若等到解析完再自增，等于把自己追平到最新值，stillMine() 恒为真，
      * 守卫就形同虚设——这正是上一版「注释说修好了、实际没生效」的地方。
      */
@@ -6073,9 +6616,22 @@
       list = list.concat([t]);
     }
 
-    // 下标按「当前歌曲在队列中的真实位置」算，不要沿用旧下标
+    /*
+     * 下标按「当前歌曲在队列中的真实位置」算，不要沿用旧下标。
+     *
+     * 旧做法在找不到时还会退回 S().queueIndex，但它存的是「保存那一刻队列里的
+     * 位置」，而这里的 list 是 tracksFromIds(savedQueue) 重建出来的 ——
+     * 在线曲目不在 onlineCache 里时会被整个丢掉，队列缩短、下标前移，
+     * 拿旧下标对新队列取值就会恢复成另一首歌（正是上一轮修过的「截断后下标偏移」
+     * 的同一个坑，只是换了个入口）。
+     * 兜底改成「在保存的队列里找这首曲目的位置」，与主路径同一套语义：
+     * 位置永远由「这首歌在哪个列表里」算出来，而不是从外部塞进来。
+     */
     let at = list.findIndex((x) => t && x.id === t.id);
-    if (at < 0) at = Math.max(0, Math.min(list.length - 1, Number(S().queueIndex) || 0));
+    if (at < 0) {
+      const savedAt = t ? savedQueue.indexOf(t.id) : -1;
+      at = savedAt >= 0 ? Math.min(savedAt, list.length - 1) : 0;
+    }
     App.context = list;
 
     if (!t) {
@@ -6089,7 +6645,7 @@
       Log.add('RESTORE', 'resolve online ' + t.title + ' neId=' + t.neId + ' pos=' + savedPos);
       /*
        * 从设定音质往下退，但最多退 2 档。
-       * 原来一路退到 0（最多 5 次串行请求，每次最长 22s），
+       * 原来一路退到 0（最多 5 次串行请求，每次都各自受 song_url 的超时预算约束），
        * 连续点十几首歌就会打出几十个 song_url，很容易触发风控。
        */
       const lvTop = qualityLevel();
@@ -6129,8 +6685,11 @@
     /*
      * ⚠️ 这是一个「后台异步恢复」的过程，而 boot 并没有 await 它
      * （见 boot 里的 restoreLast().catch(...)），界面早已可交互。
-     * 解析在线地址最多要串行试 3 档、每档最长 25s，用户完全可能
-     * 在这 75 秒里自己点了别的歌。
+     * 解析在线地址要串行试几档音质，每档都是一次完整的 song_url 请求
+     * （各自的超时预算见 netease.js 的 CALL_TIMEOUT），
+     * 这些请求串起来耗时相当可观 —— 用户完全可能在这期间自己点了别的歌。
+     * 这里不写死「最长多少秒」：那会是几个超时预算相加出来的推断值，
+     * 而不是代码保证的上限，写进注释只会误导下一个读它的人。
      *
      * 以前这里没有任何「用户已接管」的判断，于是会直接把用户正在听的歌换掉；
      * 更隐蔽的是 applyPos 读的是外层 Player.el（而不是当时这首歌的元素），
@@ -6158,11 +6717,21 @@
      * 第二个参数传 false：恢复不该自动出声，仍停在暂停态等用户点。
      */
     let loadOk = true;
+    /*
+     * 恢复期间按下 App._restoring 标记：
+     * load() 内部会同步发 'track' 事件，而那个监听器默认把 lastPosition 归零
+     * 再强制落盘 —— 在恢复路径上这等于把「要恢复到哪儿」自己抹掉
+     * （详见 Player.on('track') 里的说明）。标志只在这一次同步 load 里有效，
+     * 用 finally 还原，避免异常时把全局状态留成 true、让之后真正的切歌不再归零进度。
+     */
+    App._restoring = true;
     try {
       Player.load(t, false);
     } catch (e) {
       loadOk = false;
       Log.err('RESTORE', e, 'Player.load failed: ' + t.title);
+    } finally {
+      App._restoring = false;
     }
     if (!loadOk) {
       /* load 失败（非法 URL 等）时退回最小实现，至少界面是对的 */
@@ -6180,17 +6749,39 @@
     const posEl = Player.el;
     const applyPos = () => {
       /* 用户已经接管播放：这次恢复的一切都不许再写播放器 */
-      if (!stillMine()) return;
+      if (!stillMine()) {
+        /*
+         * 作废也要摘掉标记，否则 rememberProgress 会一直被挡、进度再也不落盘。
+         * 此时元素上大概还是 0（恢复没落地），不能拿它去覆盖 lastPosition，
+         * 所以直接把标记清掉但不主动落盘：下一次 tick 还没恢复出真实位置，
+         * 就说明用户已经从这一首切走了，让新歌自己的进度去写。
+         */
+        App._restorePending = null;
+        return;
+      }
       const el = posEl;
-      if (!el) return;
+      if (!el) { App._restorePending = null; return; }
       const d = el.duration;
       const pos = (isFinite(d) && d > 0) ? Math.min(savedPos, d - 1) : savedPos;
       if (pos > 0.5) {
         try { el.currentTime = pos; } catch (e) {}
       }
+      /*
+       * 位置已经写回元素，恢复可以交棒给常规的 rememberProgress 了。
+       * 再显式落一次盘：这正是「恢复完成后立刻持久化」的时机，
+       * 不必等下一个 12 秒 tick —— 那 12 秒正是旧实现会丢进度的窗口。
+       */
+      App._restorePending = null;
+      rememberProgress(true);
       updateTimes();
       Log.add('RESTORE', 'restored ' + t.title + ' @' + pos.toFixed(1) + 's');
     };
+    /*
+     * 登记「有一次恢复待落地」：rememberProgress 在本函数把位置写回元素之前
+     * 一律不落盘（原因见 rememberProgress 顶部）。1200ms 的 setTimeout 兜底
+     * 之后标记一定会被摘掉，所以它不会永久挡住进度持久化。
+     */
+    App._restorePending = true;
     if (Player.el.readyState >= 1) applyPos();
     else Player.el.addEventListener('loadedmetadata', applyPos, { once: true });
     // 兜底：某些内核不触发 loadedmetadata

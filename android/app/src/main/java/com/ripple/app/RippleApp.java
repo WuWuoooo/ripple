@@ -25,7 +25,7 @@ public class RippleApp extends Application {
      * 正常路径下不起作用 —— 版本号优先从 PackageManager 读（J-04），
      * 免得有人绕开 build-apk.sh 手改版本后，日志里报的还是旧版本。
      */
-    private static final String FALLBACK_VERSION_TAG = "version=1.2.2(122)";
+    private static final String FALLBACK_VERSION_TAG = "version=1.2.3(123)";
 
     @Override
     public void onCreate() {
@@ -46,15 +46,17 @@ public class RippleApp extends Application {
          * 崩溃自保护：连续多次「没走到前台就重启」才关掉 edge-to-edge。
          *
          * 这里原来是 streak >= 1，等于「只要重启过一次就永久降级」——
-         * 而清零逻辑挂在 MainActivity 的 pageLoaded 回调里（延迟 2.6 秒），
-         * 用户如果在 2.6 秒内退出（试完就关、切走再回、点错就退），
+         * 而清零逻辑挂在 MainActivity.onPageFinished 之后（见 scheduleBootStreakClear：
+         * 页面加载完成再等 BOOT_OK_DELAY_MS = 5 秒，期间没有再次重建才算这次启动成功），
+         * 用户如果在那之前退出（试完就关、切走再回、点错就退），
          * streak 永远清不掉，于是**下次启动又进 safeMode**，越用越容易中。
          *
          * 症状很有辨识度：视口变矮约 60px、状态栏不被背景覆盖、
          * 整个页面下移、顶部内容被压在状态栏下方。
          *
          * 改成 3 次：真的连续崩 3 次才降级，偶发退出不受影响。
-         * 同时把「清零」也提前到 onCreate 之后只要没崩就清（见 MainActivity）。
+         * 清零时机也从「建 WebView 就清」挪到了「onPageFinished + 5 秒无重建」——
+         * 典型故障恰好发生在建 WebView 之后，清早了 safeMode 就永远不生效。
          */
         try {
             android.content.SharedPreferences sp = getSharedPreferences(SP, Context.MODE_PRIVATE);
@@ -69,7 +71,7 @@ public class RippleApp extends Application {
     }
 
     /**
-     * 运行时版本标记（"version=1.2.2(122)" 这种形状）。
+     * 运行时版本标记（"version=1.2.3(123)" 这种形状）。
      * 读不到时回落 FALLBACK_VERSION_TAG；任何异常都不能冒出去 ——
      * 这行日志是启动取证的一部分，不能反过来把启动搞挂。
      */

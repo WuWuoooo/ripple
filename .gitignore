@@ -12,6 +12,10 @@ android/local.properties
 # 运行时状态（都含登录态/访问令牌，绝不能提交）
 .ripple-cookie
 .ripple-token
+# 原子写的临时文件（server.js 写的是 <文件>.tmp-<pid>）：写到一半被杀时会留在这里，
+# 内容同样是明文登录态/令牌，别人的 git status 里不该看见它
+.ripple-cookie.tmp-*
+.ripple-token.tmp-*
 .dsh/
 
 # 系统

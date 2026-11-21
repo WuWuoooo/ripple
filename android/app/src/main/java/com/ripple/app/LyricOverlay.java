@@ -155,12 +155,12 @@ public class LyricOverlay {
                     try {
                         wm.updateViewLayout(view, lp);
                     } catch (Throwable e) {
-                        CrashLog.record(ctx, "lyric-move", e);
+                        CrashLog.recordAsync(ctx, "lyric-move", e);
                     }
                 }
                 updateLayoutFlags();
             } catch (Throwable e) {
-                CrashLog.record(ctx, "lyric-config", e);
+                CrashLog.recordAsync(ctx, "lyric-config", e);
             }
         });
     }
@@ -275,7 +275,7 @@ public class LyricOverlay {
                 added = true;
                 LogBridge.add(ctx, "LYRIC", "overlay shown locked=" + locked);
             } catch (Throwable e) {
-                CrashLog.record(ctx, "lyric-show", e);
+                CrashLog.recordAsync(ctx, "lyric-show", e);
                 LogBridge.add(ctx, "LYRIC", "show failed: " + e);
                 added = false;
             }
@@ -321,7 +321,7 @@ public class LyricOverlay {
                 view.setShadowLayer(0f, 0f, 0f, Color.TRANSPARENT);
             }
         } catch (Throwable e) {
-            CrashLog.record(ctx, "lyric-style", e);
+            CrashLog.recordAsync(ctx, "lyric-style", e);
         }
     }
 
@@ -332,14 +332,25 @@ public class LyricOverlay {
      * 这比「画两层文字裁切」轻得多，每帧只改 shader 的位置。
      */
     private void applyProgressFill() {
-        if (view == null) return;
+        /*
+         * J-08：把 view 抓成局部 final 再进闭包。
+         * 外层这个 null 判断只管「提交任务的那一刻」；任务真正跑起来之前，
+         * hide()（同样在主线程队列里）可能已经把字段 view 置空 ——
+         * 内层再去读 this.view.getMeasuredWidth() 就是 NPE。
+         * 虽然外层还有 try-catch(Throwable) 兜着不会崩，但会在崩溃记录里
+         * 留下一条 lyric-fill 假崩溃，污染真正的排查线索。
+         */
+        final TextView v = view;
+        if (v == null) return;
         try {
-            view.post(() -> {
+            v.post(() -> {
                 try {
-                    int w = Math.max(1, view.getMeasuredWidth());
+                    /* 任务执行时再复查一次：view 可能在这期间被 hide() 摘掉 */
+                    if (v.getParent() == null) return;
+                    int w = Math.max(1, v.getMeasuredWidth());
                     if (w <= 1) {
                         // 还没量到宽度，先给个纯色，下次进度来会补上
-                        view.setTextColor(color);
+                        v.setTextColor(color);
                         return;
                     }
                     float p = Math.max(0f, Math.min(1f, progress));
@@ -359,14 +370,14 @@ public class LyricOverlay {
                     }
                     android.graphics.LinearGradient g = new android.graphics.LinearGradient(
                             0, 0, w, 0, colors, pos, android.graphics.Shader.TileMode.CLAMP);
-                    view.getPaint().setShader(g);
-                    view.invalidate();
+                    v.getPaint().setShader(g);
+                    v.invalidate();
                 } catch (Throwable e) {
-                    CrashLog.record(ctx, "lyric-fill", e);
+                    CrashLog.recordAsync(ctx, "lyric-fill", e);
                 }
             });
         } catch (Throwable e) {
-            CrashLog.record(ctx, "lyric-fill-outer", e);
+            CrashLog.recordAsync(ctx, "lyric-fill-outer", e);
         }
     }
 
@@ -416,7 +427,11 @@ public class LyricOverlay {
                 // 状态栏下沿再往下一点点，落在状态栏和标题栏之间的空隙里
                 lp.y = statusH > 0 ? statusH - dp(2) : dp(26);
             } else {
-                lp.y = posY;
+                /*
+                 * J-10 的另一半：已经存进设置里的越界 y（老版本拖出去的）也要拉回来，
+                 * 否则升级后浮层仍然在屏幕外——用户不会想到是「旧的坏坐标」。
+                 */
+                lp.y = clampY(posY);
             }
             if (posX < 0) {
                 centerHorizontally();          // 默认：居中（要等窗口量出宽度）
@@ -426,7 +441,7 @@ public class LyricOverlay {
             LogBridge.add(ctx, "LYRIC", "position x=" + lp.x + " y=" + lp.y
                     + " (saved " + posX + "," + posY + ")");
         } catch (Throwable e) {
-            CrashLog.record(ctx, "lyric-pos", e);
+            CrashLog.recordAsync(ctx, "lyric-pos", e);
             if (lp != null) lp.y = dp(26);
         }
     }
@@ -452,7 +467,7 @@ public class LyricOverlay {
                     try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
                 }
             } catch (Throwable e) {
-                CrashLog.record(ctx, "lyric-center", e);
+                CrashLog.recordAsync(ctx, "lyric-center", e);
             }
         };
         if (v.getWidth() > 0) place.run();
@@ -469,6 +484,28 @@ public class LyricOverlay {
             return Math.max(0, Math.min(x, max));
         } catch (Throwable e) {
             return Math.max(0, x);
+        }
+    }
+
+    /**
+     * 把 y 钳到「窗口完全落在屏幕内」的范围 —— 与 clampX 对称（J-10）。
+     *
+     * 上限为什么不能省：浮层是 FLAG_LAYOUT_NO_LIMITS，越界不会被系统拦；
+     * 一旦拖出屏幕底边又被持久化，重启后它仍然在屏幕外，用户只会觉得
+     * 「歌词浮层设置打开了但什么都看不见」，且找不到原因。
+     *
+     * 高度取不到（还没量完）时不设上限 —— 宁可先不钳，也不能因为按 0 算
+     * 而把它强行顶回 y=0，那是另一种「拖不动」。
+     * 状态栏/导航栏的 inset 不参与计算：浮层本来就允许压在状态栏上。
+     */
+    private int clampY(int y) {
+        try {
+            int sh = ctx.getResources().getDisplayMetrics().heightPixels;
+            int vh = view != null ? view.getHeight() : 0;
+            int max = vh > 0 ? Math.max(0, sh - vh) : Integer.MAX_VALUE;
+            return Math.max(0, Math.min(y, max));
+        } catch (Throwable e) {
+            return Math.max(0, y);
         }
     }
 
@@ -489,7 +526,7 @@ public class LyricOverlay {
             wm.updateViewLayout(view, lp);
             LogBridge.add(ctx, "LYRIC", "flags updated locked=" + locked);
         } catch (Throwable e) {
-            CrashLog.record(ctx, "lyric-flags", e);
+            CrashLog.recordAsync(ctx, "lyric-flags", e);
         }
     }
 
@@ -512,7 +549,14 @@ public class LyricOverlay {
                     float dy = ev.getRawY() - down[1];
                     if (Math.abs(dx) > dp(3) || Math.abs(dy) > dp(3)) moved[0] = true;
                     lp.x = clampX(origin[0] + (int) dx);
-                    lp.y = Math.max(0, origin[1] + (int) dy);
+                    /*
+                     * J-10：y 方向补齐上限，与 clampX 对称。
+                     * 以前只有 Math.max(0, ...) 的下限 —— 配合 FLAG_LAYOUT_NO_LIMITS
+                     * （允许布局越界），用户能把歌词一直拖到屏幕底部之外。
+                     * 位置会被持久化（onMoved → 网页存设置），重启后它仍然在屏幕外，
+                     * 只能靠「恢复默认位置」救回来，用户当时的感觉就是「歌词不见了」。
+                     */
+                    lp.y = clampY(origin[1] + (int) dy);
                     try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
                     return true;
                 }

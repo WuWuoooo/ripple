@@ -26,11 +26,11 @@
 /* ---------- 0. 尺寸令牌 ---------- */
 :root{
   --pad-x:18px;            /* 页面左右内边距 */
-  --rail-w:0px;            /* 平板竖排导航宽度；手机上为 0 */
+  --rail-w:0px;            /* 左侧导航栏展开时的宽度；手机上为 0（导航在底部胶囊） */
+  --rail-mini:68px;        /* 左侧导航栏收起成图标条时的宽度 */
   --sheet-max:640px;       /* 底部面板最大宽度 */
   --content-max:100%;      /* 内容区最大宽度 */
   --np-pad-x:22px;         /* 播放页左右内边距 */
-  --np-cover-max:520px;    /* 播放页封面最大边长 */
   --grid-cols:2;           /* 首页 / 曲库网格列数 */
   --hero-pad:22px;
 }
@@ -40,19 +40,25 @@
   :root{--pad-x:22px;--sheet-max:560px;--content-max:660px;--grid-cols:3;}
 }
 
-/* 平板（竖屏 / 横屏） / 折叠屏展开 / 桌面：左侧竖排导航 + 满宽内容 */
+/* 平板（竖屏 / 横屏） / 折叠屏展开 / 桌面：左侧可折叠导航栏 + 满宽内容 */
 @media (min-width:700px) and (max-aspect-ratio: 184/100){
   :root{
-    --pad-x:26px;--rail-w:84px;--sheet-max:720px;--content-max:1100px;
-    --np-pad-x:30px;--np-cover-max:560px;--grid-cols:3;--hero-pad:26px;
+    /*
+     * 导航栏展开宽度必须容得下「图标 + 文字 + 内外边距」：
+     *   图标 19 + gap 11 + 「设置」两字约 26 + 左右 padding 22 + 栏内边距 20 ≈ 98
+     * 以前这里写 84，两字标签已经开始被截断（「发」「曲」「搜」「我」）。
+     * 取 112 是为了给三字以内的二级入口也留余量。
+     */
+    --pad-x:26px;--rail-w:138px;--sheet-max:720px;--content-max:1100px;
+    --np-pad-x:30px;--grid-cols:3;--hero-pad:26px;
   }
 }
 
 /* 宽平板横屏 / 桌面 */
 @media (min-width:1180px) and (max-aspect-ratio: 184/100){
   :root{
-    --pad-x:34px;--rail-w:92px;--sheet-max:820px;--content-max:1240px;
-    --np-pad-x:44px;--np-cover-max:600px;--grid-cols:4;--hero-pad:30px;
+    --pad-x:34px;--rail-w:150px;--sheet-max:820px;--content-max:1240px;
+    --np-pad-x:44px;--grid-cols:4;--hero-pad:30px;
   }
 }
 
@@ -90,30 +96,65 @@
   padding-right:max(var(--pad-x), calc((100% - var(--content-max)) / 2));
 }
 
-/* ---------- 2. 导航：手机上底部胶囊，平板上左侧竖排 ---------- */
+/* ---------- 2. 导航：手机上底部胶囊，宽屏上左侧可折叠导航栏 ----------
+ *
+ * 为什么宽屏要换成左侧栏而不是继续用底部胶囊：
+ * 横屏 / 桌面上垂直空间是稀缺资源（底部胶囊 62px + dock 60px 叠起来
+ * 接近整屏高度的四分之一），而横向空间反而富余。把导航挪到左侧，
+ * 底部只留 dock，内容区高度立刻多出一截。
+ *
+ * 收起态只留图标：宽屏用户想看内容时，导航栏是最该让位的那一块。
+ */
 @media (min-width:700px) and (max-aspect-ratio: 184/100){
-  .tabbar{
-    left:calc(var(--safe-l) + 14px);right:auto;
-    top:calc(var(--safe-t) + 18px);bottom:auto;
-    width:56px;height:auto;
-    flex-direction:column;justify-content:flex-start;
-    gap:2px;padding:10px 0;border-radius:26px;
-  }
-  .tabbar a{
-    width:48px;height:46px;padding:0;gap:4px;
-    justify-content:center;border-radius:16px;
-  }
-  .tabbar a.on{background:var(--accent-soft)}
-  /* 选中指示器从「顶部横线」改成「左侧竖条」 */
-  .tabbar a.on::after{
-    top:50%;left:-4px;width:3px;height:18px;
-    transform:translateY(-50%);border-radius:3px;
-  }
-  .tabbar svg{width:21px;height:21px}
-  .tabbar a{font-size:9.5px}
+  .rail{display:flex}
+  /* 底部胶囊在这一档彻底让位给左侧栏 */
+  .tabbar{display:none}
 
-  /* dock 与底部渐变要让开竖排导航 */
-  .dock{padding-left:calc(var(--safe-l) + var(--rail-w));padding-right:var(--safe-r)}
+  /*
+   * 收起态：只把宽度换成图标条的宽度，其余布局全部跟着 --rail-w 走
+   * （.app 的 padding-left、dock、底部渐变都读它），所以这里改一个变量
+   * 就等于整屏一起让位，不会出现「导航收起了但内容没动」的错位。
+   *
+   * 放在断点内是必要的：手机上 --rail-w 必须是 0（导航在底部），
+   * 若这条规则不加断点，平板收起后残留的 data-rail 属性会在手机上
+   * 撑出一条空白。
+   */
+  html[data-rail="mini"]{--rail-w:var(--rail-mini)}
+
+  /* dock 与底部渐变要让开左侧导航 */
+  .dock{
+    padding-left:calc(var(--safe-l) + var(--rail-w));padding-right:var(--safe-r);
+    /*
+     * 这一档的底部没有胶囊导航了（导航在左侧栏），
+     * 但 .dock 的定位还留着「给胶囊让位」的 +78px —— 结果迷你播放器
+     * 悬在离屏幕底 78px 的地方，下面空出一大条。
+     * 这里收回贴底间距：13px 是视觉呼吸（dock-inner 自己还有圆角与描边）。
+     */
+    bottom:calc(var(--safe-b) + 13px);
+  }
+  /*
+   * 迷你播放器要和内容区左右对齐。
+   *
+   * .dock 是 left:0;right:0 满宽，靠 padding-left 让开侧栏；而内容的左右
+   * 内边距是 max(--pad-x, (100% - --content-max)/2)（见 .page）。
+   * 只给 dock-inner 设 max-width + margin:auto 是不够的：它居中于
+   * 「已经扣掉侧栏」的那块区域，而内容是按同样的公式在算 —— 宽屏下
+   * 两者会差一个 --pad-x（实测迷你播放器比内容区两侧各多出 34px）。
+   * 所以这里用与 .page 完全相同的左右 padding，让两条对齐线同一个来源。
+   */
+  /*
+   * 左右两侧用同一个「多余宽度」公式：
+   *   .page 的左右内边距 = max(--pad-x, (内容区宽 - --content-max) / 2)
+   * 这里 --pad-x 那一档等价于「内容区宽 - --content-max <= 2*--pad-x 时贴边」，
+   * 所以统一写成 max(--pad-x, 余量/2) 与 .page 完全一致即可。
+   * 上一版右侧漏了 --pad-x 那一档，于是右边缘比内容区多出 34px。
+   */
+  .dock{
+    padding-left:calc(var(--safe-l) + var(--rail-w)
+      + max(var(--pad-x), (100% - var(--rail-w) - var(--content-max)) / 2));
+    padding-right:calc(var(--safe-r)
+      + max(var(--pad-x), (100% - var(--rail-w) - var(--content-max)) / 2));
+  }
   .dock-inner{max-width:var(--content-max);margin:0 auto}
   .bottom-scrim{left:calc(var(--safe-l) + var(--rail-w))}
   /*
@@ -178,14 +219,33 @@
 }
 
 @media (min-width:1180px) and (max-aspect-ratio: 184/100){
-  /* 设置页在大屏上分两栏，别留一大片空白 */
-  [data-page="settings"]{
-    display:grid;grid-template-columns:1fr 1fr;
-    align-content:start;gap:0 28px;
+  /*
+   * 设置页在大屏上分两栏。
+   *
+   * 用两个独立的列容器（.set-cols > .set-col），不是 grid、也不是 columns。
+   *
+   * 为什么不 grid：grid 按「行」对齐，同一行左右两个格子必须等高。
+   *   各分组的行数差别很大（「播放」8 行 vs 「界面」6 行），矮的那一侧
+   *   下方就空出一大块（实测「界面」下面空 133~157px）。加 align-items:start
+   *   只让格子本身不拉伸，空位仍然占着布局位置，看起来还是「隔了一段」。
+   * 为什么不 columns：.page 是可滚动容器，columns 会把内容按行内宽度切列，
+   *   实测各分组 left 一路涨到 3918px（排成一条横向长条）。
+   *
+   * 两个独立列容器各自按内容高度自然堆叠，没有任何对齐约束，空洞消失。
+   * 手机上 .set-cols 退化为 block，顺序即 DOM 顺序，所以 HTML 里已经把
+   * 分组按阅读优先级分好了（见 index.html 的注释）。
+   */
+  .set-cols{
+    display:grid;grid-template-columns:1fr 1fr;gap:0 28px;
+    align-items:start;
   }
-  [data-page="settings"] > .set-group{margin-top:16px}
-  [data-page="settings"] > .set-group:first-of-type{grid-column:1 / -1}
-  [data-page="settings"] > .about-note{grid-column:1 / -1}
+  .set-col{min-width:0}
+  /*
+   * 「关于」和底部免责说明不属于任何一栏：它们本来就在 .set-cols 之外，
+   * 自然横跨整行，不需要额外规则。这里只是确认 .set-group 的间距在
+   * 列容器内外保持一致（列内用同一条 margin-top）。
+   */
+  .set-col > .set-group:first-child{margin-top:16px}
 }
 
 /* ---------- 4. 底部面板：大屏上居中限宽 ---------- */
@@ -193,7 +253,14 @@
   .np-sheet{
     left:50%;right:auto;width:min(var(--sheet-max),calc(100% - 48px));
     border-radius:26px 26px 0 0;
-    transform:translate(-50%,101%);
+    /*
+     * 面板收起的位移必须写成「自身高度 + 40px」而不是 101%。
+     * 101% 相对自身高度算，矮面板（评论、均衡器）扣掉 padding / 边框后
+     * 剩下那点距离不够把它推出屏幕，底部会露出一条顶端 ——
+     * base.css 里那段注释记录过「底部莫名多出一条评论栏」就是这么来的。
+     * 这一档以前漏改了，>=600px 的宽屏上矮面板收起仍会露顶。
+     */
+    transform:translate(-50%,calc(100% + 40px));
   }
   .np-sheet.on{transform:translate(-50%,0)}
   .np-sheet.peek{transform:translate(-50%,0)}
@@ -236,7 +303,7 @@
   .np-flexspacer{display:none}
 
   /*
-   * 这里原本有 max-width/max-height: var(--np-cover-max)。
+   * 这里原本有一对 max-width/max-height 令牌上限。
    * 必须删掉：封面的边长完全由 JS 的 sizeCover() 写成 px，
    * CSS 再加一道上限就会和 JS 算出来的值打架 ——
    * 而设计上还要求「动画期间尺寸冻结」，CSS 上限是另一套不听话的约束，
@@ -297,7 +364,15 @@
   }
   .tabbar svg{width:18px;height:18px}
   .app{padding-left:var(--safe-l)}
-  .dock{padding-left:var(--safe-l);padding-right:var(--safe-r)}
+  /*
+   * 这两行原来写的是 padding-left:var(--safe-l) —— 把 layouts.css 里
+   * .dock 的 14px 内边距整个抹掉了，于是 dock 贴到屏幕左右边缘（全宽），
+   * 而底部胶囊仍是 left/right:12px，两行宽度对不齐，视觉上就是明显的错位。
+   * 这一档没有左侧栏，需要让开的安全区只有 safe-l / safe-r。
+   * 取 12px 与底部胶囊的 left/right:12px 一致（不是 layouts.css 里的 14px）——
+   * dock 与胶囊在这里是上下相邻的两条，边距必须是同一个数字才对齐。
+   */
+  .dock{padding-left:calc(var(--safe-l) + 12px);padding-right:calc(var(--safe-r) + 12px)}
   .dock-inner{max-width:none}
   .bottom-scrim{left:0}
   .page{padding-bottom:calc(var(--safe-b) + 128px)}
@@ -453,7 +528,24 @@
    · 面板改成纯色底，省掉 backdrop-filter 的整块重采样
    · 关掉页面入场动画
    画质优先的用户可以在设置里强制关掉它。 */
-html.perf-low .ambient{filter:blur(46px);opacity:.34}
+/*
+ * 低配档的氛围光不再挂 46px 高斯模糊。
+ *
+ * base.css 里删掉父层模糊的理由是「整层重采样是帧率腰斩的来源」，
+ * 但这里又给低配单独加回来了一层 —— 静态时看着只算一次似乎成立，
+ * 可氛围光消费的是 var(--accent)，而 accent 注册了 0.5s 颜色过渡：
+ * 每次切歌取色 / 换主题，低配机都要把这块 46px 模糊整层重算一遍。
+ * 低配机最该省掉的恰好就是这个。
+ *
+ * 改用「更大的扩散半径 + 更低不透明度」来表达同样的雾感：
+ * radial-gradient 的过渡本身不花 GPU 采样，纯填充。
+ */
+html.perf-low .ambient{
+  filter:none;opacity:.3;
+  background:
+    radial-gradient(58% 58% at 22% 18%,var(--accent),transparent 72%),
+    radial-gradient(52% 52% at 78% 74%,var(--accent2),transparent 74%);
+}
 html.perf-low .ambient i{animation:none!important}
 html.perf-low .grain{display:none}
 html.perf-low .page.on{animation:none}

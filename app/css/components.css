@@ -170,8 +170,14 @@ body.compact .qitem{padding-top:3px;padding-bottom:3px}
   border-radius:12px;padding:10px 12px;color:var(--text);font-size:12px;outline:none}
 .cmt-in::placeholder{color:var(--text3)}
 .cmt-in:focus{border-color:var(--accent)}
+/*
+ * 文字色用 --accent-ink：它由 app.js 按当前 accent 的明度统一算出来
+ * （深底出浅字、浅底出深字），同页的 .btn.solid 也用它。
+ * 以前这里硬编码 #062018（深绿），一旦动态取色换到橙色/紫色系 accent，
+ * 深绿字就压在同类明度的底色上，对比度完全不受控；换封面、换主题时这一处也不跟随。
+ */
 .cmt-go{flex:none;border:none;border-radius:12px;padding:10px 16px;font-size:12px;
-  font-weight:600;background:var(--accent);color:#062018}
+  font-weight:600;background:var(--accent);color:var(--accent-ink)}
 .cmt-go:disabled{opacity:.45}
 
 .cmt{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
