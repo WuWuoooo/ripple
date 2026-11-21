@@ -179,14 +179,16 @@ jobs:
           - os: macos-latest
             label: macOS-arm64
             artifact: macos-arm64
-    # macOS 可手动关掉。
-    #
-    # 注意 `if` 只接受**单行**表达式 —— 早先写成 `if: |` 的多行字面量，
-    # GitHub 直接把整个 workflow 判为无效（run 创建出来但 0 个 job，
-    # created_at 与 updated_at 同一秒，日志接口 404），排查时很费劲。
-    # `inputs.build_macos` 在 workflow_dispatch 之外是 null，用 `!= false`
-    # 让「非手动触发」时保持为真；写成 `inputs.build_macos` 会因 null 判假而误跳过。
-    if: ${{ matrix.os != 'macos-latest' || github.event_name != 'workflow_dispatch' || inputs.build_macos != false }}
+        # 手动 dispatch 且 build_macos=false 时剔除 macOS 那一项。
+        #
+        # 为什么用 matrix exclude 而不是 job 级 if：
+        # job 级 `if` **不认 `matrix` 上下文**（matrix 只在 strategy 展开后
+        # 的 step 级才存在）。写成 `if: matrix.os != 'macos-latest'` 会让整个
+        # workflow 在解析阶段校验失败，报 "Unrecognized named-value: 'matrix'"；
+        # 那种失败的形态极具误导性 —— run 会被创建、却**一个 job 都不跑**
+        # （created_at 与 updated_at 同一秒、日志接口 404），从 Actions 页面
+        # 完全看不出原因。另外 `if: |` 多行字面量同样非法，它只接受单行表达式。
+        exclude: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_macos == false) && fromJSON('[{"os":"macos-latest"}]') || fromJSON('[]') }}
     steps:
       - uses: actions/checkout@v7
 
