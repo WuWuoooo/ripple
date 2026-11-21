@@ -28,7 +28,8 @@ const HOST: &str = "https://music.163.com";
 ///
 /// 网易云会按 UA 判断客户端类型；UA 不一致时部分接口（尤其 song_url）
 /// 返回的可用音质档位会不同。
-const UA: &str = "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) \
+const UA: &str =
+    "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) \
                   Chrome/124.0.0.0 Mobile Safari/537.36";
 
 pub struct Client {
@@ -50,7 +51,11 @@ impl Client {
             .build()
             .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
 
-        Ok(Self { http, cookie_jar, cookie_path })
+        Ok(Self {
+            http,
+            cookie_jar,
+            cookie_path,
+        })
     }
 
     /// 落盘 cookie。
@@ -86,15 +91,18 @@ impl Client {
         // 上游路径白名单：只允许 [a-z0-9/_-]，天然排除 .. / % / \ / ? / # 等
         // 能改变路径含义的字符（与 server-security.js 的 assertUpstreamPath 同口径）
         if path.is_empty()
-            || !path
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-')
+            || !path.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+            })
         {
             return Err(format!("非法上游路径：{path}"));
         }
 
         let form = weapi::form(&body.to_string());
-        let url = format!("{HOST}/weapi/{path}?csrf_token={}", weapi::url_encode(&self.csrf()));
+        let url = format!(
+            "{HOST}/weapi/{path}?csrf_token={}",
+            weapi::url_encode(&self.csrf())
+        );
         let cookie = format!("os=android; appver=8.9.70; osver=13; {}", self.cookie_jar);
 
         let res = self
@@ -111,7 +119,12 @@ impl Client {
 
         // 并发请求可能同时收到 Set-Cookie；这里按行合并进 jar，
         // 值形如 deleted/null 的按「删除」处理（与 server.js 一致）
-        if let Some(lines) = res.headers().get_all(reqwest::header::SET_COOKIE).iter().next() {
+        if let Some(lines) = res
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .next()
+        {
             let _ = lines;
         }
         let set_cookies: Vec<String> = res
@@ -128,14 +141,24 @@ impl Client {
                 .filter_map(|p| {
                     let p = p.trim();
                     let (k, v) = p.split_once('=')?;
-                    if k.is_empty() { None } else { Some((k.to_string(), v.to_string())) }
+                    if k.is_empty() {
+                        None
+                    } else {
+                        Some((k.to_string(), v.to_string()))
+                    }
                 })
                 .collect();
             for line in &set_cookies {
                 let pair = line.split(';').next().unwrap_or("").trim();
-                let Some((k, v)) = pair.split_once('=') else { continue };
-                if k.is_empty() { continue }
-                let deleted = v.is_empty() || v.eq_ignore_ascii_case("deleted") || v.eq_ignore_ascii_case("null");
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                if k.is_empty() {
+                    continue;
+                }
+                let deleted = v.is_empty()
+                    || v.eq_ignore_ascii_case("deleted")
+                    || v.eq_ignore_ascii_case("null");
                 jar.retain(|(jk, _)| jk != k);
                 if !deleted {
                     jar.push((k.to_string(), v.to_string()));
@@ -455,7 +478,11 @@ impl Client {
 }
 
 fn or_default(v: &str, d: &str) -> String {
-    if v.is_empty() { d.to_string() } else { v.to_string() }
+    if v.is_empty() {
+        d.to_string()
+    } else {
+        v.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -466,17 +493,29 @@ mod tests {
     fn upstream_path_whitelist_rejects_traversal() {
         // 这条白名单与 server-security.js 的 assertUpstreamPath 同口径：
         // 小写字母 / 数字 / 斜杠 / 下划线 / 连字符之外一律拒
-        let bad = ["../user/level", "a%2e%2e/b", "a\\b", "a?x=1", "a#frag", "A/uppercase"];
+        let bad = [
+            "../user/level",
+            "a%2e%2e/b",
+            "a\\b",
+            "a?x=1",
+            "a#frag",
+            "A/uppercase",
+        ];
         for b in bad {
             let ok = !b.is_empty()
-                && b.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-');
+                && b.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+                });
             assert!(!ok, "路径 {b} 不该通过白名单");
         }
-        for g in ["w/nuser/account/get", "v3/song/detail", "song/enhance/player/url/v1"] {
-            let ok = g
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-');
+        for g in [
+            "w/nuser/account/get",
+            "v3/song/detail",
+            "song/enhance/player/url/v1",
+        ] {
+            let ok = g.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+            });
             assert!(ok, "合法路径 {g} 应通过");
         }
     }

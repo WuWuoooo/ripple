@@ -45,7 +45,10 @@ fn get_or_init_client(
     state: &State<'_, AppState>,
     data_dir: &PathBuf,
 ) -> Result<Arc<Mutex<netease::Client>>, String> {
-    let mut guard = state.client.lock().map_err(|e| format!("状态锁被污染：{e}"))?;
+    let mut guard = state
+        .client
+        .lock()
+        .map_err(|e| format!("状态锁被污染：{e}"))?;
     if let Some(c) = guard.as_ref() {
         return Ok(Arc::clone(c));
     }

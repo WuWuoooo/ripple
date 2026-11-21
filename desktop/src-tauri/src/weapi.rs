@@ -177,8 +177,14 @@ mod tests {
         assert!(f.contains("&encSecKey="), "必须含 encSecKey 分隔符");
         // base64 的 + / = 必须被转义，否则服务端解析会错位
         let (p, k) = f.split_once("&encSecKey=").unwrap();
-        assert!(!p.contains('+') || p.contains("%2B"), "params 里的 + 未转义");
-        assert!(!p.contains('/') || p.contains("%2F"), "params 里的 / 未转义");
+        assert!(
+            !p.contains('+') || p.contains("%2B"),
+            "params 里的 + 未转义"
+        );
+        assert!(
+            !p.contains('/') || p.contains("%2F"),
+            "params 里的 / 未转义"
+        );
         assert!(!k.contains('='), "encSecKey 不该含未转义的 =");
     }
 
