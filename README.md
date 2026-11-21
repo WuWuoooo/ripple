@@ -2,12 +2,18 @@
 
 **简体中文** | [English](./docs/en/README_en.md)
 
-> 一个会呼吸的 Android 音乐播放器。液态玻璃单套观感，深色 / 浅色双主题，封面自动取色。
+> 一个会呼吸的音乐播放器。液态玻璃单套观感，深色 / 浅色双主题，封面自动取色。
 > 在线内容走网易云真实接口（weapi 加密），支持登录自己的账号、每日推荐、心动模式与无限漫游。
 
 <p align="center">
   <b>PWA + 原生外壳</b> · <b>约 0.5 MB（APK）</b> · <b>构建不依赖 Gradle</b> · <b>无 AndroidX</b> · <b>MIT</b>
 </p>
+
+**平台**：Android（APK）· 浏览器 / PWA（`node server.js`）· 桌面端（Tauri，**验证中，未发布**）
+
+> 桌面端正在 `feat/desktop-tauri` 分支上开发，复用同一份前端。
+> 它**还没有**进公开 Release —— 构建产物只作为 Actions Artifacts 供实测。
+> 详见 [desktop/README.md](desktop/README.md)。
 
 ---
 
@@ -44,7 +50,7 @@
 **界面**
 
 - 单一「液态玻璃」观感。不搞多套皮肤 —— 一套做透
-- edge-to-edge 全屏：状态栏 / 导航栏透明，颜色跟着页面背景和封面主色走
+- edge-to-edge 全屏（Android）：状态栏 / 导航栏透明，颜色跟着页面背景和封面主色走
 - 播放页三行歌词（点开是完整歌词），封面动态取色，VIP 角标
 - 右上角「…」是所有播放相关设置的入口，不必绕回「我的」
 - 评论加载骨架屏，不闪不跳
@@ -57,12 +63,16 @@
 > 均衡器只对**本机导入**的歌曲生效。在线流走直连解码（网易云音频 CDN 不返回 CORS 头，
 > 强行接进 WebAudio 会被判污染并静音），播在线歌时面板会明确提示，不会假装有反应。
 
-**通知与状态栏**
+**通知与状态栏**（Android 专属）
 
-- 前台服务 + MediaSession：通知固定不可滑掉，锁屏可控、耳机键可控
+- 前台服务 + MediaSession：通知固定不可滑掉、锁屏可控、耳机键可控
 - 状态栏歌词悬浮窗：颜色（含自绘取色器）、字号、不透明度、加粗、描边、
   **跟随播放进度填充**
 - **锁定态完全不拦触摸**，不影响你正常用手机；解锁后才能拖动位置
+
+> 这三项依赖 Android 的窗口与媒体系统，浏览器和桌面端没有对等物。
+> 桌面端目前**没有**通知栏媒体控制与歌词浮层（计划做系统托盘 / SMTP·MPRIS，
+> 见 [desktop/README.md](desktop/README.md) 的功能对照表）。
 
 **网易云**
 
@@ -78,6 +88,10 @@
 - **不内置任何音乐资源**，不提供下载站
 - **不绕过会员、付费或地区限制**。取不到音源就明确告诉你取不到
 - 不承诺通知栏长得像某个 App —— 外观由系统按 MediaSession 渲染，厂商主题说了算
+- **不给桌面端做代码签名**：Windows / macOS 的签名证书要花钱，本项目不做。
+  所以桌面端包首次运行会被系统拦（Windows SmartScreen / macOS Gatekeeper），
+  绕过方法写在 [desktop/README.md](desktop/README.md) 里 ——
+  如实告知，而不是假装安全
 
 ## 安装
 
@@ -146,11 +160,17 @@ app/                    ← 网页版，同时是 APK 里的 assets/www
 └── sw.js               ← Service Worker
 
 android/                ← Java 外壳（11 个类，见 CONTRIBUTING.md 的「代码结构」）
+desktop/                ← 桌面端（Tauri）—— 验证中，见 desktop/README.md
+├── bridge.js           ← 把 RippleNative 桥照原样造出来，前端零改动
+├── build-frontend.sh   ← app/ + bridge.js → dist/（纯 bash，无 npm）
+└── src-tauri/          ← Rust：weapi 加密 + 20 个网易云命令 + Tauri 入口
 server.js               ← 浏览器模式的本地服务（静态 + /ncm 代理）
 server-security.js      ← 上面那个服务的安全判定（Host / 同源 / 令牌 / 上游路径），可直接单测
 version.json            ← 版本号唯一来源
 tests/                  ← Node 内置测试（bash tests/run.sh）：LRC 解析 + server 安全判定
 ```
+
+三端共用同一份 `app/`：改前端只改这里，Android / 浏览器 / 桌面同时生效。
 
 ## 隐私
 
@@ -176,7 +196,12 @@ tests/                  ← Node 内置测试（bash tests/run.sh）：LRC 解�
 ## 参与
 
 欢迎提 issue 和 PR，动手前请先看 [CONTRIBUTING.md](CONTRIBUTING.md)。
-请注意本项目刻意不引入 Kotlin / AndroidX / npm 依赖 / 前端构建链——这是它能保持「一个 `node server.js` 就跑起来」的前提。
+**Android / 网页版**刻意不引入 Kotlin / AndroidX / npm 依赖 / 前端构建链 ——
+这是它能保持「一个 `node server.js` 就跑起来」的前提。
+
+**桌面端**（`desktop/`，验证中）打破了这一条：它需要 cargo 与 Rust 依赖树。
+这是引入系统级客户端能力的必然代价，所以把它隔离在独立目录、独立 CI 里，
+**不影响**前两端的零依赖构建。取舍写在 [desktop/README.md](desktop/README.md)。
 
 跑测试：`bash tests/run.sh`（Node 内置 test runner，不需要 `npm install`）。
 

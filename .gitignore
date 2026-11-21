@@ -54,3 +54,16 @@ tools/
 .workbuddy/
 
 # 注意：docs/screenshots/ 要入库（README 会引用这些图），不要加进忽略列表
+
+# ---------- 桌面端（Tauri）----------
+# Rust 构建产物：cargo 会生成几百 MB 的中间文件，绝不能入库
+desktop/src-tauri/target/
+# 由 desktop/build-frontend.sh 从 app/ 复制 + 注入 bridge.js 生成，
+# 是构建产物而不是源码（改前端只改 app/，不要改这里）
+desktop/dist/
+# Tauri CLI 生成的能力 schema
+desktop/src-tauri/gen/
+
+# ---------- Rust 通用 ----------
+**/*.rs.bk
+Cargo.lock.orig

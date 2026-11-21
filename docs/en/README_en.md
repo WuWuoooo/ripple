@@ -2,12 +2,18 @@
 
 [简体中文](../../README.md) | **English**
 
-> A breathing Android music player. A single "liquid glass" visual language, dark / light dual themes, and automatic cover art color extraction.
+> A breathing music player. A single "liquid glass" visual language, dark / light dual themes, and automatic cover art color extraction.
 > Online content uses the real NetEase Cloud Music API (weapi encryption), and supports logging in to your own account, Daily Recommendations, Heartbeat Mode, and Infinite Roam.
 
 <p align="center">
   <b>PWA + native shell</b> · <b>approx. 0.5 MB (APK)</b> · <b>build does not depend on Gradle</b> · <b>no AndroidX</b> · <b>MIT</b>
 </p>
+
+**Platforms:** Android (APK) · browser / PWA (`node server.js`) · desktop (Tauri, **in validation, unreleased**)
+
+> The desktop client is being developed on the `feat/desktop-tauri` branch and reuses the same frontend.
+> It is **not** in public Releases yet — build outputs are uploaded only as Actions Artifacts for hands-on testing.
+> See [desktop/README.md](../../desktop/README.md).
 
 ---
 
@@ -162,7 +168,12 @@ For security-related matters, please read [SECURITY.md](SECURITY.md).
 ## Contributing
 
 Issues and PRs are welcome. Before you start, please read [CONTRIBUTING.md](CONTRIBUTING.md).
-Please note that this project deliberately does not introduce Kotlin / AndroidX / npm dependencies / a frontend build chain — this is the prerequisite for keeping it runnable with just `node server.js`.
+**Android / web** deliberately introduce no Kotlin / AndroidX / npm dependencies / frontend build chain —
+that is the prerequisite for keeping it runnable with just `node server.js`.
+
+**The desktop client** (`desktop/`, in validation) breaks that rule: it needs cargo and a Rust dependency tree.
+That is the unavoidable cost of native desktop capabilities, so it is isolated in its own directory with its own CI,
+**leaving the zero-dependency builds of the other two platforms untouched**. The trade-off is documented in [desktop/README.md](../../desktop/README.md).
 
 Run tests: `bash tests/run.sh` (Node built-in test runner, no `npm install` required).
 

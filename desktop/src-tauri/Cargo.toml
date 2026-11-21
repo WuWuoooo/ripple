@@ -1,0 +1,61 @@
+[package]
+name = "ripple-desktop"
+version = "1.2.3"
+description = "Ripple 涟漪 · 桌面客户端"
+authors = ["WuWuoooo"]
+edition = "2021"
+rust-version = "1.77"
+
+# 产物名跟着平台走：Windows 是 Ripple.exe，其余是 ripple
+[[bin]]
+name = "ripple"
+path = "src/main.rs"
+
+[lib]
+name = "ripple_desktop"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+
+# 网易云 weapi 需要的三件套：
+#   aes/cbc/pkcs7  → AES-128-CBC 两次
+#   base64         → 层间编码
+#   num-bigint     → textbook RSA（无 padding，模幂）
+aes = "0.8"
+cbc = "0.1"
+base64 = "0.22"
+num-bigint = "0.4"
+num-traits = "0.2"
+sha1 = "0.10"
+rand = "0.8"
+
+# HTTP：必须能带 cookie jar 和控制 header，reqwest 的 blocking 版够用
+# 且不需要拉 tokio runtime 进 Tauri 的主线程逻辑
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "gzip",
+] }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Tauri 2 的默认 feature 会把不必要的模块拉进来；桌面端只要 webview
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# 桌面端体积敏感：Tauri 官方推荐组合
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

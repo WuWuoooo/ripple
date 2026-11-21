@@ -7,6 +7,56 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
 
 ---
 
+## 未发布 · 桌面端（Tauri）验证分支
+
+> 这一节对应 `feat/desktop-tauri` 分支，**不在任何 Release 里**。
+> 产物只上传为 Actions Artifacts 供实测，验证通过后再并入 `main`。
+
+### 一、新增桌面端（Windows / Linux）
+
+用 Tauri 2 把 `app/` 那 13000 行前端原样搬到桌面，**前端一行不改**。
+
+做法是在页面里把 Android 的 `@JavascriptInterface` 桥照原样造一份：
+`bridge.js`（86 行）提供 `window.RippleNative`，内部转发到 Tauri 的 Rust 命令。
+前端完全感知不到差别 —— 它以为自己在跟 Java 说话。
+
+- **Rust 侧 weapi 加密**：AES-128-CBC 双层 + textbook RSA，与 Java / Node 两侧
+  常量逐字符一致。带 9 条固定向量测试 —— 这段代码错一个字节，网易云只回
+  `{"code":400}`，界面上完全看不出是填充错了还是 base64 换行不同
+- **20 个命令**与 Java / server.js 逐条对齐（前端调用 20 个，一个不漏）
+- **纯 bash 组装前端**：`build-frontend.sh` 复制 `app/` 并注入桥接层，
+  不需要 npm / 前端构建链
+
+### 二、三条判定与已知差异
+
+- **不给桌面端做代码签名**：Windows 证书要花钱、macOS 要 Apple Developer
+  （$99/年）+ 公证。选择「如实告知绕过方法」而不是假装安全
+- **桌面端取消 macOS**：本机（aarch64 Ubuntu proot）绝对无法产出 macOS 产物，
+  需要 Apple SDK 与签名证书。先出 Windows + Linux，macOS 留待有条件时再做
+- **扫码登录暂缺**：底层命令（`login_qr_key` / `login_qr_check`）已备好，
+  但 UI 要改 `app/js/app.js` 的登录弹窗 —— 那是「前端零改动」的第一次破例，
+  留作单独决策。当前用「把 MUSIC_U 写进配置目录」的方式登录
+
+### 三、开发中修掉的三个真实缺陷
+
+1. **并发时 cookie 会分裂**：最初写成「取出 Client → 请求 → 放回」，
+   请求期间共享状态是 `None`，并发命令会各建一个 Client，两个 jar 互相覆盖，
+   登录态随机丢失。前端首页确实会并发（每日推荐 + 推荐歌单 + 排行榜同时拉），
+   所以是真实缺陷。改成 `Arc<Mutex<Client>>` 共享实例
+2. **`mod` 两边都声明**：`main.rs` 和 `lib.rs` 都写 `mod netease;` 会让同一份代码
+   编译两次，变成两个互不相干的类型。改成 lib 里 `pub mod`、main 里 `use`
+3. **9 处命令参数口径写错**：`like` 实际走 `song/like` 不是 `radio/like`、
+   `heart_mode` 用 `songId` 不是 `id`、`song_detail` 的参数是
+   `{c:'[{"id":1}]'}` 不是 `ids` 等，已全部按真实实现改正
+
+### 四、文档
+
+主 README 增加了平台矩阵与「桌面端验证中」的说明，并把三处 Android 专属卖点
+（通知栏 / 状态栏歌词 / edge-to-edge）明确标注为 Android 专属，避免误导。
+`desktop/README.md` 写了功能对照表、未签名包的绕过方法、三个踩坑记录。
+
+---
+
 ## 1.2.3 — 第六个版本
 
 ### 一、按来自 GLM-5.3 Flash 的代码审查报告整改（71 条全覆盖）
