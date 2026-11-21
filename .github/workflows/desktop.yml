@@ -179,11 +179,14 @@ jobs:
           - os: macos-latest
             label: macOS-arm64
             artifact: macos-arm64
-    # macOS 可手动关掉
-    if: |
-      github.event_name != 'workflow_dispatch' ||
-      inputs.build_macos ||
-      matrix.os != 'macos-latest'
+    # macOS 可手动关掉。
+    #
+    # 注意 `if` 只接受**单行**表达式 —— 早先写成 `if: |` 的多行字面量，
+    # GitHub 直接把整个 workflow 判为无效（run 创建出来但 0 个 job，
+    # created_at 与 updated_at 同一秒，日志接口 404），排查时很费劲。
+    # `inputs.build_macos` 在 workflow_dispatch 之外是 null，用 `!= false`
+    # 让「非手动触发」时保持为真；写成 `inputs.build_macos` 会因 null 判假而误跳过。
+    if: ${{ matrix.os != 'macos-latest' || github.event_name != 'workflow_dispatch' || inputs.build_macos != false }}
     steps:
       - uses: actions/checkout@v7
 
