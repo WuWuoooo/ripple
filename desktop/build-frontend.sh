@@ -35,7 +35,14 @@ cp "$HERE/bridge.js" "$DIST/bridge.js"
 #    用 python 而不是 sed：要处理「找不到锚点就报错」这件事，
 #    sed 静默失配会让构建出一个「看起来成功但桥没注入」的包。
 python3 - "$DIST/index.html" <<'PY'
+# Windows 的 Python 默认用系统代码页（cp1252）输出，中文会直接抛
+# UnicodeEncodeError: 'charmap' codec can't encode characters。
+# 这在 Linux 上永远复现不了，只有 CI 的 windows-latest 会红。
+# 强制把 stdout/stderr 切成 UTF-8 是跨平台最省事的解法。
 import sys, re
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 path = sys.argv[1]
 html = open(path, encoding='utf-8').read()
@@ -64,6 +71,9 @@ echo "[desktop] 版本 $VNAME ($VCODE)"
 
 python3 - "$HERE/src-tauri/tauri.conf.json" "$VNAME" <<'PY'
 import json, sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 path, ver = sys.argv[1], sys.argv[2]
 conf = json.load(open(path, encoding='utf-8'))
 if conf.get('version') != ver:
