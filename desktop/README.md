@@ -201,3 +201,88 @@ AES 填充错了还是 base64 换行不同。所以 `weapi.rs` 带了一组固�
 
 改前端只改 `app/`，然后重跑 `build-frontend.sh`。
 **不要改 `desktop/dist/`** —— 它是复制出来的，下次构建就被覆盖。
+
+---
+
+## CI 踩坑记录（改 workflow 前必读）
+
+这一轮把三平台 CI 真正跑通，踩了五个坑，每个都表现为「完全没有错误信息」：
+
+### 1. job 级 `if` 里不能用 `matrix`
+
+```yaml
+# ✗ 整个 workflow 解析失败
+if: matrix.os != 'macos-latest'
+```
+
+报 `Unrecognized named-value: 'matrix'`。`matrix` 只在 strategy 展开**之后**的
+step 级才有。而且这个失败发生在解析阶段：**run 会被创建、却一个 job 都不跑**，
+日志接口直接 404，从 Actions 页面完全看不出原因。
+
+正确做法：用 `matrix.exclude` 剔掉不想要的那一项。
+
+### 2. `if: |` 多行字面量非法
+
+`if` 只接受**单行**表达式。写成 `if: |` 换行写条件，同样是整个 workflow 判无效。
+
+### 3. 改对 workflow 后，GitHub 不会重新解析
+
+这个最坑：文件内容改对了，`runs` 列表里那个 workflow 的 `name` 仍然显示成
+文件路径（而不是 `name:` 字段的值），所有 run 依旧 0 job。
+**必须改文件名**（如 `desktop.yml` → `desktop-build.yml`）才触发重扫。
+
+### 4. Windows 的 Python 默认用 cp1252 输出
+
+`build-frontend.sh` 里的内联 Python 只要 print 中文就抛：
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode characters
+```
+
+Linux 上永远复现不了。解法是脚本里给 `sys.stdout.reconfigure(encoding='utf-8')`。
+
+### 5. Tauri 2 的 `AppHandle` 没有 `eval`
+
+```
+error[E0599]: no method named `eval` found for struct `AppHandle<R>`
+```
+
+Tauri 1 的 `AppHandle::eval` 在 Tauri 2 里挪到了 `WebviewWindow` 上：
+
+```rust
+if let Some(win) = app.get_webview_window("main") {
+    let _ = win.eval(&js);
+}
+```
+
+---
+
+## 排查手段：用 `workflow_dispatch` 当校验器
+
+GitHub 没有「校验 workflow 语法」的 API，但**手动触发**就是最好的校验器 ——
+它会在解析阶段返回具体错误：
+
+```bash
+curl -X POST -H "Authorization: token $GH_TOKEN" \
+  "https://api.github.com/repos/OWNER/REPO/actions/workflows/desktop-build.yml/dispatches" \
+  -d '{"ref":"feat/desktop-tauri"}'
+```
+
+- `HTTP 204` → workflow 合法
+- `HTTP 422` + `failed to parse workflow: (Line: N, Col: M): ...` → 精确到行列的错误
+
+比反复 push 试错快得多。
+
+---
+
+## 当前 CI 状态（已验证可用）
+
+| 关卡 | 内容 | 结果 |
+|---|---|---|
+| Rust 单测 | Linux + Windows 矩阵，weapi 固定向量 | ✅ |
+| 前端组装 | bridge.js 注入位置、sw.js 排除、语法检查 | ✅ |
+| 打包 | Linux-x64 / Windows-x64 / macOS-arm64 | ✅ |
+
+产物大小：Windows 7.2 MB / macOS 9.4 MB / Linux 186.6 MB
+（Linux 偏大是因为 `bundle/**` 把 deb/rpm/AppImage 三种格式全收了，
+后续可以只留一种）。
