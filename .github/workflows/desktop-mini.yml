@@ -1,0 +1,15 @@
+name: desktop-mini
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: hello
+        run: echo "workflow 能跑"
