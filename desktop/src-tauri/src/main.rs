@@ -120,7 +120,18 @@ fn netease(
             serde_json::Value::String(cb_id).to_string(),
             serde_json::Value::String(text).to_string()
         );
-        let _ = app2.eval(&js);
+        /*
+         * Tauri 2 里 `AppHandle` **没有** eval 方法（Tauri 1 有，迁移时最容易踩）。
+         * 执行 JS 必须拿到具体的 WebviewWindow：`get_webview_window(label)`。
+         * label 用 "main" 是因为 tauri.conf.json 里那个窗口没写 label，
+         * Tauri 会给默认 label `"main"`。
+         *
+         * 找不到窗口时静默跳过：前端那套 pending 逻辑有 22 秒超时兜底，
+         * 不会永久卡住；而在这里 panic 会把整个应用带崩，代价大得多。
+         */
+        if let Some(win) = app2.get_webview_window("main") {
+            let _ = win.eval(&js);
+        }
     });
 
     Ok(())
