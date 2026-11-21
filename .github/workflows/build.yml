@@ -2,7 +2,14 @@ name: build
 
 on:
   push:
-    branches: [master, main]
+    branches:
+      - master
+      - main
+      # 桌面端分支也要跑 Android 检查：它的存在意义就是「只加桌面端、
+      # 不动 app/ 与 android/」。但如果没有这条，这个承诺就只是**口头**的 ——
+      # 推 8 次 CI 一次都不会验证 Android 还能不能编译。
+      # 加上它以后，"桌面端没有破坏 Android" 才是一个被机器守住的结论。
+      - 'feat/desktop-*'
   pull_request:
   workflow_dispatch:
 
