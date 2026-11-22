@@ -88,11 +88,30 @@ impl Client {
     ///   Header: Referer / Origin 都是 music.163.com，Cookie 带 os=android 前缀。
     /// 那个 `os=android` 不是装饰：不带它时 song_url 给的部分音质档会被降级。
     fn post(&mut self, path: &str, body: Value) -> Result<String, String> {
-        // 上游路径白名单：只允许 [a-z0-9/_-]，天然排除 .. / % / \ / ? / # 等
-        // 能改变路径含义的字符（与 server-security.js 的 assertUpstreamPath 同口径）
+        /*
+         * 上游路径白名单。
+         *
+         * 与 Android 的 `NeteaseClient.assertSafePath` 保持**同一套字符集** ——
+         * 两端各写一份最容易在这里漂移。这里之前只允许小写字母，
+         * 而 comments 的路径是 `v1/resource/comments/R_SO_4_<id>`，
+         * 里面有大写的 `R_SO`，于是「评论」在桌面端直接报「非法上游路径」。
+         *
+         * 允许的字符：A-Z a-z 0-9 / _ - . ? = &
+         *   · 大写字母是刚需（R_SO_4_ 这种接口名）
+         *   · . ? = & 给带查询串的路径留口子（Java 侧本来就允许）
+         * 拒绝 `..`：防路径穿越，这是这条白名单存在的真正原因。
+         */
         if path.is_empty()
+            || path.contains("..")
             || !path.chars().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+                c.is_ascii_alphanumeric()
+                    || c == '/'
+                    || c == '_'
+                    || c == '-'
+                    || c == '.'
+                    || c == '?'
+                    || c == '='
+                    || c == '&'
             })
         {
             return Err(format!("非法上游路径：{path}"));

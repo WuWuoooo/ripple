@@ -1046,6 +1046,27 @@ body.no-cover .np-bg{opacity:0}
   opacity:0;
   pointer-events:none;
 }
+/*
+ * 展开/收起时让封面「滑走」而不是瞬间消失。
+ *
+ * flex-grow / min-height / padding 这几个量都会在展开瞬间跳变 ——
+ * 不给它们 transition 的话，用户看到的就是「啪一下没了」。
+ * 0.3s 是主人指定的时长，与 --dur-ani 的其它用法一致。
+ */
+.cover-wrap{
+  transition:flex-grow var(--dur-ani) var(--ease-inout),
+             min-height var(--dur-ani) var(--ease-inout),
+             padding var(--dur-ani) var(--ease-inout),
+             opacity var(--dur-ani) var(--ease-inout);
+}
+/* 歌名/进度/控件也要跟着平滑让位，否则它们会瞬间跳到新位置 */
+.np-meta{transition:transform var(--dur-ani) var(--ease-inout),
+                   margin var(--dur-ani) var(--ease-inout)}
+.np-seek{transition:opacity var(--dur-ani) var(--ease-inout),
+                  margin var(--dur-ani) var(--ease-inout)}
+.np-ctl{transition:margin var(--dur-ani) var(--ease-inout),
+                 transform var(--dur-ani) var(--ease-inout)}
+
 /* 展开时歌名轻微上提，和下方歌词拉开一点呼吸距离。
    原来写成 calc(-1 * var(--np-meta-exit, 6px))，但那个变量全项目只读不写，
    兜底值就是唯一的值 —— 直接写死，少一层间接，改的时候也好找。 */

@@ -1414,62 +1414,220 @@
     railSyncAccount();
   }
 
-  /* 登录：先选方式（手机号 / 扫码），再打开官方页面 */
+  /*
+   * ================= 扫码登录（三端统一） =================
+   *
+   * 为什么不再用「内嵌 WebView 打开官方登录页」：
+   *   · 慢 —— 要加载整个网易云网页（几 MB、十几个第三方脚本）
+   *   · 重 —— Android 侧得维护一个 WebView 实例，还要处理它的生命周期、
+   *     返回键、cookie 同步；桌面端更麻烦，得在 Tauri 里再套一层 webview
+   *   · 平台相关 —— 三端各写一套，行为不可能一致
+   *
+   * 现在改成纯协议层的原生扫码，流程只有三步：
+   *   1. login_qr_key   → 拿 unikey
+   *   2. 把 https://music.163.com/login?codekey=<unikey> 画成二维码
+   *   3. 轮询 login_qr_check 直到 803（成功）
+   *
+   * 好处是**登录流程从平台相关变成平台无关**：Android / Linux / Windows
+   * 跑的是同一段代码，只有二维码画在哪个容器里不同（都是同一份 DOM）。
+   *
+   * 二维码由 app/js/qrcode.js 现场编码 —— 零依赖，不引第三方库。
+   */
+  const QR_POLL_MS = 1500;      // 轮询间隔：网易云官方页面也是 1.5~2s
+  const QR_TIMEOUT_MS = 180000; // 3 分钟不扫就当作超时
+
+  /* 一次登录会话的取消句柄（关闭弹窗时用来停轮询） */
+  let _qrSession = null;
+
   function chooseLoginMode() {
     if (!Netease.ready) return toast('在线功能不可用', '请先确认网络', 'warn');
-    if (Netease.mode !== 'native') {
-      return toast('浏览器里无法内嵌登录', '请用 APK 登录，或把 MUSIC_U 写进 .ripple-cookie', 'warn');
-    }
-    modal(`
-      <h3>登录网易云</h3>
-      <p style="margin-bottom:14px">选择登录方式，会打开网易云官方页面完成验证。</p>
-      <button class="login-opt" data-mode="phone">
-        <div class="ic"><svg><use href="#i-user"/></svg></div>
-        <div class="tx"><b>手机号登录</b><span>短信验证码 / 密码，官方页面内完成</span></div>
-        <div class="go"><svg><use href="#i-chev-right"/></svg></div>
-      </button>
-      <button class="login-opt" data-mode="qr">
-        <div class="ic"><svg><use href="#i-qr"/></svg></div>
-        <div class="tx"><b>扫码登录</b><span>用网易云 App 扫一扫，登录最快</span></div>
-        <div class="go"><svg><use href="#i-chev-right"/></svg></div>
-      </button>
-      <div class="modal-btns"><button class="btn ghost" data-cancel>取消</button></div>
+    if (!window.RippleQR) return toast('二维码模块未加载', '请重新打开应用', 'warn');
+    startQrLogin();
+  }
+
+  /**
+   * 打开扫码登录弹窗并开始轮询。
+   *
+   * 状态机：
+   *   waiting  → 还没扫（显示二维码）
+   *   scanned  → 扫了但没确认（提示「请在手机上确认」）
+   *   expired  → 二维码过期（显示「刷新二维码」按钮）
+   *   done     → 成功（关弹窗）
+   */
+  function startQrLogin() {
+    const state = {
+      key: '',
+      alive: true,
+      timer: 0,
+      deadline: 0,
+      closed: false,
+    };
+    _qrSession = state;
+
+    const ret = modal(`
+      <h3>扫码登录</h3>
+      <p style="margin-bottom:14px">用手机上的网易云 App 扫，扫完在手机上点确认。</p>
+      <div class="qr-box" id="qrBox">
+        <div class="qr-img" id="qrImg"></div>
+        <div class="qr-mask" id="qrMask" hidden><b id="qrMaskText"></b></div>
+      </div>
+      <div class="qr-hint" id="qrHint">正在生成二维码…</div>
+      <div class="modal-btns">
+        <button class="btn ghost" id="qrRefresh" hidden>刷新二维码</button>
+        <button class="btn ghost" data-cancel>关闭</button>
+      </div>
     `, {
       onMount: (wrap, close) => {
-        wrap.querySelectorAll('[data-mode]').forEach((b) => {
-          b.addEventListener('click', () => {
-            const mode = b.dataset.mode;
-            close(true);
-            doLogin(mode);
-          });
+        const box = wrap.querySelector('#qrBox');
+        const img = wrap.querySelector('#qrImg');
+        const mask = wrap.querySelector('#qrMask');
+        const maskText = wrap.querySelector('#qrMaskText');
+        const hint = wrap.querySelector('#qrHint');
+        const refresh = wrap.querySelector('#qrRefresh');
+        if (box) {
+          // 二维码样式：白底黑码 + 圆角，深浅主题下都能扫
+          box.style.cssText = 'width:200px;height:200px;margin:0 auto 14px;position:relative;'
+            + 'border-radius:14px;overflow:hidden;background:#fff;padding:10px;box-sizing:border-box';
+        }
+        if (img) img.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center';
+        if (mask) {
+          mask.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;'
+            + 'background:rgba(0,0,0,.72);color:#fff;font-size:12px;text-align:center;padding:16px;'
+            + 'border-radius:14px;backdrop-filter:blur(2px)';
+        }
+
+        const paint = (text) => {
+          if (!img) return;
+          try {
+            img.innerHTML = window.RippleQR.toSVG(text, {
+              ecl: 'M', scale: 4, margin: 2,
+              dark: '#111', light: '#fff',
+            });
+          } catch (e) {
+            img.textContent = '二维码生成失败';
+            Log.err('LOGIN', e, 'qr encode');
+          }
+        };
+
+        const stop = () => { state.alive = false; if (state.timer) clearTimeout(state.timer); };
+
+        // 关闭弹窗（无论是点取消还是程序关）都要停轮询
+        wrap.addEventListener('click', (e) => {
+          if (e.target.closest('[data-cancel]')) stop();
         });
+
+        async function begin() {
+          if (!state.alive) return;
+          if (refresh) refresh.hidden = true;
+          if (mask) mask.hidden = true;
+          if (hint) hint.textContent = '正在生成二维码…';
+          try {
+            const r = await Netease.call('login_qr_key', {});
+            const key = (r && (r.unikey || r.key)) || '';
+            if (!key) throw new Error('没有拿到 unikey');
+            state.key = key;
+            state.deadline = Date.now() + QR_TIMEOUT_MS;
+            paint('https://music.163.com/login?codekey=' + key);
+            if (hint) hint.textContent = '打开手机网易云 App → 扫一扫';
+            Log.add('LOGIN', 'qr key 已获取，开始轮询');
+            poll();
+          } catch (e) {
+            Log.err('LOGIN', e, 'login_qr_key');
+            if (hint) hint.textContent = '二维码获取失败：' + (e.message || e);
+            if (refresh) refresh.hidden = false;
+          }
+        }
+
+        async function poll() {
+          if (!state.alive) return;
+          if (Date.now() > state.deadline) {
+            if (mask) { mask.hidden = false; if (maskText) maskText.textContent = '二维码已过期'; }
+            if (refresh) refresh.hidden = false;
+            if (hint) hint.textContent = '二维码已过期，点下面按钮刷新';
+            return;
+          }
+          let r = null;
+          try {
+            r = await Netease.call('login_qr_check', { key: state.key });
+          } catch (e) {
+            // 轮询期的网络抖动不该直接判失败 —— 继续下一轮
+            Log.err('LOGIN', e, 'login_qr_check');
+            state.timer = setTimeout(poll, QR_POLL_MS * 2);
+            return;
+          }
+          const code = r && Number(r.code);
+          if (code === 800) {
+            // 二维码过期（服务端判定）
+            if (mask) { mask.hidden = false; if (maskText) maskText.textContent = '二维码已过期'; }
+            if (refresh) refresh.hidden = false;
+            if (hint) hint.textContent = '二维码已过期，点下面按钮刷新';
+            return;
+          }
+          if (code === 802) {
+            // 扫了，等用户在手机上确认
+            if (mask) { mask.hidden = false; if (maskText) maskText.textContent = '已扫码，请在手机上确认'; }
+            if (hint) hint.textContent = '已扫码，请在手机上点「确认登录」';
+            state.timer = setTimeout(poll, QR_POLL_MS);
+            return;
+          }
+          if (code === 803) {
+            // 成功。cookie 已经被原生侧收下（Java 的 absorbCookies / Rust 的 set-cookie 合并）
+            state.alive = false;
+            if (hint) hint.textContent = '登录成功';
+            Log.add('LOGIN', 'qr 登录成功');
+            close(true);
+            await afterLoginSuccess();
+            return;
+          }
+          // 801 = 等待扫码，继续
+          if (hint && code === 801) hint.textContent = '等待扫码…';
+          state.timer = setTimeout(poll, QR_POLL_MS);
+        }
+
+        if (refresh) {
+          refresh.addEventListener('click', () => {
+            if (!state.alive) return;
+            state.timer && clearTimeout(state.timer);
+            begin();
+          });
+        }
+
+        begin();
       },
+    });
+    /*
+     * 清理轮询。
+     *
+     * modal() 只支持 onMount，没有 onClose 钩子 —— 所以这里用返回值兜底：
+     * 不管弹窗是点取消关的、点遮罩关的、还是登录成功后程序关的，
+     * Promise 都会 resolve，在 then 里停掉轮询就一定跑得到。
+     * 用 onClose（不存在的选项）会静默什么都不做，轮询会一直转下去。
+     */
+    ret.then(() => {
+      if (_qrSession) {
+        _qrSession.alive = false;
+        if (_qrSession.timer) clearTimeout(_qrSession.timer);
+        _qrSession = null;
+      }
     });
   }
 
-  async function doLogin(mode) {
-    if (!Netease.ready) return toast('在线功能不可用', '请先确认网络', 'warn');
-    if (Netease.mode !== 'native') {
-      return toast('浏览器里无法内嵌登录', '请用 APK 登录，或把 MUSIC_U 写进 .ripple-cookie', 'warn');
-    }
-    Log.add('LOGIN', 'open page mode=' + mode);
-    toast(mode === 'qr' ? '已打开扫码登录' : '已打开登录页',
-      '在官方页面完成验证，成功后自动返回', 'cloud');
+  /** 登录成功后的统一收尾（三端共用） */
+  async function afterLoginSuccess() {
+    let p = null;
     try {
-      const p = await Netease.login(mode);
-      Log.add('LOGIN', 'success ' + (p && p.nickname));
-      App._myPl = null;
-      App._dailyCache = null;
-      App._topCache = null;
-      updateAccountCard();
-      loadHomeOnline();
-      loadMyPlaylists();
-      toast('登录成功', p.nickname + (p.vip ? ' · 黑胶 VIP' : ''), 'check');
-      if (S().syncLikes) syncLikes();
+      p = await Netease.status();
     } catch (e) {
-      Log.err('LOGIN', e, mode);
-      toast('登录未完成', e.message, 'warn');
+      Log.err('ACCOUNT', e, '登录后 status 失败（不影响登录结论）');
     }
+    App._myPl = null;
+    App._dailyCache = null;
+    App._topCache = null;
+    updateAccountCard();
+    loadHomeOnline();
+    loadMyPlaylists();
+    toast('登录成功', (p && p.nickname) || '已连接网易云账号', 'check');
+    if (S().syncLikes) syncLikes();
   }
 
   async function doLogout() {

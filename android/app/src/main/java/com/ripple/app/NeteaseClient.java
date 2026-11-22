@@ -27,11 +27,16 @@ import java.util.zip.GZIPInputStream;
  *   search / song_detail / song_url / lyric / playlist / toplist
  *   recommend / likelist / like / user_playlist / personalized
  *
- * J-07：`login_qr_key` / `login_qr_check` 两条原语已从白名单删除。
- * 它们是把网易云扫码登录的两个底层接口直接暴露给页面 —— 而前端登录全程走
- * 内嵌 WebView（`RippleNative.login`），从头到尾没有调用过这两条命令
- * （全目录 grep 零命中）。每个命令白名单项都是「页面被注入后能白嫖的 API 面」，
- * 没有调用方的就该删。将来真要做原生扫码登录，再加回来并同时补前端调用。
+ * 扫码登录（`login_qr_key` / `login_qr_check`）：
+ *
+ * 这两条命令曾经被删过（当时代码里叫 J-07：前端从不调用，而每条命令都是
+ * 「页面被注入后能白嫖的 API 面」）。现在加回来，因为**登录方式整体换了**：
+ * 不再用内嵌 WebView 打开官方登录页（慢、重、还要维护一个 WebView 实例），
+ * 改成三端统一的原生扫码 —— 前端拿 unikey 自己画二维码，用户用手机网易云
+ * App 扫，再轮询 check 接口直到成功。
+ *
+ * 这样做的收益不只是快：登录流程从「平台相关」变成「平台无关」，
+ * Android / Linux / Windows 走的是同一段前端代码，只有画二维码的位置不同。
  */
 final class NeteaseClient {
 
@@ -293,8 +298,16 @@ final class NeteaseClient {
     String call(String cmd, JSONObject p) throws Exception {
         p = p == null ? new JSONObject() : p;
         switch (cmd) {
-            case "status":        return status();
-            /* J-07：login_qr_key / login_qr_check 已删除（前端从不调用，见类注释） */
+            case "status":          return status();
+            /*
+             * 扫码登录两步走：
+             *   login_qr_key   → 拿一个 unikey（二维码内容就是它）
+             *   login_qr_check → 轮询扫码状态（801 等待 / 802 待确认 / 803 成功）
+             * 成功时上游下发 MUSIC_U，post() 里的 CookieManager 会自动收下。
+             */
+            case "login_qr_key":   return post("login/qrcode/unikey", "{\"type\":3}");
+            case "login_qr_check": return post("login/qrcode/client/login",
+                    new JSONObject().put("key", p.optString("key")).put("type", 3).toString());
             /*
              * 先让服务端注销会话，再清本地 cookie。
              * 反过来（先 clearCookie）会让 post 带着空 cookie 去请求 logout，

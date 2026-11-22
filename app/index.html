@@ -816,6 +816,12 @@
 <script src="js/netease.js"></script>
 <script src="js/store.js"></script>
 <script src="js/player.js"></script>
+<!--
+  二维码编码器：扫码登录用。
+  放在 app.js 之前 —— 登录弹窗在 app.js 里定义，运行时要读 window.RippleQR。
+  自己实现而不是引第三方库，是为了守住「零 npm 依赖」这条取向。
+-->
+<script src="js/qrcode.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

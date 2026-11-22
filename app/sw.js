@@ -3,7 +3,7 @@ const SHELL = [
   './', './index.html', './manifest.webmanifest',
   './css/base.css', './css/layouts.css', './css/components.css', './css/responsive.css',
   './js/version.js', './js/perf.js', './js/log.js', './js/lrc.js', './js/netease.js',
-  './js/store.js', './js/player.js', './js/app.js',
+  './js/store.js', './js/player.js', './js/qrcode.js', './js/app.js',
   /* 示例音频 / 封面已从项目中移除（7 个文件约 5.4 MB），代码里从不引用它们 */
   './assets/icons/icon-192.png', './assets/icons/icon-512.png', './assets/icons/icon-180.png'
 ];

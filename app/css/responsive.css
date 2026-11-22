@@ -282,7 +282,12 @@
   .np-inner{
     display:grid;
     grid-template-columns:minmax(0,1.08fr) minmax(0,1fr);
-    grid-template-rows:auto 1fr 1fr auto auto auto;
+    /*
+     * 行高比例从 1fr 1fr 调成 1fr 1.35fr：把多余空间多给歌词、少给封面列。
+     * 原来两栏对半分，大屏上歌词区只有两行的位置，四周空一大片；
+     * 现在歌词能多显示两行，整体也更饱满。
+     */
+    grid-template-rows:auto 1fr 1.35fr auto auto auto;
     grid-template-areas:
       "top   top"
       "cover info"
@@ -291,14 +296,51 @@
       "cover ctl"
       "acts  acts";
     column-gap:36px;
-    padding:var(--safe-t) var(--np-pad-x) 0;
+    /*
+     * 顶部留白收紧：宽屏的高度很富裕，原来留 --safe-t（手机上那是状态栏高度，
+     * 桌面上通常是 0）+ 默认 padding，标题栏离窗口顶太远，显得空。
+     * 8px 是纯粹的呼吸量，不是安全区。
+     */
+    padding:8px var(--np-pad-x) 0;
+    /* 展开/收起时行高变化要平滑过渡（数值型轨道可以被 transition 插值） */
+    transition:grid-template-rows var(--dur-ani) var(--ease-inout);
   }
   .np-top{grid-area:top}
   .cover-wrap{grid-area:cover;align-items:center;padding:6px 0}
   .np-meta{grid-area:info;margin-top:14px;align-self:end}
-  .np-lyricbox{grid-area:lyric;align-self:start}
+  /*
+   * min-height:0 是必须的。
+   * grid 项的 min-height 默认是 auto —— 内容多高就多高，会**溢出**网格轨道
+   * 压到下面的进度条上（实测展开歌词/长歌词时进度条被盖住）。
+   * stretch 让歌词盒子被限制在轨道里，内部再自己滚动/裁剪。
+   */
+  .np-lyricbox{
+    grid-area:lyric;align-self:stretch;min-height:0;
+    /* 内容在整块可用高度里垂直居中：不再挤在顶部留一大片空白 */
+    display:flex;flex-direction:column;justify-content:center;
+  }
+  /*
+   * 宽屏上歌词多放两行（默认 3 行 → 5 行）。
+   *
+   * 主人反馈「收起歌词时周围显得太空」：右栏高度有 400+px，
+   * 而三行歌词只有 ~100px，上下各空出一大块。
+   * 行数放开到 5 行，配合上面的垂直居中，视觉饱满且信息更多。
+   * 用 min-height 而不是 height：歌词不足 5 行时盒子按内容收缩，
+   * 不会出现「只有两行歌词却撑出 5 行空白」。
+   */
+  .np-lyric{
+    height:auto;min-height:calc(var(--lyr-lh) * 5);
+    display:flex;flex-direction:column;justify-content:center;
+  }
+  /* 宽屏上第 3 行不再隐藏（那原本是给矮屏省高度的） */
+  .np-lyric .ln:nth-child(3){display:flex}
   .np-seek{grid-area:seek;margin:10px 0 0}
-  .np-ctl{grid-area:ctl;margin-top:8px;justify-content:space-around;max-width:460px;width:100%}
+  /*
+   * margin:0 auto 让这排控制按钮在右栏里居中。
+   * 以前只有 max-width:460px + width:100%，盒子被限制到 460 宽但仍靠左，
+   * 于是在宽屏上「播放/上一首/下一首」偏在左边、右边空一大块。
+   */
+  .np-ctl{grid-area:ctl;margin:8px auto 0;justify-content:space-around;max-width:460px;width:100%}
   .np-actions{grid-area:acts}
   .np-flexspacer{display:none}
 
