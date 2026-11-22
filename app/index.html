@@ -562,7 +562,7 @@
           </div>
         </div>
       </div>
-      <div class="set-group">
+      <div class="set-group" id="grpNotify">
         <div class="lbl">通知与后台</div>
         <div class="set-card glass">
           <div class="set-row">
@@ -570,12 +570,17 @@
             <div class="tx"><b>软件内通知</b><span>顶部弹出的提示条（失败类提示仍会显示）</span></div>
             <button type="button" class="sw" role="switch" aria-checked="false" data-set="inAppToast" aria-label="软件内通知"></button>
           </div>
-          <div class="set-row">
+          <!--
+            以下四行依赖 Android 原生能力（PlaybackService / POST_NOTIFICATIONS），
+            桌面端（Windows / Linux）由 app.js 按 RippleNative.platform === 'desktop'
+            隐藏掉，见 syncSettingsUI()。
+          -->
+          <div class="set-row" id="rowMediaSession">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知栏播放控件</b><span id="mediaHint">锁屏 / 通知中心显示</span></div>
             <button type="button" class="sw on" role="switch" aria-checked="true" data-set="mediaSession" aria-label="通知栏播放控件"></button>
           </div>
-          <div class="set-row">
+          <div class="set-row" id="rowNotifyQuiet">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知不打断播放</b><span>横幅只提示，不暂停、不压低音量</span></div>
             <button type="button" class="sw on" role="switch" aria-checked="true" data-set="notifyQuiet" aria-label="通知不打断播放"></button>
@@ -585,7 +590,7 @@
             <div class="tx"><b>发送测试通知</b><span>验证音乐是否继续播放</span></div>
             <div class="val">试一试 ›</div>
           </div>
-          <div class="set-row">
+          <div class="set-row" id="rowPerm">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>请求通知权限</b><span id="permHint">未授权</span></div>
             <div class="val" id="permVal">授权 ›</div>

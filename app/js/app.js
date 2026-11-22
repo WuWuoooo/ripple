@@ -4173,6 +4173,39 @@
     $('#mediaHint').textContent = hasNativeMedia
       ? '通知栏 / 锁屏 / 耳机键可控'
       : (('mediaSession' in navigator) ? '锁屏 / 通知中心显示' : '此环境不支持');
+    /*
+     * 桌面端（Windows / Linux）隐藏「通知与后台」里只能手机上用的几项。
+     *
+     * 这几项都依赖 Android 的原生能力：
+     *   · 通知栏播放控件 —— 靠 PlaybackService 的前台服务 + MediaSession
+     *   · 通知不打断播放 —— 靠上面的横幅通知
+     *   · 发送测试通知   —— 调 RippleNative.notify（桌面端返回 false）
+     *   · 请求通知权限   —— Android 13+ 的 POST_NOTIFICATIONS
+     * 桌面端浏览器/WebView 里它们要么无效、要么永远显示「未授权」，
+     * 留着只会让人以为坏了。
+     *
+     * 判据用 bridge.js 显式给的 platform 标记，不做能力探测：
+     * 桌面桥为了「前端零改动」把方法都造出来了（只是返回 false），
+     * 探测会被占位实现骗到。Android 侧没有这个字段 → undefined → 不隐藏。
+     */
+    const isDesktop = !!(window.RippleNative && window.RippleNative.platform === 'desktop');
+    [
+      'rowMediaSession',   // 通知栏播放控件
+      'rowNotifyQuiet',    // 通知不打断播放
+      'rowTestNotify',     // 发送测试通知
+      'rowPerm',           // 请求通知权限
+    ].forEach((id) => {
+      const row = document.getElementById(id);
+      if (row) row.hidden = isDesktop;
+    });
+    /*
+     * 不要隐藏整个 #grpNotify 分组 ——「软件内通知」是纯前端 toast，
+     * 桌面端照样有效，藏掉分组会把它一起藏了。
+     *
+     * 「通知不打断播放」和「通知栏播放控件」虽然是偏好项，但它们只在
+     * Android 拿到原生横幅通知时才有意义，桌面端一并没有入口，
+     * 所以同样收起来，避免出现「开关能拨但什么都不会发生」。
+     */
     $('#sleepVal').textContent = (s.sleepMin ? s.sleepMin + ' 分钟 ›' : '关闭 ›');
     syncConnectionUI();
     /*

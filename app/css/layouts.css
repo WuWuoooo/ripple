@@ -276,7 +276,14 @@ html[data-rail="mini"] .rail-foldrow{flex-direction:column;gap:4px}
 html[data-rail="mini"] .rail-brand b,
 html[data-rail="mini"] .rail-nav a em,
 html[data-rail="mini"] .rail-acct .who{display:none}
-html[data-rail="mini"] .rail-top{justify-content:center}
+/*
+ * 收起态下每一个「只剩下图标」的块都要单独居中 ——
+ * 它们的展开态都是 flex + 左对齐，去掉文字后剩余的那个图标不会自己跑到中间。
+ * 这里三个块（品牌 logo / 导航图标 / 账号头像）必须成组写在一起，
+ * 少写一个就会像以前那样：品牌那颗波形图标贴在左边，上下都是居中的，
+ * 看着就像「首页上面那个图标没对齐」。
+ */
+html[data-rail="mini"] .rail-brand{justify-content:center;padding:0}
 html[data-rail="mini"] .rail-nav a{justify-content:center;padding:0}
 html[data-rail="mini"] .rail-acct{justify-content:center;padding:8px 0}
 html[data-rail="mini"] .rail-fold svg{transform:rotate(180deg)}
