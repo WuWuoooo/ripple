@@ -294,3 +294,99 @@ jobs:
             echo ""
             echo "[→ Artifacts 列表](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ================= 发布到 GitHub Release =================
+  #
+  # 只有在 main 分支上手动 dispatch 才会发布。
+  # 分支上的日常构建仍然只产 Artifacts（见上面 bundle job），
+  # 这样「验证产物」和「正式发布」不会混在一起。
+  #
+  # 为什么单独一个 job、而不是在 bundle 里顺手发布：
+  #   matrix 有两个平台，各自上传会让多个 runner 同时往同一个 Release
+  #   写资产，并发冲突。这里用一个 job 把所有产物下载齐、一次性上传。
+  release:
+    name: 发布三端 Release
+    needs: [bundle]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write        # 创建 Release 并上传资产
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 读取版本号
+        id: meta
+        run: |
+          VC=$(sed -n 's/.*"versionCode"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' version.json | head -1)
+          VN=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
+          echo "version=$VN" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VN"     >> "$GITHUB_OUTPUT"
+          echo "code=$VC"     >> "$GITHUB_OUTPUT"
+          echo "版本：$VN ($VC)"
+
+      # 把两个平台的 Artifacts 都拿下来，平铺到 dist/
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      # APK 不在这套 workflow 里产出（由 build.yml 负责）。
+      # 从**已发布的 Android Release** 里取同版本的 APK 再挂到这次的 Release 上，
+      # 这样「三端一个 Release」不用等两个 workflow 互相等待。
+      - name: 取同版本 Android APK
+        run: |
+          set -e
+          VN='${{ steps.meta.outputs.version }}'
+          URL="https://github.com/${{ github.repository }}/releases/download/v${VN}/Ripple-${VN}.apk"
+          echo "尝试下载：$URL"
+          if curl -fsSL -o "dist/Ripple-${VN}.apk" "$URL"; then
+            echo "✅ 拿到 Android APK"
+            ls -lh "dist/Ripple-${VN}.apk"
+          else
+            echo "::warning::没有找到 v${VN} 的 Android APK，本次只发桌面端产物"
+          fi
+
+      - name: 整理产物清单
+        run: |
+          echo "=== dist/ ==="
+          ls -lh dist/ || true
+          echo "=== 文件数 ==="
+          find dist -maxdepth 1 -type f | wc -l
+
+      # 只**追加资产**，不改 Release 说明。
+      #
+      # 为什么这样：Android 的 build.yml 已经创建了这个 tag 的 Release，
+      # 并且写了完整的 CHANGELOG 正文。这边如果也带 body，会把那份正文覆盖成
+      # 一份「桌面端版说明」——两个 workflow 抢同一段文案，最后谁跑完算谁的。
+      # 所以这里只负责把桌面端文件挂上去；Release 正文由 Android 那边统一维护。
+      - name: 追加资产到既有 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          # 不给 name / body → softprops 会沿用既有 Release 的标题与正文
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: |
+            dist/*.apk
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 发布结果摘要
+        run: |
+          {
+            echo "## Ripple ${{ steps.meta.outputs.version }} 三端发布"
+            echo ""
+            echo "| 平台 | 文件 |"
+            echo "|---|---|"
+            ls -1 dist/ | sed 's/^/| | `&` |/'
+            echo ""
+            echo "> 桌面端为未签名包，用户侧需要在系统提示里手动放行。"
+            echo ""
+            echo "[→ Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.tag }})"
+          } >> "$GITHUB_STEP_SUMMARY"

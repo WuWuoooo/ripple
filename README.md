@@ -14,8 +14,8 @@
 > 桌面端复用**同一份 `app/` 前端，逻辑一行不改**，靠一层桥接把 Android 的
 > `@JavascriptInterface` 原样造出来。详见 [desktop/README.md](desktop/README.md)。
 >
-> 桌面端产物目前只作为 Actions Artifacts 提供，**不进公开 Release**；
-> macOS 不做（需要 Apple SDK + 签名证书，本机无法产出也无法验证）。
+> 三端产物都在同一个 Release 里发布。macOS 不做 —— 需要 Apple SDK + 签名证书，
+> 本机既无法产出也无法验证，与其发一个没人测过的包，不如明确不做。
 
 ---
 
@@ -95,10 +95,10 @@
 - **不内置任何音乐资源**，不提供下载站
 - **不绕过会员、付费或地区限制**。取不到音源就明确告诉你取不到
 - 不承诺通知栏长得像某个 App —— 外观由系统按 MediaSession 渲染，厂商主题说了算
-- **不给桌面端做代码签名**：Windows / macOS 的签名证书要花钱，本项目不做。
-  所以桌面端包首次运行会被系统拦（Windows SmartScreen / macOS Gatekeeper），
+- **不给桌面端做代码签名**：Windows 的签名证书要花钱，本项目不做。
+  所以桌面端包首次运行会被系统拦（Windows SmartScreen），
   绕过方法写在 [desktop/README.md](desktop/README.md) 里 ——
-  如实告知，而不是假装安全
+  **如实告知，而不是假装安全**
 
 ## 安装
 
@@ -112,7 +112,7 @@ APK 里没有任何 `.so` / `lib/` 目录（`aapt2 dump badging` 也没有 `nati
 
 ### 桌面端（Windows / Linux）
 
-产物在 Actions 的 `ripple-desktop-linux-x64` / `ripple-desktop-windows-x64` 里：
+到 [Releases](../../releases) 下载对应格式（和 APK 在同一个 Release 里）：
 
 | 平台 | 格式 | 说明 |
 |---|---|---|

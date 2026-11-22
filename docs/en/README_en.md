@@ -13,8 +13,8 @@
 
 > The desktop client reuses **the same `app/` frontend with not a single line of logic changed**; a bridge layer reproduces Android's `@JavascriptInterface` verbatim. See [desktop/README.md](../../desktop/README.md).
 >
-> Desktop artifacts are currently offered only as Actions Artifacts and **do not go into public Releases**.
-> macOS is not built (it needs the Apple SDK and signing certificates, which this machine can neither produce nor verify).
+> All three platforms ship in the same Release. macOS is not built — it needs the Apple SDK and signing
+> certificates, which this machine can neither produce nor verify; better to be explicit than to ship a package nobody tested.
 
 ---
 
@@ -108,7 +108,7 @@ x86 / x86_64 / arm64 all use the same package — ABI only matters for apps ship
 
 ### Desktop (Windows / Linux)
 
-Artifacts live in the Actions runs under `ripple-desktop-linux-x64` / `ripple-desktop-windows-x64`:
+Download the format you need from [Releases](../../releases) (same Release as the APK):
 
 | Platform | Format | Notes |
 |---|---|---|
