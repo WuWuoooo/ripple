@@ -26,11 +26,6 @@ on:
       - 'desktop/**'
       - 'app/**'
   workflow_dispatch:
-    inputs:
-      build_macos:
-        description: '同时构建 macOS（需要 Apple runner 额度）'
-        type: boolean
-        default: true
 
 concurrency:
   group: desktop-${{ github.ref }}
@@ -176,19 +171,11 @@ jobs:
           - os: windows-latest
             label: Windows-x64
             artifact: windows-x64
-          - os: macos-latest
-            label: macOS-arm64
-            artifact: macos-arm64
-        # 手动 dispatch 且 build_macos=false 时剔除 macOS 那一项。
-        #
-        # 为什么用 matrix exclude 而不是 job 级 if：
-        # job 级 `if` **不认 `matrix` 上下文**（matrix 只在 strategy 展开后
-        # 的 step 级才存在）。写成 `if: matrix.os != 'macos-latest'` 会让整个
-        # workflow 在解析阶段校验失败，报 "Unrecognized named-value: 'matrix'"；
-        # 那种失败的形态极具误导性 —— run 会被创建、却**一个 job 都不跑**
-        # （created_at 与 updated_at 同一秒、日志接口 404），从 Actions 页面
-        # 完全看不出原因。另外 `if: |` 多行字面量同样非法，它只接受单行表达式。
-        exclude: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_macos == false) && fromJSON('[{"os":"macos-latest"}]') || fromJSON('[]') }}
+    # 为什么没有 macOS：
+    #   CI 能编译，但**没人能测** —— 未签名包会被 Gatekeeper 直接拦掉，
+    #   要真正能双击打开需要 Apple Developer（$99/年）+ 公证流程。
+    #   一个「能编出来但打不开、也没人验证过」的产物，不如不发布。
+    #   等有条件验证时再加回来（matrix 里补一行 macos-latest 即可）。
     steps:
       - uses: actions/checkout@v7
 
@@ -234,14 +221,51 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ''
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
 
+      # 额外产一个 tar.gz：Tauri 自己不出这种格式，但它是最通用的分发形态
+      # （解压即用、不依赖包管理器、ARM/x86 都能用）。
+      # 额外产一个 tar.gz / zip：Tauri 自己不出这两种格式，但它们是最通用的
+      # 分发形态 —— 解压即用、不依赖包管理器、不挑发行版。
+      # 里面只有可执行文件 + 一份说明，不带任何运行时（WebView 用系统的）。
+      - name: 附加产出 tar.gz（Linux）/ zip（Windows）
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          VN=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
+          REL=desktop/src-tauri/target/release
+          STAGE="$RUNNER_TEMP/ripple-stage"
+          mkdir -p "$STAGE"
+          if [ "${{ matrix.os }}" = "ubuntu-22.04" ]; then
+            cp "$REL/ripple" "$STAGE/ripple" 2>/dev/null || true
+            printf '%s\n' \
+              "Ripple 涟漪 · 桌面端" \
+              "" \
+              "运行：" \
+              "  chmod +x ripple && ./ripple" \
+              "" \
+              "依赖 WebKitGTK 4.1 运行库：" \
+              "  Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0" \
+              "  Fedora:        sudo dnf install webkit2gtk4.1" \
+              "  Arch:          sudo pacman -S webkit2gtk-4.1" \
+              "" \
+              "这是未签名包，首次运行可能需要在文件管理器里允许执行。" \
+              > "$STAGE/README.txt"
+            (cd "$STAGE" && tar czf "$GITHUB_WORKSPACE/Ripple-${VN}-linux-$(uname -m).tar.gz" ripple README.txt)
+            echo "tar.gz 已产出"
+          else
+            cp "$REL/ripple.exe" "$STAGE/Ripple.exe" 2>/dev/null || true
+            (cd "$STAGE" && 7z a -tzip "$GITHUB_WORKSPACE/Ripple-${VN}-windows-x64.zip" Ripple.exe > /dev/null)
+            echo "zip 已产出"
+          fi
+
+
       - name: 列出产物
         shell: bash
         run: |
-          echo "=== 产物清单 ==="
-          find desktop/src-tauri/target/release -maxdepth 2 \
-            \( -name "*.exe" -o -name "*.msi" -o -name "*.app" -o -name "*.dmg" \
-               -o -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" -o -name "ripple" \) \
-            -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | sort || true
+          echo "=== bundle 目录 ==="
+          find desktop/src-tauri/target/release/bundle -type f 2>/dev/null | sort || true
+          echo "=== 工作区根 ==="
+          ls -lh Ripple-*.tar.gz Ripple-*.zip 2>/dev/null || true
 
       - uses: actions/upload-artifact@v7
         with:
@@ -249,8 +273,8 @@ jobs:
           # 只收最终安装包与可执行文件；中间文件（.o/.rlib/deps）不收
           path: |
             desktop/src-tauri/target/release/bundle/**
-            desktop/src-tauri/target/release/ripple
-            desktop/src-tauri/target/release/ripple.exe
+            Ripple-*.tar.gz
+            Ripple-*.zip
           if-no-files-found: error
           retention-days: 14
 

@@ -275,14 +275,89 @@ curl -X POST -H "Authorization: token $GH_TOKEN" \
 
 ---
 
+## 产物格式
+
+| 平台 | 格式 | 说明 |
+|---|---|---|
+| Linux | `.deb` | Debian / Ubuntu 系，`sudo dpkg -i` 安装 |
+| Linux | `.tar.gz` | **最通用**：解压即用，不挑发行版，也不需要包管理器 |
+| Linux | `.AppImage` | 单文件，chmod +x 直接跑 |
+| Windows | `.zip` | 内含 `Ripple.exe`，解压即用 |
+| Windows | `.exe` (NSIS) | 安装向导 |
+
+`tar.gz` / `zip` 不是 Tauri 原生格式，由 CI 在打包后额外生成：
+里面只有可执行文件 + 一份说明，**不带任何运行时**（WebView 用系统自带的）。
+这样做的理由是「解压即用」比「先装包管理器依赖」低得多。
+
+### 为什么没有 macOS
+
+CI 能编译，但**没人能测** —— 未签名包会被 Gatekeeper 直接拦掉
+（「已损坏，无法打开」），要真正能双击需要 Apple Developer（$99/年）+ 公证流程。
+一个「能编出来但打不开、也没人验证过」的产物，不如不发布。
+
+等有条件验证时再加回来：`matrix.include` 里补一行 `macos-latest` 即可。
+
 ## 当前 CI 状态（已验证可用）
 
 | 关卡 | 内容 | 结果 |
 |---|---|---|
 | Rust 单测 | Linux + Windows 矩阵，weapi 固定向量 | ✅ |
 | 前端组装 | bridge.js 注入位置、sw.js 排除、语法检查 | ✅ |
-| 打包 | Linux-x64 / Windows-x64 / macOS-arm64 | ✅ |
+| 打包 | Linux-x64（deb/appimage/tar.gz）+ Windows-x64（nsis/zip） | ✅ |
 
-产物大小：Windows 7.2 MB / macOS 9.4 MB / Linux 186.6 MB
-（Linux 偏大是因为 `bundle/**` 把 deb/rpm/AppImage 三种格式全收了，
-后续可以只留一种）。
+---
+
+## 本机实测记录（ARM64 Linux）
+
+CI 只证明「能编译」，这里记录一次**真跑起来**的验证。
+
+### 环境
+
+Android 手机上的 Ubuntu 24.04 proot，`aarch64`，Xvfb + VNC。
+
+### 两个必踩的坑
+
+**1. `/sdcard` 是 noexec，编译必然失败**
+
+```
+could not execute process `.../build_script_build` (never executed)
+Caused by: Permission denied (os error 13)
+```
+
+Android 的 `/sdcard` 是 bind 挂载且带 `noexec` —— cargo 编译过程中要执行
+自己刚生成的 build script，直接报权限拒绝。
+
+**结论：在任何 Android 手机上做 Rust/编译类项目，构建目录都不能放在 `/sdcard`。**
+挪到 `/root`（或其他支持 exec 的位置）就好。
+
+**2. 就算在 `/root`，cargo 生成的 build script 也是 0600**
+
+proot 环境下 cargo 落盘的可执行文件没有执行位（`-rw-------`），
+报同样的 `Permission denied`。`chmod +x` 手工试过是有效的，所以编译时
+需要并行跑一个补权限的循环：
+
+```bash
+( cargo build --release ) &
+for i in $(seq 1 60); do
+  sleep 3
+  find target -type f -name 'build_script_*' ! -perm -u+x -exec chmod +x {} \;
+done
+```
+
+一共编了 **9 分 44 秒**（ARM + 手机，比 x86 慢得多），产物 4.9 MB。
+
+### 结果
+
+```
+✅ 进程启动       pid 6190
+✅ 窗口创建       1180×743
+✅ 界面完整渲染   左侧栏 / hero / 每日推荐 / 迷你播放器 / 账号卡
+✅ 交互可用       点击能触发界面变化（截图字节数变化）
+```
+
+**渲染差异（重点）**：WebKitGTK 上 `backdrop-filter` 的模糊强度明显弱于
+Chromium，玻璃质感偏「薄」。功能和布局都正确，但观感与 Android/Chromium
+不完全一致 —— 这与事先对 WebKit 系的判断相符。
+
+如果在意这个差异，后续可以给 `html[data-webkit]` 加一档更重的
+`--glass-blur` 补偿（不改结构，只调令牌）。
