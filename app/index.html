@@ -173,6 +173,15 @@
       参考主流桌面播放器也是这么排的：开关在上、标识在下、导航居中、账号在底。
     -->
     <div class="rail-foldrow">
+      <!--
+        夜间模式：宽屏（桌面 / 横屏大屏）下放在「展开/收起箭头」的左边。
+        窄屏 / Android 上不显示这一颗 —— 那边没有侧栏，
+        主题开关仍然在顶栏上（见 .topbar 的 #btnTheme）。
+      -->
+      <button type="button" class="rail-fold rail-theme" id="railTheme"
+              aria-label="切换深色 / 浅色主题" title="切换深浅色">
+        <svg><use href="#i-moon"/></svg>
+      </button>
       <button type="button" class="rail-fold" id="railFold" aria-label="收起导航" aria-expanded="true">
         <svg><use href="#i-chev-right"/></svg>
       </button>

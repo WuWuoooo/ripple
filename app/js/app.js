@@ -240,8 +240,12 @@
      * 统一走 refreshSystemBars（同一帧内合并、值没变不重复跨桥）。
      */
     refreshSystemBars();
-    $('#btnTheme').innerHTML = theme === 'light'
+    const themeIcon = theme === 'light'
       ? '<svg><use href="#i-moon"/></svg>' : '<svg><use href="#i-sun"/></svg>';
+    $('#btnTheme').innerHTML = themeIcon;
+    /* 侧栏里的主题按钮（宽屏才显示）保持同一个图标，两处入口永远一致 */
+    const railTheme = $('#railTheme');
+    if (railTheme) railTheme.innerHTML = themeIcon;
     syncSegAria('#themeSeg', S().theme, 'theme');
   }
 
@@ -4293,14 +4297,22 @@
     }
     $('#btnSearch').addEventListener('click', () => { go('search'); setTimeout(() => $('#searchInput').focus(), 260); });
     $('#btnSettings').addEventListener('click', () => go('settings'));
-    $('#btnTheme').addEventListener('click', () => {
+    /*
+     * 主题切换：顶栏按钮和侧栏按钮是同一个行为，抽成一个函数，
+     * 避免两处各写一套、以后改顺序时只改一处导致行为不一致。
+     * 宽屏下顶栏那颗被 CSS 隐藏，侧栏那颗显示；窄屏反过来。
+     */
+    const cycleTheme = () => {
       const order = ['dark', 'light', 'auto'];
       const next = order[(order.indexOf(S().theme) + 1) % 3];
       S().theme = next; Store.save();
       applyTheme();
       if (Player.track) paletteFor(Player.track);
       toast('主题已切换', { dark: '深色', light: '浅色', auto: '跟随系统' }[next], 'theme');
-    });
+    };
+    $('#btnTheme').addEventListener('click', cycleTheme);
+    const railThemeBtn = $('#railTheme');
+    if (railThemeBtn) railThemeBtn.addEventListener('click', cycleTheme);
 
     // 首页 · hero 是「无限漫游」入口
     /*

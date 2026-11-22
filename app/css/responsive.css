@@ -111,6 +111,18 @@
   .tabbar{display:none}
 
   /*
+   * 侧栏出现后，顶栏右侧的三个圆形按钮（搜索 / 主题 / 设置）就和左侧
+   * 导航重复了 —— 侧栏里已经有「搜索」「我的」，主题也搬到了折叠行。
+   * 所以这一档把它们收起来，把宽度让给内容。
+   *
+   * 只在侧栏真正显示的档位里隐藏；手机上没有侧栏，顶栏这三个按钮
+   * 是唯一入口，必须留着（否则主题都切不了）。
+   */
+  .topbar .tb-btn{display:none}
+  /* 侧栏折叠行里的主题按钮在这一档才出现（窄屏由顶栏负责） */
+  .rail-theme{display:grid}
+
+  /*
    * 收起态：只把宽度换成图标条的宽度，其余布局全部跟着 --rail-w 走
    * （.app 的 padding-left、dock、底部渐变都读它），所以这里改一个变量
    * 就等于整屏一起让位，不会出现「导航收起了但内容没动」的错位。
@@ -333,7 +345,17 @@
     display:flex;flex-direction:column;justify-content:center;
   }
   /* 宽屏上第 3 行不再隐藏（那原本是给矮屏省高度的） */
-  .np-lyric .ln:nth-child(3){display:flex}
+  /*
+   * 这里必须补 justify-content:center，否则第 3 行会左对齐。
+   *
+   * 原因：.ln 本来是 display:block，文字靠父级的 text-align:center 居中；
+   * 一旦改成 display:flex，text-align 就管不住它的行内内容了 ——
+   * flex 容器的默认主轴对齐是 flex-start，文字整体贴到左边。
+   * 实测（1180px 宽窗口）：第 1、2 行文字中心 ≈852/870，
+   * 第 3 行中心 ≈717，整整偏左 130+px。因为只有第 3 行被改成 flex，
+   * 所以只有它歪 —— 看起来就像「第三句没居中」。
+   */
+  .np-lyric .ln:nth-child(3){display:flex;justify-content:center}
   .np-seek{grid-area:seek;margin:10px 0 0}
   /*
    * margin:0 auto 让这排控制按钮在右栏里居中。

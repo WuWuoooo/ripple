@@ -211,13 +211,27 @@
 }
 
 /* 收起按钮独占一行、靠右：和品牌名挤一行放不下（见 index.html 注释） */
-.rail-foldrow{display:flex;justify-content:flex-end;flex:none}
+.rail-foldrow{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:none}
 .rail-fold{width:28px;height:28px;flex:none;border-radius:9px;display:grid;place-items:center;
   color:var(--text3);border:1px solid transparent;transition:.22s var(--ease)}
 .rail-fold:hover{background:var(--panel);color:var(--text)}
 .rail-fold svg{width:16px;height:16px;transition:transform var(--dur) var(--ease)}
 /* 收起态按钮居中（一行只有一个按钮时靠右看着别扭） */
 html[data-rail="mini"] .rail-foldrow{justify-content:center}
+
+/*
+ * 夜间模式按钮（#railTheme）平时不显示 —— 窄屏 / Android 上没有侧栏，
+ * 主题开关由顶栏的 #btnTheme 负责。
+ * 只有侧栏真正显示出来的宽屏档位（见 responsive.css 的 .rail{display:flex}）
+ * 才把它放出来：展开时在折叠箭头左边，收起时和箭头竖排居中。
+ */
+.rail-theme{display:none}
+
+/*
+ * 收起态（mini）下两个图标 28+6+28=62px，塞不进 68px 的窄栏里还留白太挤，
+ * 所以收起态让它们竖排、居中。
+ */
+html[data-rail="mini"] .rail-foldrow{flex-direction:column;gap:4px}
 
 .rail-brand{display:flex;align-items:center;gap:9px;flex:none;min-width:0;
   padding:0 4px;overflow:hidden}
