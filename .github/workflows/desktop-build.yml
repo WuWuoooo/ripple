@@ -2,15 +2,15 @@ name: desktop
 
 # 桌面端（Tauri）构建。
 #
-# 定位：**验证阶段不进公开 Release**。
-# 所有产物只上传为 Actions Artifacts（需登录、14 天过期），
-# 由维护者下载实测、确认可用之后再决定是否并入 main 并发布。
-# 这正是 feat/desktop-tauri 分支存在的方式 —— 先在分支上验证，跑通了再合并。
+# 定位：**三端一并发布**。桌面端产物（deb / AppImage / tar.gz / NSIS / zip）
+# 与 Android APK 挂在**同一个公开 Release** 下；同时仍上传 Actions Artifacts
+# 便于排查（需登录、14 天过期）。
 #
 # 触发：
 #   · push 到 feat/desktop-tauri 等桌面分支 → 自动构建，产出 Artifacts
-#   · workflow_dispatch（手动）→ 可指定是否构建 macOS
-#   · 合并进 main 之后也不会自动发布，仍需要手动 dispatch
+#   · workflow_dispatch（手动）→ 可指定是否构建 macOS；在 main 上触发时
+#     会走 release job，把桌面端产物并进该版本的 Release
+#   · push 到 main 时只跑检查与打包，不自动发 Release（发版走手动 dispatch）
 on:
   push:
     branches:
@@ -179,10 +179,9 @@ jobs:
   # 三个平台各打各的包。macOS 默认参与（主人要求三端），
   # 但可以在手动 dispatch 时关掉以省额度。
   #
-  # ⚠️ 产物只作为 Artifact 上传，不进 Release。
-  #    为什么：CI 里没法真正测「点开能不能用」——GUI 交互、
-  #    登录、播放这些必须人在真实桌面上点。先进 Artifact 让人验，
-  #    验过了再决定要不要发。
+  # 产物既是 Artifact（方便看日志与单包排查），也会被下面的 release job
+  # 收集起来并进同一个公开 Release。分支上的日常构建只有 Artifact，
+  # 只有 main 上手动 dispatch 才会真的发 Release。
   # ------------------------------------------------------------------
   bundle:
     name: 打包（${{ matrix.label }}）
@@ -311,8 +310,9 @@ jobs:
           {
             echo "## Ripple 桌面端 · ${{ matrix.label }}"
             echo ""
-            echo "> ⚠️ 这是**验证版产物**，只作为 Artifact 保留 14 天，不会进公开 Release。"
-            echo "> 请下载后实测：能否启动、界面是否正常、能否登录与播放。"
+            echo "> 这是本平台的构建产物（Artifact 保留 14 天）。"
+            echo "> 在 main 上手动 dispatch 时，同样的产物会随该版本进公开 Release。"
+            echo "> 建议下载后实测：能否启动、界面是否正常、能否登录与播放。"
             echo ""
             echo "### 下一步（未签名包的用户侧处理）"
             echo ""
@@ -326,7 +326,7 @@ jobs:
   #
   # 只有在 main 分支上手动 dispatch 才会发布。
   # 分支上的日常构建仍然只产 Artifacts（见上面 bundle job），
-  # 这样「验证产物」和「正式发布」不会混在一起。
+  # 这样「日常构建」和「正式发布」不会混在一起。
   #
   # 为什么单独一个 job、而不是在 bundle 里顺手发布：
   #   matrix 有两个平台，各自上传会让多个 runner 同时往同一个 Release
