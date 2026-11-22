@@ -6,6 +6,95 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.0 — Seventh Version
+
+The theme of this version is **"taking the desktop build from *runs* to *usable*"**, plus a batch of layout and capability defects that are **only visible once it actually runs on a real device**. In one sentence: the previous version proved that "the same frontend can be moved to the desktop"; this version is about whether every detail is actually *right* after the move.
+
+### 1. New Desktop Build (Windows / Linux, Tauri 2)
+
+The 13000-line frontend in `app/` is moved to the desktop as-is, with **not a single line of frontend logic changed**.
+
+The approach is to reproduce Android's `@JavascriptInterface` bridge verbatim inside the page: the desktop `bridge.js` provides `window.RippleNative`, forwarding internally to Tauri's Rust commands. The frontend cannot tell the difference — it believes it is talking to Java.
+
+- **weapi encryption on the Rust side**: double AES-128-CBC + textbook RSA, with constants character-for-character identical to the Java / Node sides, covered by 9 fixed-vector tests. Get one byte wrong here and NetEase just returns `{"code":400}`; on screen you cannot tell whether the padding was wrong or the base64 line wrapping differed
+- **20 commands**, aligned one by one with Java / server.js (the frontend calls 20, and not one is missing)
+- **Pure bash frontend assembly**: `build-frontend.sh` copies `app/` and injects the bridge layer; no npm / frontend build chain required
+- **Artifact formats**: Linux produces `.deb` / `.AppImage` / `.tar.gz`; Windows produces an NSIS installer / `.zip` portable build. CI uploads only to Actions Artifacts and **never to a public Release**
+- **macOS dropped**: this machine (aarch64 Ubuntu proot) absolutely cannot produce macOS artifacts, which need the Apple SDK and signing certificates. Rather than ship an untested package, it is explicitly not done
+
+### 2. Three Defects That "Look Right but Do Not Work"
+
+What these have in common: **the code reads fine; only running it and actually clicking exposes the problem**.
+
+1. **Window buttons render, but clicking does nothing**
+   In Tauri 2's permission system `core:default` grants only the **query-type** window permissions and does not include `allow-minimize` / `allow-close` / `allow-maximize` / `allow-toggle-maximize`. So the three buttons render fine and the handlers are bound, but the IPC is rejected by the permission layer — and it **fails silently**, with nothing in the console. Fixed in `capabilities/default.json`.
+
+2. **Window dragging broken**
+   Tauri's **bare** `data-tauri-drag-region` attribute only fires when the click lands **directly on that element** (see `isDragRegion` in `tauri/src/window/scripts/drag.js`: it requires `el === composedPath[0]`). A drag region inevitably contains child elements (text nodes), and clicking the text makes `target` that child, so the bare attribute is dead. It has to be `"deep"` for the whole subtree to drag.
+
+3. **Comments reported "illegal upstream path"**
+   The Rust-side path whitelist allowed only lowercase `a-z`, while the comments endpoint path is `v1/resource/comments/R_SO_4_<id>` — **the uppercase letters are part of the interface name**. After checking every backend: Java allows uppercase and Node's regex has `/i`, so **only the Rust side had this defect**. The whitelist was relaxed to `is_ascii_alphanumeric()` (still rejecting `..`).
+
+### 3. Desktop QR Login (Unified Across All Three Platforms)
+
+A new **zero-dependency QR encoder** `app/js/qrcode.js` (about 400 lines): ISO/IEC 18004 byte mode, versions 1–10, ECL L/M/Q/H, 8 masks selected by penalty score, GF(256) Reed-Solomon, BCH format information.
+
+The login flow is now QR scanning on all three platforms: Android / desktop / browser all scan with the NetEase Cloud Music app on a phone. The state machine covers 801 (awaiting scan) / 802 (scanned, awaiting confirmation) / 803 (success) / 800 (expired).
+
+**How this code was verified deserves its own note**: structural tests, BCH validation and module-count checks all passed, yet the QR code **would not scan**. It took a real `zbarimg` decode to find three bugs:
+
+- The serpentine direction of the data fill was derived from the column number instead of the **column-pair index** — both odd and even columns were wrong half the time
+- The bit order of the two format-information copies was reversed: the first copy bit14→bit0, the second should be bit0→bit14
+- The dark module was written at `(size-8, size-8)`; the correct position is `(size-8, 8)`
+
+The third one makes the point: **one pixel wrong and the entire code becomes unscannable**. No amount of "looks correct" self-checking gets past that; it has to be actually decoded.
+
+### 4. Four Layout Problems on the Player Page
+
+- **Lyrics overlapped the progress bar**: a grid item's `min-height` defaults to `auto`, so it is as tall as its content and **overflows** its track onto the progress bar below. Fixed with `min-height:0` + `align-self:stretch`
+- **Controls not centred when lyrics expand**: `.np-ctl` was missing `margin:8px auto 0`, so the box was capped at 460 wide but still left-aligned, leaving "previous / play / next" stuck to the left
+- **No transition when expanding / collapsing**: `grid-template-areas` itself cannot interpolate, but `grid-template-rows` tracks of numeric values can — used for a smooth 0.3s transition
+- **Too empty when collapsed**: lyrics are now vertically centred, and the wide-screen line count went from 3 to 5
+
+### 5. Window Titlebar No Longer Covers the Top of the Page
+
+The previous version used "a 34px dark bar + `html{padding-top:34px}`". That padding pushes the entire page down 34px, so **whatever sits at the top of any page is permanently covered**, and a solid dark bar over a light page looks like a strip of tape — the opposite of "immersive".
+
+It now follows the approach of mainstream desktop clients: **there is no such thing as a "titlebar"**, only three zero-height window buttons floating in the top-right corner, taking no layout space. The page's own header already has search / theme / settings on its right, and the window buttons line up to their right, visually forming a single row of controls.
+
+Related adjustment: the buttons float on the very top layer, above the full-screen player layer (`z-index:60`) and custom modals (`z-index:120`) — otherwise, opening the player leaves no way to close or minimise the window.
+
+### 6. Wide-Screen Information Architecture Consolidated
+
+With the sidebar expanded, the search / theme / settings circular buttons in the header are **completely redundant** with the left navigation. On wide screens they are withdrawn and folded into the sidebar:
+
+- Search → sidebar "Search"
+- Settings → sidebar "Mine"
+- Theme → the sidebar fold row, placed to the left of the expand/collapse arrow
+
+**Mobile is unaffected**: the hiding rule lives in the media query where the sidebar is actually shown, and phones have no sidebar, so those three header buttons remain the only entries there.
+
+### 7. Three Small Defects
+
+- **Third lyric line left-aligned**: `.np-lyric .ln` was `display:block` and relied on the parent's `text-align:center`; the wide-screen rule `.ln:nth-child(3){display:flex}` turned it into a flex container, and `text-align` does not control inline content of flex items while the default main-axis alignment is `flex-start`. **Only line 3 was made flex, so only line 3 was crooked**. Measured centres: lines 1 and 2 at 852/870, line 3 at 717. Adding `justify-content:center` brings all three to 860
+- **Logo misaligned when the sidebar is collapsed**: the collapsed state relies on a group of "only an icon left, so centre it" rules, but `.rail-brand` was missed. Every other icon centres at 83; only it and the home icon sat at 77
+- **In-app notifications defaulted to off**: the top toast is the **only immediate feedback** for actions like changing track, liking, or network failures; defaulting it off leaves people unsure whether an action took effect. Now on by default
+
+### 8. Mobile-Only Settings Hidden on Desktop
+
+Four items in "Notifications & Background" — **notification playback controls / non-interrupting notifications / send test notification / request notification permission** — all depend on Android native capabilities (`PlaybackService`, `POST_NOTIFICATIONS`, `RippleNative.notify`). On desktop they either do nothing or permanently show "not authorised", so keeping them only makes it look broken.
+
+The criterion is the explicit `platform: 'desktop'` from `bridge.js`, **not capability detection** — the desktop bridge reproduces every method with its exact signature (returning `false`) to keep "zero frontend changes", so probing would be fooled by those placeholders. Android has no such field, so it reads `undefined` and stays unchanged.
+
+"In-app notifications" is a pure frontend toast and works fine on desktop, so it is **kept**.
+
+### 9. CI
+
+- Both the Android and the desktop matrices (Linux-x64 / Windows-x64) now pass
+- Two GitHub Actions pitfalls hit along the way are recorded in `desktop/README.md`: a job-level `if` **cannot reference `matrix`** (which yields a workflow with 0 jobs and no error); `if: |` multi-line literals are illegal; and once a workflow is broken GitHub caches the bad parse, so **the filename must change** to force a re-parse
+
+---
+
 ## 1.2.3 — Sixth Version
 
 ### 1. Rectification According to the Code Review Report from GLM-5.3 Flash (Full Coverage of 71 Items)

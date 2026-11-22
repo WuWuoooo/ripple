@@ -9,11 +9,13 @@
   <b>PWA + 原生外壳</b> · <b>约 0.5 MB（APK）</b> · <b>构建不依赖 Gradle</b> · <b>无 AndroidX</b> · <b>MIT</b>
 </p>
 
-**平台**：Android（APK）· 浏览器 / PWA（`node server.js`）· 桌面端（Tauri，**验证中，未发布**）
+**平台**：Android（APK）· 浏览器 / PWA（`node server.js`）· 桌面端（Windows / Linux，Tauri 2）
 
-> 桌面端正在 `feat/desktop-tauri` 分支上开发，复用同一份前端。
-> 它**还没有**进公开 Release —— 构建产物只作为 Actions Artifacts 供实测。
-> 详见 [desktop/README.md](desktop/README.md)。
+> 桌面端复用**同一份 `app/` 前端，逻辑一行不改**，靠一层桥接把 Android 的
+> `@JavascriptInterface` 原样造出来。详见 [desktop/README.md](desktop/README.md)。
+>
+> 桌面端产物目前只作为 Actions Artifacts 提供，**不进公开 Release**；
+> macOS 不做（需要 Apple SDK + 签名证书，本机无法产出也无法验证）。
 
 ---
 
@@ -71,8 +73,13 @@
 - **锁定态完全不拦触摸**，不影响你正常用手机；解锁后才能拖动位置
 
 > 这三项依赖 Android 的窗口与媒体系统，浏览器和桌面端没有对等物。
-> 桌面端目前**没有**通知栏媒体控制与歌词浮层（计划做系统托盘 / SMTP·MPRIS，
+> 桌面端**没有**通知栏媒体控制与歌词浮层（计划做系统托盘 / MPRIS，
 > 见 [desktop/README.md](desktop/README.md) 的功能对照表）。
+>
+> 因此桌面端在「设置 → 通知与后台」里会**自动隐藏**这四项手机专属开关
+> （通知栏播放控件 / 通知不打断播放 / 发送测试通知 / 请求通知权限），
+> 避免出现「能拨但什么都不会发生」的开关。「软件内通知」是纯前端 toast，
+> 桌面端照样有效，保留。
 
 **网易云**
 
@@ -98,6 +105,25 @@
 ### 装 APK（推荐）
 
 到 [Releases](../../releases) 下载最新的 `Ripple-x.y.z.apk`，传到手机安装（需允许「安装未知来源应用」）。
+
+**只有一个通用包，不需要分 ABI。** Ripple 是纯 Java + WebView 应用，
+APK 里没有任何 `.so` / `lib/` 目录（`aapt2 dump badging` 也没有 `native-code` 字段），
+所以 x86 / x86_64 / arm64 用的是同一个包 —— 那些 ABI 只对带 native 库的应用才有意义。
+
+### 桌面端（Windows / Linux）
+
+产物在 Actions 的 `ripple-desktop-linux-x64` / `ripple-desktop-windows-x64` 里：
+
+| 平台 | 格式 | 说明 |
+|---|---|---|
+| Linux | `.deb` | Debian / Ubuntu 双击安装 |
+| Linux | `.AppImage` | 免安装，`chmod +x` 后直接跑 |
+| Linux | `.tar.gz` | 便携版，解压即用 |
+| Windows | NSIS `-setup.exe` | 安装包 |
+| Windows | `.zip` | 绿色版，解压即用 |
+
+包未做代码签名，首次运行会被系统拦（Windows SmartScreen / Linux 无影响），
+绕过方法见 [desktop/README.md](desktop/README.md)。
 
 - 最低 Android 7.0（API 24）
 - 装完直接可用，**不需要另起服务、不需要配置接口地址**

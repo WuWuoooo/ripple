@@ -9,11 +9,12 @@
   <b>PWA + native shell</b> · <b>approx. 0.5 MB (APK)</b> · <b>build does not depend on Gradle</b> · <b>no AndroidX</b> · <b>MIT</b>
 </p>
 
-**Platforms:** Android (APK) · browser / PWA (`node server.js`) · desktop (Tauri, **in validation, unreleased**)
+**Platforms:** Android (APK) · browser / PWA (`node server.js`) · desktop (Windows / Linux, Tauri 2)
 
-> The desktop client is being developed on the `feat/desktop-tauri` branch and reuses the same frontend.
-> It is **not** in public Releases yet — build outputs are uploaded only as Actions Artifacts for hands-on testing.
-> See [desktop/README.md](../../desktop/README.md).
+> The desktop client reuses **the same `app/` frontend with not a single line of logic changed**; a bridge layer reproduces Android's `@JavascriptInterface` verbatim. See [desktop/README.md](../../desktop/README.md).
+>
+> Desktop artifacts are currently offered only as Actions Artifacts and **do not go into public Releases**.
+> macOS is not built (it needs the Apple SDK and signing certificates, which this machine can neither produce nor verify).
 
 ---
 
@@ -69,6 +70,12 @@
   **fill following playback progress**
 - **In the locked state it does not intercept touches at all**, so it does not affect normal phone use; the position can only be dragged after unlocking
 
+> These depend on Android's window and media systems; browsers and desktop have no equivalent.
+> The desktop client therefore **automatically hides** those four phone-only switches under
+> "Settings → Notifications & Background" (notification playback controls / non-interrupting notifications /
+> send test notification / request notification permission), so no switch is shown that can be toggled
+> yet does nothing. "In-app notifications" is a pure frontend toast and works on desktop, so it stays.
+
 **NetEase Cloud Music**
 
 - Real weapi protocol (double-layer AES-128-CBC + textbook RSA, consistent with mainstream third-party clients)
@@ -90,10 +97,29 @@ To avoid trouble, it does not do the following:
 
 Go to [Releases](../../releases) to download the latest `Ripple-x.y.z.apk`, transfer it to your phone, and install it (you need to allow "Install unknown apps").
 
+**There is only one universal package; ABI splits are unnecessary.** Ripple is a pure Java + WebView app with
+no `.so` files or `lib/` directory in the APK (`aapt2 dump badging` reports no `native-code` either), so
+x86 / x86_64 / arm64 all use the same package — ABI only matters for apps shipping native libraries.
+
 - Minimum Android 7.0 (API 24)
 - Ready to use after installation; **no need to start a separate service or configure an API address**
 
 > **The installation source is important**: This app uses a public **debug signature** (the debug keystore is public with the repository; the password is the industry-standard `android`, and anyone can use it to sign an APK with the same package name). Therefore, please **install only from this repository's Releases**, and do not install APKs with the same package name from other sources — otherwise you are giving others the permission to overwrite and upgrade your Ripple. See [SECURITY.md](SECURITY.md) for details.
+
+### Desktop (Windows / Linux)
+
+Artifacts live in the Actions runs under `ripple-desktop-linux-x64` / `ripple-desktop-windows-x64`:
+
+| Platform | Format | Notes |
+|---|---|---|
+| Linux | `.deb` | Double-click to install on Debian / Ubuntu |
+| Linux | `.AppImage` | No install; `chmod +x` and run |
+| Linux | `.tar.gz` | Portable, unpack and run |
+| Windows | NSIS `-setup.exe` | Installer |
+| Windows | `.zip` | Portable, unpack and run |
+
+The packages are unsigned, so the first run is blocked by the OS (Windows SmartScreen; no effect on Linux).
+See [desktop/README.md](../../desktop/README.md) for the workaround.
 
 ### Run the Web Version / PWA
 
