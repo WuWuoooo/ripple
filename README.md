@@ -186,7 +186,7 @@ app/                    ← 网页版，同时是 APK 里的 assets/www
 └── sw.js               ← Service Worker
 
 android/                ← Java 外壳（11 个类，见 CONTRIBUTING.md 的「代码结构」）
-desktop/                ← 桌面端（Tauri）—— 验证中，见 desktop/README.md
+desktop/                ← 桌面端（Tauri），产物随 Release 一起发布，见 desktop/README.md
 ├── bridge.js           ← 把 RippleNative 桥照原样造出来，前端零改动
 ├── build-frontend.sh   ← app/ + bridge.js → dist/（纯 bash，无 npm）
 └── src-tauri/          ← Rust：weapi 加密 + 20 个网易云命令 + Tauri 入口
@@ -225,7 +225,7 @@ tests/                  ← Node 内置测试（bash tests/run.sh）：LRC 解�
 **Android / 网页版**刻意不引入 Kotlin / AndroidX / npm 依赖 / 前端构建链 ——
 这是它能保持「一个 `node server.js` 就跑起来」的前提。
 
-**桌面端**（`desktop/`，验证中）打破了这一条：它需要 cargo 与 Rust 依赖树。
+**桌面端**（`desktop/`）打破了这一条：它需要 cargo 与 Rust 依赖树。
 这是引入系统级客户端能力的必然代价，所以把它隔离在独立目录、独立 CI 里，
 **不影响**前两端的零依赖构建。取舍写在 [desktop/README.md](desktop/README.md)。
 
@@ -238,7 +238,7 @@ tests/                  ← Node 内置测试（bash tests/run.sh）：LRC 解�
 ## 参与贡献
 
 **编码**：Deepseek V4.1 Flash 1017  
-**主要审查**：MiniMax M3.1 Flash、Hy4 Flash、GLM-5.3 Flash
+**主要审查**：MiniMax M3.1 Flash、Hy4 Flash、GLM-5.3 Flash、Deepseek V4.1 Flash 1017
 
 ---
 

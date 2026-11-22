@@ -172,27 +172,52 @@ const TOKEN_TTL_MS = (() => {
   return Math.min(Math.max(raw, 10 * 1000), 24 * 60 * 60 * 1000);
 })();
 /*
- * 轮换时保留的旧令牌个数。
+ * 轮换时保留的旧令牌个数 —— **按来源 IP 分桶，每桶保留这么多个**。
  *
- * S-02：这里曾经是 2（全局 3 槽）。令牌表是**全局**的，不分设备 ——
- * 三台设备先后加载页面，第一台的令牌就被挤出去了，表现为「谁刷新谁好使、别人全 401」，
- * 30 分钟 TTL 根本来不及用。提到 5 之后，最多约 6 个「设备 + 页面」可以交替
- * 刷新而互不挤兑；再多的设备就该走「令牌按 IP 分桶」那种改造了，本轮不做。
- * 注意：加长的是**数量**不是**时间** —— 每个令牌的 exp 仍然由 TOKEN_TTL_MS 决定，
- * 安全窗口一点没变宽，只是同时能容纳更多在用的设备。
+ * S-02（1.2.3）：这里曾经是 2（全局 3 槽），令牌表是全局的、不分设备，
+ * 三台设备先后加载页面就把第一台的令牌挤掉了，表现是「谁刷新谁好使、别人全 401」。
+ * 当时把数字提到 5，但**没有解决结构问题**。
+ *
+ * S-01（1.3.0 审查）：全局单表 + 按 IP 限流的组合意味着 —— 任一来源只要在
+ * 自己的配额内连刷 6 次，就能把整张表填满成自己的令牌，其他来源的令牌被
+ * `slice(0, 6)` 全部挤掉。而签发端点**不需要任何令牌**（唯一的门槛
+ * browserSignalOk 只要求 Sec-Fetch-* 头存在，伪造零成本），所以同网段任何
+ * 设备/进程都能让正在听歌的设备成片 401，且前端只在页面加载时取一次令牌、
+ * 不会自动续签 —— 攻击者可定时刷，使刷新也无效。
+ *
+ * 现在改成 Map<ip, [{t, exp}]>：每个来源有自己的窗口，互相挤不到。
+ * 单 IP 的在用令牌再设上限 TOKEN_PER_IP，避免一台设备开 6 个标签页互挤。
  */
 const TOKEN_KEEP_PREV = 5;
+/* 单个 IP 最多同时持有几个有效令牌（= KEEP_PREV + 1，与旧语义一致） */
+const TOKEN_PER_IP = TOKEN_KEEP_PREV + 1;
 const TOKEN_ISSUE_PER_MIN = 30;     // 每个 IP 每分钟最多签发多少个（防刷爆轮换窗口）
 
-/** 当前有效令牌：新的在前，每项 { t, ip, exp } */
-let tokenList = [];
+/**
+ * 当前有效令牌：Map<归一化 IP, [{ t, exp }]>，每桶新的在前。
+ *
+ * 注意桶里**不存 ip** —— 键就是 ip，避免出现「key 是 A、记录里 ip 是 B」
+ * 这种自相矛盾的状态。鉴权时按请求来源 IP 直接查自己的桶。
+ */
+let tokenMap = new Map();
 
 const normIp = sec.normIp;
 
-/** 只在真的清掉了过期项时才换数组，避免每次鉴权都新建对象 */
+/**
+ * 丢掉所有桶里的过期令牌；只在真的清掉了东西时才重建 Map，
+ * 避免每次鉴权都新建对象。整体为空时顺手返回空 Map。
+ */
 function pruneTokens(now) {
-  const keep = sec.pruneTokens(tokenList, now);
-  if (keep !== tokenList) tokenList = keep;
+  let changed = false;
+  for (const [ip, arr] of tokenMap) {
+    const keep = sec.pruneTokens(arr, now);
+    if (keep !== arr) {
+      changed = true;
+      if (keep.length) tokenMap.set(ip, keep);
+      else tokenMap.delete(ip);
+    }
+  }
+  if (changed) saveTokenStore();
 }
 
 function loadTokenStore() {
@@ -201,15 +226,25 @@ function loadTokenStore() {
   if (!raw) return;
   try {
     const j = JSON.parse(raw);
+    /*
+     * v:2 的旧文件是 { v:2, tokens: [{t, ip, exp}] } —— 全局单表。
+     * 读进来时按 ip 字段重新分桶（兼容，不丢已签发的令牌）。
+     */
     const arr = (j && Array.isArray(j.tokens)) ? j.tokens : [];
-    tokenList = arr
-      .filter((e) => e && typeof e.t === 'string' && /^[a-f0-9]{32}$/.test(e.t))
-      .map((e) => ({ t: e.t, ip: normIp(e.ip), exp: Number(e.exp) || 0 }))
-      .slice(0, TOKEN_KEEP_PREV + 1);
+    const map = new Map();
+    for (const e of arr) {
+      if (!e || typeof e.t !== 'string' || !/^[a-f0-9]{32}$/.test(e.t)) continue;
+      const ip = normIp(e.ip);
+      const bucket = map.get(ip) || [];
+      if (bucket.length >= TOKEN_PER_IP) continue;
+      bucket.push({ t: e.t, exp: Number(e.exp) || 0 });
+      map.set(ip, bucket);
+    }
+    tokenMap = map;
     pruneTokens(Date.now());
   } catch (e) {
     /* 旧版本文件里就是一行裸令牌，直接丢弃，按新格式重建（下次签发时写盘） */
-    tokenList = [];
+    tokenMap = new Map();
   }
 }
 
@@ -217,7 +252,10 @@ function saveTokenStore() {
   /* R-14 同款：先写临时文件再 rename，写到一半被杀不会留下半截 JSON */
   const tmp = TOKEN_FILE + '.tmp-' + process.pid;
   try {
-    fs.writeFileSync(tmp, JSON.stringify({ v: 2, tokens: tokenList }), { encoding: 'utf8', mode: 0o600 });
+    /* 落盘格式保持「扁平数组 + 每条带 ip」，与旧版本兼容（读回时会重新分桶） */
+    const flat = [];
+    for (const [ip, arr] of tokenMap) for (const e of arr) flat.push({ t: e.t, ip: ip, exp: e.exp });
+    fs.writeFileSync(tmp, JSON.stringify({ v: 2, tokens: flat }), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, TOKEN_FILE);
     try { fs.chmodSync(TOKEN_FILE, 0o600); } catch (e) {}
   } catch (e) {
@@ -226,21 +264,41 @@ function saveTokenStore() {
   }
 }
 
-/** 签发新令牌并旋转：新令牌在前，只留 TOKEN_KEEP_PREV 个旧的 */
+/**
+ * 签发新令牌并旋转 —— **只旋转该来源自己的桶**。
+ *
+ * 这是 S-01 的核心修复：以前是全局 unshift + slice，任何来源刷 6 次就能
+ * 把别人的令牌全部挤掉。现在每个 IP 有自己的窗口，A 刷爆只影响 A 自己。
+ */
 function issueToken(ip) {
   const now = Date.now();
   pruneTokens(now);
+  const me = normIp(ip);
   const t = crypto.randomBytes(16).toString('hex');
-  tokenList.unshift({ t: t, ip: normIp(ip), exp: now + TOKEN_TTL_MS });
-  tokenList = tokenList.slice(0, TOKEN_KEEP_PREV + 1);
+  const bucket = (tokenMap.get(me) || []).filter((e) => now < e.exp);
+  bucket.unshift({ t: t, exp: now + TOKEN_TTL_MS });
+  tokenMap.set(me, bucket.slice(0, TOKEN_PER_IP));
   saveTokenStore();
   return t;
 }
 
-/** 令牌是否有效：必须存在、未过期、且来源 IP 与签发时一致 */
+/** 令牌是否有效：必须属于该来源 IP 的桶、存在、且未过期 */
 function tokenValid(got, ip) {
   pruneTokens(Date.now());
-  return sec.tokenValid(tokenList, got, ip);
+  const bucket = tokenMap.get(normIp(ip));
+  if (!bucket || !bucket.length) return false;
+  const v = String(got || '');
+  if (!v) return false;
+  const now = Date.now();
+  return bucket.some((e) => e && e.t === v && now < e.exp);
+}
+
+/** 诊断用：当前令牌总数与各来源的持有量（不含令牌值本身） */
+function tokenStats() {
+  const byIp = [];
+  let total = 0;
+  for (const [ip, arr] of tokenMap) { byIp.push(ip + '×' + arr.length); total += arr.length; }
+  return { total: total, byIp: byIp };
 }
 
 loadTokenStore();
@@ -380,6 +438,20 @@ const COOKIE_FILE = path.join(DATA_DIR, '.ripple-cookie');
 let cookieJar = '';
 /** 串行化 Set-Cookie 合并，避免并发响应互相覆盖 */
 let cookieWriteChain = Promise.resolve();
+/**
+ * 登录代际（审查 S-03）。
+ *
+ * logout 时自增。慢请求发出时记下当时的代际，它的 Set-Cookie 回来时若
+ * 代际已经变了，说明期间用户登出过 → 直接丢弃，不许把登录态复活。
+ *
+ * 以前 server.js 的注释明确写着「断开后直接返回：不写响应，也不让上游的
+ * Set-Cookie 覆盖用户当前会话」，但 closed 只在「写响应」分支里被检查，
+ * 而 cookie 的合并/写盘发生在 ncmPost 内部的 res.on('end') 闭包里 ——
+ * 那个闭包完全看不到 closed，于是：
+ *   慢请求在飞 → 用户 logout 清空 jar 并落盘 → 慢请求的 Set-Cookie 回来
+ *   → 加回 MUSIC_U → 写盘 → 登录态复活（实测 2.6 秒后 .ripple-cookie 被写回）
+ */
+let cookieEpoch = 0;
 try { cookieJar = fs.readFileSync(COOKIE_FILE, 'utf8').trim(); } catch (e) {}
 /* 这个文件里是明文的 MUSIC_U 登录态，期望权限 0600（生效与否由 checkSecretMode 核对） */
 try { if (fs.existsSync(COOKIE_FILE)) fs.chmodSync(COOKIE_FILE, 0o600); } catch (e) {}
@@ -481,6 +553,14 @@ function assertUpstreamPath(rawPath, url) {
   sec.assertUpstreamPath(rawPath, url);
 }
 
+/*
+ * 上游响应体上限（审查 S-10）。
+ * 请求方向已有 256KB 上限，响应方向以前完全没有 —— 实测单请求可累积到 214MB、
+ * 两并发 1491MB RSS。这里给一个宽松但有限的上限：正常接口响应最大也就几 MB
+ * （歌单 tracks、评论列表），16MB 足够，超出说明上游行为异常。
+ */
+const MAX_UPSTREAM_BODY = 16 * 1024 * 1024;
+
 function ncmPost(path, body) {
   return new Promise((resolve, reject) => {
     let url;
@@ -508,9 +588,27 @@ function ncmPost(path, body) {
       },
     }, (res) => {
       let data = '';
+      /*
+       * 审查 S-03：发出请求时记下代际。
+       * 响应回来时若代际已变（期间用户登出过），Set-Cookie 一律丢弃。
+       */
+      const epochAtStart = cookieEpoch;
+      let settled = false;
+      const done = (fn, arg) => { if (settled) return; settled = true; fn(arg); };
+
       res.setEncoding('utf8');
-      res.on('data', (c) => (data += c));
+      res.on('data', (c) => {
+        /* S-10 顺带：响应体无上限累积会和 256KB 的请求上限形成单边不对称（实测两并发可到 1.5GB RSS） */
+        if (data.length > MAX_UPSTREAM_BODY) {
+          /* 超限：主动断开，按上游失败处理，别把进程内存吃光 */
+          done(reject, new Error('上游响应体过大（超过 ' + (MAX_UPSTREAM_BODY / 1024 / 1024) + 'MB）'));
+          try { req.destroy(); } catch (e) {}
+          return;
+        }
+        data += c;
+      });
       res.on('end', () => {
+        if (settled) return;
         const sc = res.headers['set-cookie'];
         if (sc && sc.length) {
           /*
@@ -518,8 +616,12 @@ function ncmPost(path, body) {
            * cookieMap(cookieJar) → 改 → 整体写回，后写的会盖掉先写的，
            * 丢掉刚拿到的会话字段。这里用一个串行队列把「合并」串起来，
            * 保证每次都基于最新值改、且只有一处写盘。
+           *
+           * S-03：合并前再比一次代际 —— 期间登出过就整个丢掉，
+           * 否则慢请求会把用户的登录态「复活」。
            */
           cookieWriteChain = cookieWriteChain.then(() => {
+            if (epochAtStart !== cookieEpoch) return;   /* 登出过 → 丢弃 */
             const jar = cookieMap(cookieJar);
             sc.forEach((line) => {
               const pair = line.split(';')[0].trim();
@@ -534,11 +636,33 @@ function ncmPost(path, body) {
             saveCookie();
           }).catch(() => {});
         }
-        resolve(data);
+        done(resolve, data);
       });
+
+      /*
+       * 审查 S-02：上游中途断流必须 settle。
+       *
+       * req.setTimeout 是 **socket idle** 计时器；响应阶段上游若把 TCP 半关
+       * （发完头部 + 部分 body 后 destroy socket），Node 会在 **res** 上发
+       * 'aborted' + 'error'，而以前只挂了 res.on('data') 和 res.on('end') ——
+       * 两者都不触发，Promise 永远既不 resolve 也不 reject。
+       *
+       * 实测：45 秒后 curl 自己超时（rc=28），服务端既不回 502 也不回 200，
+       * 日志一个字都没有。后果是搜索/打开歌单/解析播放地址都会转圈到前端超时，
+       * 且每个挂起请求把闭包、累积字符串、socket 一起留在内存里无回收路径。
+       */
+      res.on('error', (e) => done(reject, e));
+      res.on('aborted', () => done(reject, new Error('上游连接中断')));
+      res.on('close', () => { if (!res.complete) done(reject, new Error('上游连接提前关闭')); });
     });
-    req.on('error', reject);
-    req.setTimeout(18000, () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => reject(e));
+    req.setTimeout(18000, () => req.destroy(new Error('上游响应超时')));
+    /*
+     * 硬上限兜底：socket idle 计时器覆盖不到「已收头部之后断流」，
+     * 再压一个绝对时长的守卫，保证任何情况下都会 settle。
+     */
+    const guard = setTimeout(() => { try { req.destroy(new Error('上游响应超时（硬上限）')); } catch (e) {} }, 25000);
+    req.on('close', () => clearTimeout(guard));
     req.write(form);
     req.end();
   });
@@ -591,6 +715,11 @@ async function ncmCall(cmd, p = {}) {
        */
       let r = '';
       try { r = await ncmPost('logout', {}); } catch (e) { r = ''; }
+      /*
+       * S-03：代际自增必须**在清空之前**。
+       * 这样所有「在飞请求发出时记的是旧代际」的 Set-Cookie 都会在合并前被判定失效。
+       */
+      cookieEpoch += 1;
       cookieJar = '';
       saveCookie();
       /* 上游失败也照样清本地（用户点了退出，界面必须回到未登录），

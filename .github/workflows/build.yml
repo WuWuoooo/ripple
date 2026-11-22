@@ -227,6 +227,35 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # 审查 D-05：已存在的同版本 tag 必须指向当前 HEAD。
+      #
+      # 1.3.0 发版时就出过这件事：Release 里的 6 个产物是 1.3.0（来自 ecd1eaa），
+      # 而 tag v1.3.0 指向 e3f1cd2 —— 一个提交信息就叫「1.2.3」的旧提交，
+      # 那个提交里连 desktop/ 目录都没有。后果是从源码构建 1.3.0 会得到 1.2.3，
+      # GitHub 的 Code → Download ZIP 也是旧内容，而 README 正在让用户从源码构建。
+      #
+      # 这里在构建前就挡住：如果 tag 已存在却指向别的提交，直接失败并给出修法，
+      # 而不是等到发完 Release 才发现二进制与源码对不上。
+      - name: tag 与 version.json / HEAD 一致（防 tag 错位）
+        run: |
+          VN=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
+          TAG="v$VN"
+          echo "version.json=$VN  tag=$TAG"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TAG_SHA=$(git rev-parse "$TAG^{commit}")
+            HEAD_SHA=$(git rev-parse HEAD)
+            echo "tag 指向: $TAG_SHA"
+            echo "HEAD    : $HEAD_SHA"
+            if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::tag $TAG 指向 $TAG_SHA，不是当前 HEAD $HEAD_SHA —— 从该 tag 构建会得到别的版本。"
+              echo "修法：git tag -f $TAG $HEAD_SHA && git push origin $TAG --force"
+              exit 1
+            fi
+            echo "✅ tag 与 HEAD 一致"
+          else
+            echo "tag $TAG 尚不存在（首次发布），跳过校验"
+          fi
+
       # 签名稳定性是「能不能覆盖升级」的前提。CI 每次都是全新 checkout，
       # 如果 keystore 没入库，build-apk.sh 会生成一把新密钥 —— 每个版本的
       # 证书指纹都不一样，用户必须卸载再装。这里直接失败，不要静默凑合。
@@ -302,24 +331,61 @@ jobs:
         run: |
           VN="${{ steps.meta.outputs.version }}"
           OUT=/tmp/notes.md
-          if [ -f CHANGELOG.md ] && grep -q "^## $VN" CHANGELOG.md; then
-            # 抓从本版标题到下一个 "## " 之间的内容
-            awk -v v="$VN" '
-              $0 ~ "^## "v"([ ]|$)" { on=1; next }
-              on && /^## / { exit }
-              on { print }
-            ' CHANGELOG.md > "$OUT"
-            echo "已从 CHANGELOG.md 提取 $VN 的说明（$(wc -l < "$OUT") 行）"
-          else
-            # 必须真的创建这个文件：下面的 cat "$OUT" 在 `bash -e` 下会失败，
-            # 以前这里只 echo 一句、不落盘，于是「CHANGELOG 缺本版段落」直接把发布打挂。
-            echo "CHANGELOG.md 里没有 $VN 的段落，使用占位说明"
+          ZH=/tmp/notes_zh.md
+          EN=/tmp/notes_en.md
+
+          # 从 CHANGELOG 抓某一版的段落：从本版标题行开始，到下一个 "## " 之前。
+          # 标题行会保留（发布正文需要一个像样的开头），尾部多余的分隔线一并裁掉。
+          extract() {
+            _file="$1"; _out="$2"
+            if [ -f "$_file" ] && grep -q "^## $VN" "$_file"; then
+              awk -v v="$VN" '
+                $0 ~ "^## "v"([ ]|$)" { on=1 }
+                on && NR > 1 && /^## / && $0 !~ "^## "v"([ ]|$)" { exit }
+                on { print }
+              ' "$_file" | awk '{ lines[NR]=$0 } END {
+                # 从尾部回删空行与 "---"
+                n=NR
+                while (n>0 && (lines[n]=="" || lines[n]=="---" || lines[n]==" ")) n--
+                for (i=1;i<=n;i++) print lines[i]
+              }' > "$_out"
+              echo "已从 $_file 提取 $VN 的说明（$(wc -l < "$_out") 行）"
+              return 0
+            fi
+            return 1
+          }
+
+          extract CHANGELOG.md "$ZH" || {
             {
               echo "## Ripple $VN"
               echo ""
               echo "本版未在 CHANGELOG.md 中找到对应段落，详见仓库提交记录。"
-            } > "$OUT"
-          fi
+            } > "$ZH"
+            echo "CHANGELOG.md 里没有 $VN 的段落，使用中文占位说明"
+          }
+
+          extract docs/en/CHANGELOG_en.md "$EN" || {
+            {
+              echo "## Ripple $VN"
+              echo ""
+              echo "This version has no matching section in CHANGELOG_en.md; see the commit history."
+            } > "$EN"
+            echo "docs/en/CHANGELOG_en.md 里没有 $VN 的段落，使用英文占位说明"
+          }
+
+          # 中英双版：中文在上、英文在下，中间用一条分隔线隔开。
+          # 用 --- 而不是「分隔线」这类文字标记，GitHub 会把它渲染成真正的 <hr>。
+          # 中英双版：语言标签 + 中文段 + 分隔线 + 英文段，最后再接安装包信息。
+          {
+            echo "> 本文档为中英双语 · This release note is bilingual (Chinese / English)."
+            echo ""
+            cat "$ZH"
+            echo ""
+            echo "---"
+            echo ""
+            cat "$EN"
+          } > "$OUT"
+          echo "中英双版正文已合并：$(wc -l < "$OUT") 行（中文 $(wc -l < "$ZH") + 英文 $(wc -l < "$EN")）"
 
           # 指纹直接从**成品 APK** 读，而不是从 keystore 猜：
           # 用户真正关心的是「这个包是什么签名」，而 apksigner --print-certs 给的
@@ -333,7 +399,13 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "**安装包**：\`${{ steps.meta.outputs.file }}\`"
+            echo "## 安装包 / Artifacts"
+            echo ""
+            echo "| 平台 | 文件 |"
+            echo "|---|---|"
+            echo "| Android | \`${{ steps.meta.outputs.file }}\` |"
+            echo "| Linux | \`Ripple_${VN}_amd64.deb\` · \`Ripple_${VN}_amd64.AppImage\` · \`Ripple-${VN}-linux-x86_64.tar.gz\` |"
+            echo "| Windows | \`Ripple_${VN}_x64-setup.exe\` · \`Ripple-${VN}-windows-x64.zip\` |"
             echo ""
             echo "**SHA-256**：\`${{ steps.meta.outputs.sha256 }}\`"
             echo ""
@@ -342,6 +414,10 @@ jobs:
             echo "> debug 证书的密码是公开的，**不能上架应用商店**；仅供自用 / 内测分发。"
             echo "> minSdk 24 / Android 7.0+。"
             echo "> 校验下载完整性：\`sha256sum ${{ steps.meta.outputs.file }}\`"
+            echo ""
+            echo "**Unsigned desktop builds**: the Windows/Linux packages are not code-signed. "
+            echo "On Windows, SmartScreen -> \"More info\" -> \"Run anyway\". "
+            echo "On Linux, \`chmod +x\` the AppImage/tar.gz, or \`sudo dpkg -i\` the deb."
           } >> "$OUT"
 
           {

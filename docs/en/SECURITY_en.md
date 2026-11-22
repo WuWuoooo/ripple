@@ -19,7 +19,7 @@ This project **has no proprietary server** and does not upload any data to third
 > `/sdcard/DSHBox/ripple` (Android internal storage, a **fuseblk mount**). This mount does not implement POSIX
 > permission bits, so `chmod` is a **no-op** here — in practice, `stat -c '%a' .ripple-cookie .ripple-token`
 > returns `660` rather than `0600`. The real protection comes from "other apps cannot read this storage,"
-> not from file permission bits. See [README.md](README.md#隐私) for a synchronized explanation.
+> not from file permission bits. See [README.md](README_en.md#privacy) for a synchronized explanation.
 
 ## Reporting Security Issues
 

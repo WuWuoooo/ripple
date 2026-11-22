@@ -96,13 +96,33 @@ sed_file() {
 
 # ---------- Gradle ----------
 if [ -f "$HERE/app/build.gradle" ]; then
-  _old="$(cat "$HERE/app/build.gradle")"
+  #
+  # 审查 U-06：这里必须做**替换后断言**，不能只看「内容变了没有」。
+  #
+  # 以前是 `if [ "$_old" = "$_new" ] then "已是最新"` —— 而 sed 完全没命中时
+  # _old 也等于 _new，于是「格式变了（比如 AGP 官方推荐的 = 写法
+  # versionCode = 130）」会被报成「已是最新，未改动」并 exit 0，
+  # 静默产出一个版本号错掉的包。
+  #
+  # 现在改成：替换后必须能 grep 到期望值，否则直接失败。
+  #
+  GB="$HERE/app/build.gradle"
+  _old="$(cat "$GB")"
   _new="$(printf '%s\n' "$_old" \
     | sed "s/versionCode [0-9]\+/versionCode $VC/; s/versionName '[^']*'/versionName '$VN'/")"
+  if ! printf '%s\n' "$_new" | grep -qE "versionCode[[:space:]]*=?[[:space:]]*$VC\b"; then
+    echo "❌ build.gradle: versionCode 注入失败（期望 $VC），sed 表达式可能已失配" >&2
+    echo "   文件格式变了？请检查 android/sync-version.sh。" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$_new" | grep -qF "versionName '$VN'"; then
+    echo "❌ build.gradle: versionName 注入失败（期望 '$VN'）" >&2
+    exit 1
+  fi
   if [ "$_old" = "$_new" ]; then
     echo "      build.gradle: 已是最新，未改动"
   else
-    printf '%s\n' "$_new" > "$HERE/app/build.gradle"
+    printf '%s\n' "$_new" > "$GB"
     echo "      build.gradle: 已同步"
   fi
 fi
@@ -137,6 +157,12 @@ sync_file "$APP/js/version.js" "/* 由 android/build-apk.sh 从项目根 version
 if [ -f "$APP/sw.js" ]; then
   _old="$(cat "$APP/sw.js")"
   _new="$(printf '%s\n' "$_old" | sed "s|^const CACHE = .*|const CACHE = 'ripple-$VC';|")"
+  # U-06：同样要有替换后断言 —— SW 缓存名不跟着变会导致旧壳永久留存
+  if ! printf '%s\n' "$_new" | grep -qF "const CACHE = 'ripple-$VC';"; then
+    echo "❌ sw.js: CACHE 名注入失败（期望 ripple-$VC），sed 表达式可能已失配" >&2
+    echo "   文件格式变了？请检查 android/sync-version.sh。" >&2
+    exit 1
+  fi
   if [ "$_old" = "$_new" ]; then
     echo "      sw.js: 已是最新，未改动"
   else
@@ -145,4 +171,60 @@ if [ -f "$APP/sw.js" ]; then
   fi
 fi
 
+
+# ---------- 桌面端（Tauri / Rust）----------
+#
+# 审查 D-02：1.3.0 引入桌面端后，版本号多出**两个**副本 ——
+# tauri.conf.json 的 version（desktop/build-frontend.sh 会写，没问题）
+# 和 Cargo.toml 的 [package] version（**没有任何脚本写它**，停在 1.2.3）。
+#
+# Cargo.toml 的 version 会进二进制元数据（CARGO_PKG_VERSION）。当前 Rust
+# 源码没读它，所以用户可见版本暂时是对的；但这是潜伏漂移 —— 哪天有人按
+# cargo 惯例加 env!("CARGO_PKG_VERSION")，桌面窗口就会显示旧版本。
+#
+# 注意 Cargo.toml 里 [dependencies] 也有大量 version =，必须限定到
+# [package] 段。`0,/re/s//x/` 只替换第一处匹配，而 [package] 段永远在文件
+# 最前面，所以第一处 `version = "x.y.z"` 恰好就是 [package] 的那行。
+if [ -f "$ROOT/desktop/src-tauri/Cargo.toml" ]; then
+  CT="$ROOT/desktop/src-tauri/Cargo.toml"
+  _old="$(cat "$CT")"
+  _new="$(printf '%s\n' "$_old" | sed "0,/^version = \"[0-9.]*\"/s//version = \"$VN\"/")"
+  if [ "$_old" = "$_new" ]; then
+    echo "      Cargo.toml: 已是最新，未改动"
+  else
+    printf '%s\n' "$_new" > "$CT"
+    echo "      Cargo.toml: 已同步"
+  fi
+  # 断言：[package] 段的 version 必须真的等于 $VN，否则说明格式变了、sed 没命中
+  _cv="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' "$CT" | head -1)"
+  if [ "$_cv" != "$VN" ]; then
+    echo "❌ Cargo.toml 的 [package] version 同步失败（得到 '${_cv:-空}'，期望 '$VN'）" >&2
+    echo "   文件格式变了？请检查 android/sync-version.sh 里的 sed 表达式。" >&2
+    exit 1
+  fi
+fi
+
+# Cargo.lock 里 ripple-desktop 这一段的 version 也要跟上。
+# 用 python 精确匹配 [[package]] 块，避免误改依赖项的同名 version 行。
+CARGOLOCK="$ROOT/desktop/src-tauri/Cargo.lock"
+if [ -f "$CARGOLOCK" ]; then
+  python3 -c "
+import re, sys
+path, ver = sys.argv[1], sys.argv[2]
+src = open(path, encoding='utf-8').read()
+pat = re.compile(r'(\[\[package\]\]\nname = \"ripple-desktop\"\nversion = \")[0-9.]+(\")')
+new, n = pat.subn(lambda m: m.group(1) + ver + m.group(2), src)
+if n == 0:
+    print('NO_RIPPLE_PACKAGE')
+    sys.exit(1)
+if new == src:
+    print('      Cargo.lock: 已是最新，未改动')
+else:
+    open(path, 'w', encoding='utf-8').write(new)
+    print('      Cargo.lock: 已同步')
+" "$CARGOLOCK" "$VN" || {
+    echo "❌ Cargo.lock 里找不到 ripple-desktop 的 [[package]] 块" >&2
+    exit 1
+  }
+fi
 exit 0

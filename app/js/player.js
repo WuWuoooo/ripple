@@ -366,7 +366,19 @@
       if (this._prefetchSrc === nx.src) return;
       try {
         const el = this._pickEl(nx);   // 和 load() 用同一套路由（含 B-4 的 elC）
-        if (el === this.el) return;                 // 同一个元素正在放当前的歌，别动它
+        /*
+         * 审查 P-01：同类型连续曲目会解析到**同一个**元素，那个元素正在播
+         * 当前的歌，不能拿它去预取 —— 所以这条 return 是必需的，不能删。
+         *
+         * 真实后果：一个歌单全是在线歌（绝大多数形态）时，这个开关一次都不
+         * 预取；只有「在线 ↔ 本地交替」才会因为落到不同元素而真正生效。
+         * 设置项文案已经改成诚实说法，这里补一条日志让原因可诊断 ——
+         * 否则以后有人再查「为什么无缝播放没效果」还要重读一遍代码。
+         */
+        if (el === this.el) {
+          if (g.Log) g.Log.add('PLAY', 'gapless skip: 同类型连续，复用当前元素 ' + nx.id);
+          return;
+        }
         /*
          * B-3：清空上一个预取元素之前，必须确认它不是「正在播放的那一个」。
          * 旧代码只保护了要写入的 el，没保护要被清空的 _prefetchEl：
@@ -484,6 +496,23 @@
         this._emit('track', track);
         return;
       }
+      /*
+       * 审查 P-02：复用元素的重播必须显式归零。
+       *
+       * _pickEl() 按音源类型路由到固定元素（在线歌永远走 elA），所以
+       * 「切走再切回同一首在线歌」时会落到同一个 <audio> 上。以前这里只重设
+       * src、**不重置 currentTime** —— 浏览器对「同元素同 URL」重设 src 通常
+       * 不清播放位置，于是从上次中断处继续播。
+       *
+       * 两个手工路径都能复现：① 点队列里「正在播放的那一首」不从 0 开始；
+       * ② 播在线歌到 1:30 → 切到本地歌（走 elB）→ 点回那首在线歌 → 从 1:30 继续。
+       *
+       * 注意：冷启动恢复上次进度走的是 seek() 而不是 load() 之后的隐式续播，
+       * 所以这里无条件归零是安全的；restoreLast 的路径会自己 seek 回目标位置。
+       */
+      try {
+        if (el.currentTime > 0) el.currentTime = 0;
+      } catch (e) { /* 元数据还没到就设 currentTime 在部分浏览器上会抛，忽略 */ }
       if (el.src !== resolved) {
         el.src = track.src;
       }
@@ -498,6 +527,8 @@
         this._reapplyEQ();
       }
       this._emit('track', track);
+      /* 新曲已就位，过渡窗口结束（下一首起播后 state 会正常上报） */
+      this._advancing = false;
       this._updateMediaSession();
       // 换歌后旧歌的 RMS 不再有效，清掉重新实测（第一帧测量前保持 1.0 不做假动作）
       this._rms = 0;
@@ -730,7 +761,27 @@
     next(auto = false) {
       const s = g.Store.state.settings;
       if (!this.queue.length) return;
-      if (s.repeat === 'one' && auto) { this.seek(0); this.play(); return; }
+      if (s.repeat === 'one' && auto) {
+        /*
+         * 单曲循环：播完立即从头再来。
+         *
+         * 这里以前只 seek(0) + play() 就 return —— 而「播完」会让元素的
+         * paused 变 true（部分内核补发 pause），通知栏已经被刷成「暂停」；
+         * 重启那一瞬间的 state true 又刚好赶上原生 pauseTimers 的时序，
+         * 推送可能整个丢掉，于是用户看到「后台还在放、通知栏却写着暂停」。
+         *
+         * 修法：重启之后显式补一次状态推送（并解除过渡窗口），
+         * 不赌浏览器事件的到达顺序。
+         */
+        this.seek(0);
+        const p = this.play();
+        Promise.resolve(p).then(() => {
+          this.playing = true;
+          this._emit('state', true);
+          this._advancing = false;
+        }).catch(() => { this._advancing = false; });
+        return;
+      }
       let i;
       if (s.shuffle) {
         i = Math.floor(Math.random() * this.queue.length);
@@ -756,6 +807,30 @@
     },
 
     _onEnded() {
+      /*
+       * 自动切歌的「过渡窗口」（审查：后台播完不续播 / 单曲循环状态不回传）。
+       *
+       * 一首歌自然播完时，浏览器的时序是：
+       *   ended 事件 → （元素 paused 变 true，部分内核会补一个 pause 事件）
+       *   → 我们立刻 next(true) 去播下一首（在线曲目还要异步解析地址）
+       *
+       * 问题出在中间那个 pause：它会让 state 变成 false，JS 侧
+       * reportPlaying(false) 告诉原生「已停止播放」，而原生在后台收到这个
+       * 信号会调 WebView.pauseTimers() —— 把驱动「进度推进 / 通知栏刷新 /
+       * 播完自动下一首」的定时器全停了。紧接着新曲起播虽然也能成功，
+       * 但：
+       *   · 后台场景：解析下一首要走异步原生通道 + 跨桥，timer 被暂停后
+       *     通知栏再也收不到「又变成播放中」的推送 → 通知栏永久停在暂停；
+       *   · 单曲循环：seek(0)+play() 的重启太快，state true 的推送和上面那次
+       *     pauseTimers 抢时序，同样丢；
+       *   · 更糟的情形是 pauseTimers 把 ended/解析的回调链也一起冻住，
+       *     表现就是「播完到下一首不会开始」。
+       *
+       * 所以这里给「自动切歌」开一个过渡窗口：这段时间内不把临时的
+       * 「暂停」上报出去（音频并没有真的被用户暂停），等新曲真的起播、
+       * state 变回 true 之后再解除。这样原生侧不会在切歌瞬间去暂停定时器。
+       */
+      this._advancing = true;
       this._emit('ended', this.track);
       // 心动 / 漫游模式：队列快见底时先续上，再切下一首
       this._emit('needmore', this.track);

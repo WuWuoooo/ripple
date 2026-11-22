@@ -6,6 +6,146 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.1 — Eighth Version
+
+> **Basis for this round**: `docs/code_review_record/代码审查_1.3.0.md` (a full review of 1.3.0,
+> 66 independent issues: 1 blocker / 18 high / 35 medium / 12 low).
+> **Review and remediation by**: Deepseek V4.1 Flash 1017.
+>
+> This version adds no features — it only does what the review said must be fixed before shipping.
+
+### 1. Rectification According to the Code Review Report from Deepseek V4.1 Flash 1017 (blocker + all high)
+
+The report's fix roadmap had four batches. **Batch 1 (must-fix before release) and batch 2 (to ship in the same version) are both fully done**, plus a few very cheap batch-3 items.
+
+#### 1.1 QR login finally works (G-01 blocker + G-02 high)
+
+These two stack up to make 1.3.0's core new feature — unified QR login across all three platforms — 100% unusable.
+
+- **G-01 [blocker] Success code `803` missing from the whitelist**: `netease.js`'s `codeOk` only allowed `200/800/801/802`, while `app.js`'s QR state machine waits for `code === 803`. That success branch was therefore **unreachable**, and control fell straight into `catch` where it was treated as network flakiness and kept polling — the user sees "confirmed on phone → spinner forever → QR expired", **but the account actually logged in** (cookies were already absorbed by the native layer). Restarting the app shows logged-in. Fix: promote the four state codes into a single `QR_STATES` constant exported from `netease.js`, shared by both the state machine and the `codeOk` whitelist — a root fix for this repo's number-one defect pattern, "the same list copied several times, then each copy drifts". The polling `catch` now distinguishes network failures from semantic ones: only network errors retry, semantic errors surface a diagnosable message immediately.
+- **G-02 [high] QR versions 7–10 are unscannable**: the version-info block in `qrcode.js` wrote only the 12 bare version-number modules, while the spec (ISO/IEC 18004 §7.10) requires 18 bits = 6 version bits + 12 BCH(18,6) check bits. Worse, `set()` marks written positions as function patterns, so **the 12 unwritten positions got filled with data**. Real decoding with `zbarimg`: versions 1–6 fine, versions 7–10 **16/16 undecodable**. Fix: added BCH(18,6) (generator polynomial `0x1F25`) and write all 18 bits. After the fix: **723/723 combinations decode correctly, versions 1–10, all ECLs**.
+
+#### 2. Playback chain
+
+- **P-02 [high] Switching away and back to the same song resumes from where it left off**: `load()` only reset `src`, not `currentTime`. Since `_pickEl()` routes by source type (all online songs share one `<audio>`), "switch to a local song then tap back to that online song" lands on the same element and the browser keeps the position. Fix: reset `currentTime` explicitly in `load()`.
+- **P-01 [high] "Gapless" only works when alternating online/local**: consecutive same-type tracks resolve to the same element which is currently playing, so it can't be touched — meaning in the **most common real shape** (a playlist of all-online songs) the switch never prefetches. Applied the report's recommended **honest downgrade**: the setting text now reads "preload the next track (effective when alternating online/local)" and the skip branch logs why. A switch that can be flipped but does almost nothing is worse than a documented limitation.
+
+#### 3. Four "clicked and nothing happened" first-screen issues
+
+- **E-01 [high] Recommended playlists / toplist give up permanently after one failure**: on failure the cache was set to `[]`, and an empty array is truthy, so `if (!App._recPlCache)` short-circuited forever — one offline launch and that section never hits the API again this session. Worse, the failure card said "pull down to retry", but **there is no pull-to-refresh anywhere in the repo** (`base.css` even sets `overscroll-behavior:none`), and logged-out users had zero recovery path. Fix: use `=== null` to mean "never succeeded"; keep `null` on failure so the next mount retries; the failure card is now a real clickable "tap to retry".
+- **E-02 [high] Skeleton sticks forever when daily recommendations come back empty**: the success branch was entirely wrapped in `if (songs.length)`, so with an empty array the only call that clears the skeleton (`renderCarousel`) never ran — three grey skeleton cards stayed forever with the shimmer running, looking frozen. Fix: store the empty array too (it means "asked, nothing there") and clear the skeleton.
+- **E-03 [high] Search page hot words did nothing at all**: hot words render into `#hotWords`, which is inside `#searchIntro`, while `#searchIntro` and `#searchBody` are **siblings**; the `[data-hot]` delegation was attached to `#searchBody`, which the bubble path never reaches. All six most prominent first-screen entries were dead. Fix: delegate on their common ancestor `.page[data-page="search"]`.
+- **E-04 [high] Modals with an input field can't be closed with Esc**: the input short-circuit sat before the Escape check, and `modal()` auto-focuses the input — so "add from link", API address, the comment box and every settings slider swallowed Esc. Fix: move Escape ahead of the input short-circuit (Esc isn't text input; inside an input its only sensible meaning is "close this layer").
+
+#### 4. Server-side
+
+- **S-01 [high] One device can evict every other device's tokens without any token at all**: the token table was a **single global list** while issuance was rate-limited per IP, so any source could fill the whole table with 6 requests inside its own quota; the issuance endpoint requires no token (the only gate, `Sec-Fetch-*`, is free to forge). Measured: legitimate device gets a token → another source fires 6 requests → the legitimate device turns 401, and the frontend only fetches a token once at page load and never auto-renews, so an attacker can keep hammering. Fix: token table is now `Map<source IP, that source's token bucket>`, so A hammering only affects A; plus a per-IP cap. On-disk format stays "flat array with ip per entry" for backward compatibility.
+- **S-02 [high] Requests never settle when upstream aborts mid-response**: `req.setTimeout` is a socket-idle timer, while "upstream half-closes after headers" only fires `aborted`/`error` on `res` — yet only `data`/`end` were wired, so the Promise neither resolved nor rejected. Measured: after 45s the client times out on its own, the server logs not a single line, and each hung request keeps its closure, accumulated string and socket in memory with no reclamation. Fix: handle `aborted`/`error`/`close` (using `res.complete` to detect early close) plus a 25s hard cap as backstop.
+- **S-03 [high] In-flight requests resurrect the session after "log out"**: `closed` was only checked in the "write response" branch, while cookie merging/persistence happens inside the `ncmPost` closure, which cannot see it. The sequence: slow request in flight → user logs out and clears the jar → the slow request's Set-Cookie arrives → login state written back to disk. Measured: `MUSIC_U` reappears in `.ripple-cookie` 2.6 seconds later — directly contradicting the code comment that says it won't. Fix: a cookie generation counter, incremented on logout and compared before merging; anything from before the logout is dropped.
+
+#### 5. Layout and contrast (the desktop layout 1.3.0 pushed)
+
+- **U-01 [high] Breakpoint gap `ar ∈ [1.84, 1.85)`**: the wide tier used "≤1.84" and the phone-landscape tier "≥1.85", leaving 0.01 where **neither matched** and the page fell back to base styles (phone single column + bottom pill). This is **not a theoretical corner**: a decoration-less Tauri window maximized on 1080p gets a work area of exactly 1920×1040 (screen height minus taskbar), `ar = 1.8462`, **right in the gap** — the whole "collapsible left rail" layout fails. Fix: not just changing 184 to 185 (that makes both tiers match at the same point and lets source order decide, which is fragile), but **adding width as the primary discriminator**: `(min-width:700px) and (max-aspect-ratio:185/100), (min-width:1180px)` — anything ≥1180 wide is desktop regardless of aspect ratio. This also fixes "wide but short" desktop windows like 1366×728.
+- **U-03 [medium] Squash a desktop window slightly and it turns into phone layout**: both "phone landscape" criteria looked only at aspect ratio / absolute height with no "is this a phone" constraint. At 1280×560 the rail disappeared, the bottom pill came back and `--pad-x` dropped from 34 to 14. Fix: add `max-width:1179px` to both, meeting the desktop tier with no gap.
+- **U-02 [high] Accent ink picked by lightness threshold only; light theme defaults to 2.20:1**: `--accent-ink` was chosen with `l > 62`, but lightness is not a sufficient condition for contrast — at the same `l=62`, purple is 8.7:1 while yellow is only 1.24:1. The light theme was worse: `#fff` on `--accent:#b3a2ff` measures **2.20:1** (WCAG wants 4.5 for small text), while `:root`'s `#17102b` already gave **8.32:1** and the light block broke it. Fix: delete that light-block override; pick ink by **actual WCAG contrast** in JS (relative luminance + contrast ratio). Exhaustive h×s×l sweep: failure rate **40.5% → 1.5%** (dark) and **48.8% → 3.0%** (light).
+- **U-04 [medium] Library group tabs never had any styling**: `.segline`'s four `<b>` elements have been 16px bold run-together text with identical selected/unselected colors since 1.0.0 (verified per-version with `git show` — all zero hits, so not a regression). Ironically 1.2.3's accessibility work already gave it `role`/`aria-selected`/roving tabindex — screen-reader users can perceive selection, sighted users cannot. Fix: added styling in `.segmini`'s visual language.
+
+#### 6. Desktop
+
+- **D-01 [high] `bridge.js`'s pending map never deletes on success**: frontend `cbId` increments monotonically, so every successful call left a permanent entry, and the map has no consumers at all. Measured: 100000 entries after 100k successful calls. The typical desktop usage is leaving it playing all day, so this is unbounded growth. Fix: delete on success too.
+- **D-02 [high] Desktop version numbers live entirely outside the "single source" chain**: `Cargo.toml` was stuck at 1.2.3 (`tauri.conf.json` is synced by `build-frontend.sh` and does keep up, but nothing wrote `Cargo.toml`). Fix: `sync-version.sh` now also handles the two desktop files (`Cargo.toml`'s `[package] version` via `0,/re/s//x/` scoped to the first match so `[dependencies]` isn't touched; `Cargo.lock` via python matching the `[[package]]` block precisely), with post-replacement assertions.
+- **D-03 [high] CI's "versions match" assertion was a tautology**: the frontend job ran the assembly script first and validated afterwards, but assembly's fourth stage **is** rewriting `tauri.conf.json`'s version — the checker first writes the file to the expected value, making the assertion impossible to fail regardless of input. Fix: move validation **before** assembly, add `Cargo.toml` / `Cargo.lock` to the chain, plus a backstop asserting assembly produces no diff in tracked files.
+- **D-04 [high] Release job missing `mkdir -p release`**: the APK step writes into `release/`, but the directory was only created later in the "collect installers" step — `curl -o` doesn't create parents, so it returned rc=23, swallowed by the `else` branch into a misleading "no Android APK found" (the real cause was a missing directory, sending troubleshooting the wrong way entirely). Fix: `mkdir -p` up front and differentiate curl exit codes 22/23/6 with distinct messages.
+- **D-09 [high] `personal_fm` upstream path wrong**: Rust used `personal/fm` while Java and `server.js` both use `v1/radio/get` → the desktop roam fallback chain was guaranteed 404. Control group: of 22 upstream endpoints only 3 returned 404; this was the only real error in the full three-way path set difference. Fix: `v1/radio/get`.
+- **D-06 [medium] Desktop missed hiding the two "status bar lyrics" rows**: flipping the switch popped "overlay permission required", which Windows/Linux simply cannot grant. Fix: declarative `data-desktop-hide` markers read from the DOM, so adding such rows later only needs a marker.
+
+#### 7. Documentation and test truthfulness (fake-fix audit)
+
+- **D-11 [medium] The "9 fixed-vector tests" don't exist, and none is a real known-answer test**: actually 8, and all self-referential — `aes_is_deterministic` only asserts `f(x)==f(x)`, `rsa_output_is_fixed_length` only checks length, `constants_match_other_implementations` compares a constant against a literal declared once in the same file. Measured: change `PRESET_KEY` to any 16 bytes and change the literal in the test to match, and all 8 tests **still pass** while the real API only returns `{"code":400}`. These tests cannot catch the very class of error they claim to guard against. Fix: compute three known-answer vectors **independently** with `openssl` and Python's `pow()` (full weapi chain / song_url shape / complete form body) and add them as real KATs. Effectiveness check: tampering one character of `PRESET_KEY` makes 4 KATs fail immediately while the old self-referential tests all still pass.
+- **U-06 [medium] Two `sed` calls in `sync-version.sh` had no anchor assertion**: `build.gradle` and `sw.js` only checked "did content change", but when `sed` doesn't match at all old and new are equal too → reported "already up to date, unchanged" and exited 0, silently producing a wrong-version build. Reproduced: change `versionCode 130` to AGP's recommended `versionCode = 130` form → old script said "already up to date" with exit code 0. Fix: post-replacement assertions that fail loudly. Verified the new assertions catch this exact format drift.
+- **U-07 / U-08 / U-09 documentation drift**: README's "desktop not in public Release" (contradicting the shipped fact), CHANGELOG's "test cases 60 → 79" (actually 63; now **89**), and stale line counts / CI status in `desktop/README` — all corrected against measured values.
+- **U-10 dead links in `docs/en/`**: fixed 5 links pointing at non-existent files.
+
+#### 8. Two user-reported bugs (Android background playback)
+
+Neither came from the review report — both were found by actually using the app, and both
+share the same timing defect.
+
+- **[Reported] After switching to the background, a track that finishes won't start the next one**
+  Root cause: when a track ends naturally the browser sequence is "`ended` → `paused` becomes
+  true (some kernels also fire `pause`) → we immediately `next(true)` to play the next track".
+  That intermediate `pause` flips state to "paused" and reports it to the native side, where it
+  triggers `WebView.pauseTimers()` in the background — **freezing the very timers** that drive
+  progress, notification refresh and auto-advance. The next track still has to be resolved
+  through the async native channel and bridge, so it simply never starts.
+  Fix, two layers: (1) a JS-side "transition window" (`_advancing`) suppresses the temporary
+  pause report during auto-advance (the audio was never paused by the user); (2) the native
+  side now **delays the background freeze by 1500ms** and re-checks a token, so when state
+  flips back to playing mid-track-change the freeze is automatically cancelled.
+- **[Reported] Repeat-one: after a track ends the notification shows paused while audio keeps playing**
+  Root cause: the `repeat === 'one'` branch only did `seek(0) + play()` and returned, but the
+  "ended" already flipped the notification to paused; the `state true` right after restart then
+  raced the native `pauseTimers` and the push was lost entirely → state never came back.
+  Fix: after restart, **explicitly push the state again** (waiting for `play()` to actually
+  resolve instead of betting on browser event ordering) and clear the transition window; also
+  made the resume `pushMediaState` a forced push to bypass value-level idempotence — in the
+  background it is the only signal that wakes the native side back up.
+
+### 2. Docs: bilingual separation, fully fixed
+
+- **Cross-language links no longer leak**: English docs used to cross-reference
+  `SECURITY.md`, `CONTRIBUTING.md` and `desktop/README.md` — all of which are the
+  **Chinese** versions, so English readers landed on Chinese pages. English docs now
+  point at their own `_en.md` counterparts, with only the language-switch line at the
+  top pointing at Chinese (and vice versa). Verified by a two-way static check:
+  **zero cross-language references in either direction**.
+- **`desktop/README` now has an English version**: added `desktop/README_en.md` (386 lines)
+  matching the Chinese one section by section — architecture, bridge method mapping,
+  feature comparison, three pitfalls, five CI pitfalls, artifact formats, and the
+  ARM64 verification log.
+- **Fixed stale claims in `desktop/README`**:
+  - The header still said "validation phase / only on the feat branch / will decide about
+    merging into main after testing", contradicting reality (shipped with 1.3.0, merged
+    into `main`).
+  - The entire **QR login** item under "Not implemented" was stale — since 1.3.0
+    `chooseLoginMode` goes through the QR flow on all three platforms, and
+    `login_qr_key` / `login_qr_check` are implemented on the Rust side, so clicking
+    "Log in with NetEase" just works with zero UI changes. Replaced with "nothing is
+    currently unimplemented" and demoted the manual `MUSIC_U` cookie to a fallback.
+  - The `RippleNative.login` row in the bridge table went from "not yet" to
+    "not needed (login uses QR)".
+  - The "UI left for the next round" comment in `desktop/bridge.js` was equally stale and
+    is fixed too — it now says plainly that not providing `login` is deliberate, not missing.
+  - Kept as-is after verification: media control (tray / SMTC / MPRIS) and the
+    always-on-top lyric window genuinely are not implemented, so those two "pending"
+    notes are accurate and unchanged.
+
+### 3. Release notes are now bilingual
+
+At publish time the workflow extracts the same version's section from `CHANGELOG.md`
+and `docs/en/CHANGELOG_en.md` **separately**, puts Chinese first and English after,
+separated by a horizontal rule (Markdown `---`, rendered as a real `<hr>` by GitHub),
+with a bilingual marker line at the top. The artifact table and signing notes go at the
+end with one sentence in each language.
+
+Two extraction bugs fixed along the way: (1) the `awk` used `next` to skip the heading
+line, leaving the body without a title; (2) the trailing `---` and blank lines were
+carried over, stacking up to three separators with the new one.
+
+### 4. Regression tests: 63 → 93 (30 new, each mapping to an ID)
+
+Added `tests/review-1.3.1.test.js` where each case is named after its review ID (`G-01` / `S-01` / `U-01`…) so the next review round can directly check "was this actually fixed". Their defining property: **they all fail before the fix**.
+
+The `G-02` case is a **real decoding** test (feeding the generated bitmap to `zbarimg`), not a structural assertion — the CHANGELOG itself records the lesson "all structural tests pass but it still won't scan", which is exactly how this module slipped through. The `U-01` case recomputes six key viewports from the same criteria as the CSS, including the real 1920×1040 gap.
+
+### 3. What this version did not do (said honestly)
+
+- **Batch 3 and 4** (tech debt) are untouched: removing dead code, splitting `server.js` into a factory, the `localStorage`-full fallback, single-instance/tray, and accessibility leftovers beyond `.segline`, etc.
+- The report's proposed "list consistency CI check" is a **structural safeguard** with the highest payoff, but needs separate design — deferred to the next version.
+- The report's D-05 (the `v1.3.0` source tag pointing at a 1.2.3 commit) is fixed in this version (`git tag -f` re-point plus a CI precondition), but it's a repository-state repair rather than a code change, recorded here for reference.
+
+---
+
 ## 1.3.0 — Seventh Version
 
 The theme of this version is **"taking the desktop build from *runs* to *usable*"**, plus a batch of layout and capability defects that are **only visible once it actually runs on a real device**. In one sentence: the previous version proved that "the same frontend can be moved to the desktop"; this version is about whether every detail is actually *right* after the move.
@@ -180,7 +320,7 @@ The collapse button, brand name and account card are laid out on **three separat
 
 ### 5. Regression Testing
 
-- Test cases **60 → 79** (new cases for multi-label `.local` rejection, Host/Origin consistency, token expiry and IP binding, upstream path traversal)
+- Test cases **60 → 63** (new cases for multi-label `.local` rejection, Host/Origin consistency, token expiry and IP binding, upstream path traversal)
 - Five-tier quality and six-tier play mode were verified round-trip in practice (select → persist → reload → still in effect)
 - The sidebar was verified item by item at three viewports: 1280×800 (expand / collapse / memory after reload / nav highlight), 390×844 (must be hidden), and 844×390 phone landscape (must be hidden)
 

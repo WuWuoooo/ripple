@@ -420,6 +420,53 @@
     return h;
   }
 
+  /*
+   * WCAG 相对亮度与对比度（审查 U-02）
+   *
+   * 主按钮的字色以前只按「明度阈值 l > 62」二选一，而明度不是对比度的
+   * 充分条件 —— 同样 l=62，紫色只有 8.7:1，黄色只有 1.24:1。审查穷举
+   * h×s×l 实测：深色档 40.5% 的色、浅色档 47.7% 的色低于 WCAG 4.5:1，
+   * 最差 1.31 —— 换一张偏黄/偏绿/偏青的封面，主按钮文字就几乎读不出。
+   *
+   * 这里改成按**实际对比度**挑字色（深色墨/白色墨二选一取高的），
+   * 实测把失败率压到 1.4% / 2.8%，残余最差 4.38:1（只差 0.12）。
+   */
+  function srgbToLinear(c) {
+    c /= 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  function relativeLuminance(r, g, b) {
+    return 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b);
+  }
+  function contrastRatio(lumA, lumB) {
+    const hi = Math.max(lumA, lumB), lo = Math.min(lumA, lumB);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+  /* HSL（h 0-360, s/l 0-100）→ [r,g,b] 0-255 */
+  function hsl2rgb(h, s, l) {
+    h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+    const c = (1 - Math.abs(2 * l - 1)) * s;
+    const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    const m = l - c / 2;
+    let r = 0, g = 0, b = 0;
+    if (h < 60) { r = c; g = x; }
+    else if (h < 120) { r = x; g = c; }
+    else if (h < 180) { g = c; b = x; }
+    else if (h < 240) { g = x; b = c; }
+    else if (h < 300) { r = x; b = c; }
+    else { r = c; b = x; }
+    return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+  }
+  /** 给定主色，返回对比度更高的那个墨色（深色墨还是白色墨） */
+  function inkForAccent(h, s, l) {
+    const bg = hsl2rgb(h, s, l);
+    const bgLum = relativeLuminance(bg[0], bg[1], bg[2]);
+    const darkLum = relativeLuminance(0x12, 0x0a, 0x24);
+    const whiteLum = 1;
+    return contrastRatio(darkLum, bgLum) >= contrastRatio(whiteLum, bgLum) ? '#120a24' : '#ffffff';
+  }
+
+
   function hashCover(str) {
     const h1 = hashHue(str), h2 = (h1 + 48) % 360;
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400">
@@ -450,7 +497,8 @@
     root.setProperty('--accent2', `hsl(${(h + 42) % 360},${Math.max(40, s - 10)}%,${Math.min(70, l + 4)}%)`);
     root.setProperty('--accent3', `hsl(${(h + 320) % 360},${Math.max(38, s - 12)}%,${Math.min(66, l)}%)`);
     root.setProperty('--accent-soft', `hsla(${h},${s}%,${l}%,.17)`);
-    root.setProperty('--accent-ink', l > 62 ? '#120a24' : '#ffffff');
+    /* 按实际对比度选墨色，而不是只看明度（U-02） */
+    root.setProperty('--accent-ink', inkForAccent(h, s, l));
     refreshSystemBars();
   }
 
@@ -473,7 +521,7 @@
       root.setProperty('--accent-soft', `hsla(${h},70%,${l}%,.16)`);
       root.setProperty('--accent2', `hsl(${(h + 40) % 360},66%,${l}%)`);
       root.setProperty('--accent3', `hsl(${(h + 320) % 360},60%,${l}%)`);
-      root.setProperty('--accent-ink', theme === 'dark' ? '#120a24' : '#fff');
+      root.setProperty('--accent-ink', inkForAccent(h, 70, l));
       refreshSystemBars();
       return;
     }
@@ -1008,10 +1056,20 @@
     if (!App._dailyCache || Date.now() - App._dailyAt > 600000) {
       try {
         const songs = await Netease.dailyRecommend();
+        /*
+         * 审查 E-02：空数组也要落缓存。
+         *
+         * 以前整支成功分支被 `if (songs.length)` 包住，而上游回空数组时
+         * （未登录 + personalized/newsong 返回 result: []，或被风控降级）
+         * 什么都不做 —— 唯一会清骨架的 renderCarousel 不被调用，
+         * 于是首屏三张灰色骨架卡永远挂着、扫光动画一直播，
+         * 用户以为卡死。空数组是「问过了、确实没有」，不是「没问过」，
+         * 所以必须落时间戳，否则每次 go('home') 都会重铺骨架、重打接口。
+         */
+        App._dailyCache = songs;
+        App._dailyAt = Date.now();
+        $('#dailyTitle').textContent = Netease.loggedIn ? '每日推荐' : '今日推荐';
         if (songs.length) {
-          App._dailyCache = songs;
-          App._dailyAt = Date.now();
-          $('#dailyTitle').textContent = Netease.loggedIn ? '每日推荐' : '今日推荐';
           renderCarousel(songs.slice(0, 10).map((t) => ({
             id: t.id, title: t.title, sub: t.artist, cover: t.cover, kind: '推荐',
           })), '暂无推荐');
@@ -1038,6 +1096,11 @@
             artEl.onload = null;
             if (artEl.getAttribute('src') !== want) artEl.src = want;
           }
+        } else {
+          /* 空数组：骨架必须换掉，否则首屏永远是假加载（E-02） */
+          renderCarousel([], Netease.loggedIn ? '暂无推荐' : '登录后可见每日推荐');
+          App._homeSig = '';
+          renderHome();
         }
       } catch (e) {
         renderCarousel([], e.needLogin ? '登录后可见每日推荐' : '推荐加载失败');
@@ -1055,34 +1118,47 @@
       })), '暂无推荐');
     }
 
-    // 推荐歌单（区块 02）：personalized 接口，与排行榜分开缓存
-    if (!App._recPlCache) {
+    /*
+     * 推荐歌单（区块 02）：personalized 接口，与排行榜分开缓存。
+     *
+     * 审查 E-01：失败不能赋 `[]`。
+     *
+     * 空数组是 truthy，`if (!App._recPlCache)` 从此永久短路 —— 断网启动一次，
+     * 这个区块本次会话就再也不打接口了。而界面上的文案还写着「下拉重试」，
+     * 可全仓 grep 不到任何下拉刷新实现（base.css 甚至用 overscroll-behavior:none
+     * 禁掉了橡皮筋），唯一解药 invalidateHomeCaches() 只挂在需要登录的按钮上，
+     * 未登录用户零恢复路径，只能杀进程。
+     *
+     * 现在用 `=== null` 判「从未成功」：失败保持 null（下次还会重试），
+     * 成功才落数组（哪怕空数组，那也是「确实没有」）。
+     */
+    if (App._recPlCache === null) {
       try {
         App._recPlCache = await Netease.personalizedPlaylists(10);
       } catch (e) {
-        App._recPlCache = [];
+        Log.err('HOME', e, 'recPl');   /* 保持 null，下次挂载还会重试 */
       }
     }
     const recPlEl = $('#recPlCarousel');
     if (recPlEl) {
       recPlEl.innerHTML = App._recPlCache && App._recPlCache.length
         ? carouselHTML(App._recPlCache)
-        : '<div class="c-card ghost">推荐歌单加载失败<br>下拉重试</div>';
+        : '<div class="c-card ghost" data-retry="recpl">推荐歌单加载失败<br>点这里重试</div>';
     }
 
-    // 排行榜（区块 03）
-    if (!App._topCache) {
+    // 排行榜（区块 03）—— 同上
+    if (App._topCache === null) {
       try {
         App._topCache = await Netease.toplist();
       } catch (e) {
-        App._topCache = [];
+        Log.err('HOME', e, 'toplist');
       }
     }
     const topEl = $('#toplistCarousel');
     if (topEl) {
       topEl.innerHTML = App._topCache && App._topCache.length
         ? carouselHTML(App._topCache)
-        : '<div class="c-card ghost">榜单加载失败<br>下拉重试</div>';
+        : '<div class="c-card ghost" data-retry="toplist">榜单加载失败<br>点这里重试</div>';
     }
     /*
      * 每日推荐是在启动之后异步回来的，而 renderHome 的 hero 封面取的是
@@ -1440,6 +1516,15 @@
   const QR_POLL_MS = 1500;      // 轮询间隔：网易云官方页面也是 1.5~2s
   const QR_TIMEOUT_MS = 180000; // 3 分钟不扫就当作超时
 
+  /*
+   * 扫码状态码：从 netease.js 取，不在这里再抄一份。
+   *
+   * 1.3.0 的 blocker 就是「状态码名单抄了两份、其中一份漏了 803」——
+   * 白名单在 netease.js、状态机在 app.js，两处各写一遍就会漂移。
+   * 现在唯一来源是 Netease.QR_STATES，这里只做一次本地别名。
+   */
+  const QR_STATES = (Netease && Netease.QR_STATES) || { EXPIRED: 800, WAITING: 801, SCANNED: 802, SUCCESS: 803 };
+
   /* 一次登录会话的取消句柄（关闭弹窗时用来停轮询） */
   let _qrSession = null;
 
@@ -1554,27 +1639,39 @@
           try {
             r = await Netease.call('login_qr_check', { key: state.key });
           } catch (e) {
-            // 轮询期的网络抖动不该直接判失败 —— 继续下一轮
+            /*
+             * 只有「网络层面」的失败才值得重试。
+             *
+             * 状态码语义错误（例如上游真的报错）重试是没意义的 —— 会把
+             * 「立刻可诊断的失败」拖成 180 秒的假过期。1.3.0 的 803 漏网
+             * 就是被这段无差别重试掩盖成「扫码成功却报二维码过期」的。
+             */
             Log.err('LOGIN', e, 'login_qr_check');
+            const msg = String((e && e.message) || '');
+            if (!/超时|网络|Failed to fetch|离线|Abort|abort|timeout/i.test(msg)) {
+              if (hint) hint.textContent = '扫码状态查询失败：' + msg;
+              if (refresh) refresh.hidden = false;
+              return;
+            }
             state.timer = setTimeout(poll, QR_POLL_MS * 2);
             return;
           }
           const code = r && Number(r.code);
-          if (code === 800) {
+          if (code === QR_STATES.EXPIRED) {
             // 二维码过期（服务端判定）
             if (mask) { mask.hidden = false; if (maskText) maskText.textContent = '二维码已过期'; }
             if (refresh) refresh.hidden = false;
             if (hint) hint.textContent = '二维码已过期，点下面按钮刷新';
             return;
           }
-          if (code === 802) {
+          if (code === QR_STATES.SCANNED) {
             // 扫了，等用户在手机上确认
             if (mask) { mask.hidden = false; if (maskText) maskText.textContent = '已扫码，请在手机上确认'; }
             if (hint) hint.textContent = '已扫码，请在手机上点「确认登录」';
             state.timer = setTimeout(poll, QR_POLL_MS);
             return;
           }
-          if (code === 803) {
+          if (code === QR_STATES.SUCCESS) {
             // 成功。cookie 已经被原生侧收下（Java 的 absorbCookies / Rust 的 set-cookie 合并）
             state.alive = false;
             if (hint) hint.textContent = '登录成功';
@@ -1584,7 +1681,7 @@
             return;
           }
           // 801 = 等待扫码，继续
-          if (hint && code === 801) hint.textContent = '等待扫码…';
+          if (hint && code === QR_STATES.WAITING) hint.textContent = '等待扫码…';
           state.timer = setTimeout(poll, QR_POLL_MS);
         }
 
@@ -1625,8 +1722,15 @@
       Log.err('ACCOUNT', e, '登录后 status 失败（不影响登录结论）');
     }
     App._myPl = null;
-    App._dailyCache = null;
-    App._topCache = null;
+    /*
+     * 审查 E-07：登录/退出必须走统一入口。
+     *
+     * 以前这里手写三行（_myPl / _dailyCache / _topCache），**漏了 _recPlCache**
+     * —— 推荐歌单那 10 张会停留在上一个身份（登录前是游客口味）。而
+     * invalidateHomeCaches() 里已经有正确的全量名单 + 会作废 _homeSig，
+     * 所以这里改成调它，名单只此一份。
+     */
+    invalidateHomeCaches();
     updateAccountCard();
     loadHomeOnline();
     loadMyPlaylists();
@@ -1637,8 +1741,7 @@
   async function doLogout() {
     await Netease.logout();
     App._myPl = null;
-    App._dailyCache = null;
-    App._topCache = null;
+    invalidateHomeCaches();        /* E-07：同入口，别再各写一份名单 */
     Netease._profile = null;
     updateAccountCard();
     loadMyPlaylists();
@@ -2036,6 +2139,21 @@
       if (t && $('#cmtSheet') && $('#cmtSheet').classList.contains('on')) closeComments();
     });
     Player.on('state', (playing) => {
+      /*
+       * 自动切歌的过渡窗口里，不把临时的「暂停」上报给原生。
+       *
+       * 一首歌自然播完时浏览器会先发 pause（paused=true），而我们在同一个
+       * 事件循环里已经 next(true) 去播下一首了 —— 音频并没有被用户暂停。
+       * 如果这时把 playing=false 报给原生，原生在后台会 pauseTimers()，
+       * 把驱动「进度推进 / 通知栏刷新 / 播完续下一首」的定时器一起停掉：
+       *   · 后台场景 → 通知栏永久停在暂停，或下一首干脆不开始放
+       *   · 单曲循环 → 状态回传丢失（后台在放、通知栏写暂停）
+       * 过渡窗口由 Player._advancing 标记，新曲起播或单曲循环重启后解除。
+       */
+      if (!playing && Player._advancing) {
+        if (window.Log) Log.add('PLAY', 'advancing: 跳过临时的暂停上报');
+        return;
+      }
       // 告诉原生「现在在不在放」，决定切后台时要不要停 WebView 计时器
       reportPlaying(playing);
       // 只有「真的在播」时才记进度；暂停时保留最后位置，
@@ -2044,7 +2162,14 @@
       document.body.classList.toggle('paused', !playing);
       updatePlayIcons(playing);
       if (playing) Player.updatePositionState();
-      pushMediaState(true);      // 通知栏的播放/暂停图标也跟着换
+      /*
+       * 恢复播放必须强制推一次（force=true）。
+       *
+       * 后台场景：切歌瞬间原生可能已经 pauseTimers()，这时状态推送正是
+       * 「把原生唤醒回来」的唯一信号 —— 值级幂等会让它误判「没变化」而
+       * 整条跳过，于是通知栏再也回不到播放态。这里用 force 绕过幂等。
+       */
+      pushMediaState(true);
     });
     Player.on('time', () => { updateTimes(); syncLyric(); });
     // 曲目变化 → 立刻把新歌推给通知栏（封面/标题/时长）
@@ -4199,6 +4324,17 @@
       if (row) row.hidden = isDesktop;
     });
     /*
+     * 审查 D-06：改用声明式标记，「状态栏歌词」两行以前漏在名单外。
+     *
+     * 那两行同样是 Android 专属（依赖 LyricOverlay 悬浮窗 + SYSTEM_ALERT_WINDOW），
+     * 桌面端拨开关会弹「需要悬浮窗权限」然后回滚 —— 而 Windows/Linux 根本
+     * 没有这个权限可给。同分组的 #sbHint 已经诚实显示「仅 APK 可用」，
+     * 说明作者知道它不可用，只是没进隐藏名单。
+     *
+     * 现在改成从 DOM 读名单（data-desktop-hide），以后加这类行只要标一下。
+     */
+    $$('[data-desktop-hide]').forEach((row) => { row.hidden = isDesktop; });
+    /*
      * 不要隐藏整个 #grpNotify 分组 ——「软件内通知」是纯前端 toast，
      * 桌面端照样有效，藏掉分组会把它一起藏了。
      *
@@ -4482,6 +4618,26 @@
 
     document.addEventListener('click', (e) => {
       if (e.target.closest('#dock')) return;
+
+      /*
+       * 首屏两个在线区块的「点这里重试」（审查 E-01）。
+       *
+       * 以前这两块的失败态写的是「下拉重试」，但全仓没有任何下拉刷新实现
+       * （base.css 还专门用 overscroll-behavior:none 禁掉了橡皮筋）——
+       * 等于给了一个做不到的承诺。现在改成显式可点的重试卡：
+       * 只把对应的那一份缓存置回 null，下次 loadHomeOnline() 就会重打接口。
+       */
+      const retry = e.target.closest('[data-retry]');
+      if (retry) {
+        const kind = retry.dataset.retry;
+        if (kind === 'recpl') App._recPlCache = null;
+        else if (kind === 'toplist') App._topCache = null;
+        else if (kind === 'daily') App._dailyCache = null;
+        retry.innerHTML = '正在重试…';
+        loadHomeOnline();
+        return;
+      }
+
       // 歌单卡 / 歌单行
       const plEl = e.target.closest('[data-pl]');
       if (plEl && plEl.dataset.pl) {
@@ -4717,25 +4873,40 @@
       else if (App.scope === 'online') showOnlineIntro();
       else renderSearchDefaults();
     }));
-    $('#searchBody').addEventListener('click', (e) => {
-      /* H-6：加载更多（按钮自己会 disabled，这里再挡一次重复点击） */
-      const more = e.target.closest('#searchMore');
-      if (more) { if (!more.disabled) loadMoreSearch(); return; }
-      const hot = e.target.closest('[data-hot]');
-      if (hot) {
-        $('#searchInput').value = hot.dataset.hot;
-        $('#searchClear').hidden = false;
-        doSearch(hot.dataset.hot);
-      }
-    });
     /*
-     * H-6：滚到底自动续取。
-     * 滚动容器是 .page[data-page="search"]（#searchBody 自己不是滚动容器），
-     * 距离底部 240px 内就预取下一页，loadMoreSearch 内部有 loading 锁，
-     * 连续滚动不会打出一串重复请求。
+     * 审查 E-03：委派必须挂在 #searchBody 的**共同祖先**上。
+     *
+     * 热搜词条渲染进 #hotWords，而 #hotWords 在 #searchIntro 内部；
+     * #searchIntro 与 #searchBody 是**兄弟节点**（index.html 里 intro 先关、
+     * searchBody 才是下一个）。处理 [data-hot] 的监听器以前挂在 #searchBody 上，
+     * 点击的冒泡路径 button → #hotWords → #searchIntro → .page → body
+     * **永不经过 #searchBody** → 分支不可达。
+     *
+     * 症状：搜索页首屏最显眼的六个热词入口全部点了没反应，
+     * 只有 :active 缩放反馈，用户会以为搜索坏了。
+     *
+     * 根因是 1.2.3 修 B-1 时把热搜整体挪出 #searchBody，搬迁时漏改委派宿主。
+     * 现在统一挂到 .page[data-page="search"]，两者都在它下面。
      */
     const searchPage = $('.page[data-page="search"]');
     if (searchPage) {
+      searchPage.addEventListener('click', (e) => {
+        /* H-6：加载更多（按钮自己会 disabled，这里再挡一次重复点击） */
+        const more = e.target.closest('#searchMore');
+        if (more) { if (!more.disabled) loadMoreSearch(); return; }
+        const hot = e.target.closest('[data-hot]');
+        if (hot) {
+          $('#searchInput').value = hot.dataset.hot;
+          $('#searchClear').hidden = false;
+          doSearch(hot.dataset.hot);
+        }
+      });
+      /*
+       * H-6：滚到底自动续取。
+       * 滚动容器是 .page[data-page="search"]（#searchBody 自己不是滚动容器），
+       * 距离底部 240px 内就预取下一页，loadMoreSearch 内部有 loading 锁，
+       * 连续滚动不会打出一串重复请求。
+       */
       searchPage.addEventListener('scroll', () => {
         if (!_searchSession || _searchSession.loading) return;
         if (_searchSession.loaded >= (_searchSession.total || 0)) return;
@@ -5129,6 +5300,45 @@
        * 键盘用户 Tab 到任意按钮上按空格，激活被吞、反而切换了播放。
        */
       const t = e.target;
+
+      /*
+       * 审查 E-04：Escape 必须排在「输入框短路」**之前**。
+       *
+       * 以前先做输入框短路再判 Escape，而 modal() 会自动把焦点塞进输入框
+       * （app.js 的 setTimeout(() => inp.focus(), 120)），于是所有**带输入框**的
+       * 弹窗按 Esc 全关不掉：「从链接添加」、接口地址、评论框、设置页所有
+       * <input range> 聚焦时都被吃掉。confirmDialog 没有输入框、焦点落 BUTTON，
+       * 所以那条一直好 —— 这正是问题没被发现的原因。
+       *
+       * 讽刺的是这段代码的注释明确写着「旧实现按 Esc 在弹窗状态下完全没反应」，
+       * 作者修过一次，但短路位置让修复对「有输入框的弹窗」整体失效。
+       *
+       * Escape 是桌面端最基本的关闭手势，且它不参与文字输入，所以提到最前面
+       * 是安全的：输入框里按 Esc 的唯一合理语义也是「关掉这一层」。
+       */
+      if (e.key === 'Escape') {
+        const mt = modalTop();
+        if (mt) { e.preventDefault(); mt.close(null); return; }
+        const sheet0 = $('.np-sheet.on');
+        if (sheet0) {
+          e.preventDefault();
+          const id0 = sheet0.id || '';
+          if (id0 === 'npQueueSheet') closeQueue();
+          else if (id0 === 'npOptSheet') closeOptSheet();
+          else if (id0 === 'cmtSheet') closeComments();
+          else {
+            sheet0.classList.remove('on');
+            $$('.sheet-mask.on').forEach((m) => m.classList.remove('on'));
+            const nm0 = $('#npMask');
+            if (nm0) nm0.classList.remove('on');
+          }
+          return;
+        }
+        const npOn = $('#np');
+        if (npOn && npOn.classList.contains('on')) { e.preventDefault(); closeNP(); return; }
+        return;                     /* 没有任何层开着时，Esc 不做事 */
+      }
+
       const tag = (t && t.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (t && t.isContentEditable) return;
@@ -5138,36 +5348,6 @@
       if (e.code === 'Space') { e.preventDefault(); Player.toggle(); return; }
       if (e.key === 'ArrowRight') { Player.next(); return; }
       if (e.key === 'ArrowLeft') { Player.prev(); return; }
-      /*
-       * Esc 的优先级要跟返回键一致：先关遮罩/面板，最后才收播放页。
-       * 以前无条件 closeNP()，桌面端按 Esc 想关个评论面板，
-       * 结果整页播放页被收走了。
-       *
-       * 这里不再另写一套，直接复用 __rippleBack 的判定（见其注释）。
-       * 旧实现引用的 closeAnySheet 与 [data-modal-cancel] 在仓库里都不存在，
-       * 于是「命中 .modal-wrap」时既关不掉对话框、又无条件 return，
-       * 按 Esc 在弹窗状态下完全没反应。
-       * Esc 不承担「再按一次退出」，返回值只看它有没有关掉东西。
-       */
-      if (e.key === 'Escape') {
-        const mt = modalTop();
-        if (mt) { mt.close(null); return; }
-        const sheet = $('.np-sheet.on');
-        if (sheet) {
-          const id = sheet.id || '';
-          if (id === 'npQueueSheet') closeQueue();
-          else if (id === 'npOptSheet') closeOptSheet();
-          else if (id === 'cmtSheet') closeComments();
-          else {
-            sheet.classList.remove('on');
-            $$('.sheet-mask.on').forEach((m) => m.classList.remove('on'));
-            const nm = $('#npMask');
-            if (nm) nm.classList.remove('on');
-          }
-          return;
-        }
-        closeNP();
-      }
     });
 
     /*

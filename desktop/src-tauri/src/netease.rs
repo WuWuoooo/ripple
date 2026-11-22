@@ -489,7 +489,7 @@ impl Client {
                 )
             }
 
-            "personal_fm" => self.post("personal/fm", Value::Object(Default::default())),
+            "personal_fm" => self.post("v1/radio/get", Value::Object(Default::default())),
 
             other => Err(format!("未知命令：{other}")),
         }

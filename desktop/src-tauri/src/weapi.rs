@@ -141,6 +141,102 @@ mod tests {
         assert_eq!(csrf("os=android"), "");
     }
 
+    /*
+     * ============================================================
+     * 真正的 known-answer test（审查 D-11）
+     *
+     * 以前这里叫「9 条固定向量测试」（实际 8 条），但没有一条含**期望值常量**：
+     * aes_is_deterministic 只断言 f(x) == f(x)，rsa_output_is_fixed_length
+     * 只查长度，constants_match_other_implementations 把常量跟在同文件里
+     * 声明一次的字面量再比一遍 —— 两处一起改就绿。
+     *
+     * 实测后果：把 PRESET_KEY 改成任何 16 字节串、同时把测试里的字面量一起改，
+     * 8 条测试仍然全绿，而线上网易云只回 {"code":400}。也就是说这组测试
+     * **挡不住它自己声称要挡的那类错误**（换 crate 版本改掉填充、IV 写错、
+     * base64 带换行……）。而 weapi 错一个字节的症状恰恰是「界面完全看不出
+     * 是填充错了还是 base64 换行不同」，这种缺陷只能靠 known-answer test 抓。
+     *
+     * 下面这组期望值不是从本实现抄出来的，而是用 **openssl AES-128-CBC**
+     * 和 Python 的 pow() 独立算出来的（三端同算法）。任何一端改坏了这里的
+     * 输入口径，这条测试立刻红。
+     * ============================================================
+     */
+
+    /// KAT-1：完整 weapi 加密链（AES → AES → RSA），期望值独立算出
+    ///
+    /// 注意 RSA 的输入是**反转后**的密钥（与 Java / Node 一致），这是
+    /// 三端最容易写成「正序」的一处 —— 单看代码看不出来，只能靠向量比对。
+    #[test]
+    fn kat_full_weapi_chain() {
+        let json = r#"{"s":"周杰伦","type":1}"#;
+        let secret = "abcdefghijklmnop";
+
+        let first = aes_cbc_base64(json, PRESET_KEY);
+        assert_eq!(
+            first, "V9Vu+x+fuurEfbP2qyBZjC6rkAvHb1mkgXo5hQ6Bv20=",
+            "第一次 AES 结果不对 —— IV 或 PRESET_KEY 变了？"
+        );
+
+        let params = aes_cbc_base64(&first, secret.as_bytes());
+        assert_eq!(
+            params, "n2nXn8LzSZtTIMti/1xqFqy5fgWVpTduKbnKYofx58y9iihREQxDVYhuI1MIV3GS",
+            "第二次 AES 结果不对 —— 密钥口径或填充变了？"
+        );
+
+        let rev: String = secret.chars().rev().collect();
+        assert_eq!(rev, "ponmlkjihgfedcba", "反转口径必须是整串反转");
+        assert_eq!(
+            rsa_no_padding(rev.as_bytes()),
+            "d15a1683c992095d0c234c19966605c5c5964911268bbeda8cb8d08d834913e59d53b32358903a121b5fca784c1f5ae44951fd02524df58ecc98e52cc7cf8689b42c2e93ddf05b0592512d87f5960467e2f086c018849d76014d323500e30f13ef4cafbb0cf5a66731a3f1776c75ca35d0062dac70a3e33245afabcf47938487",
+            "RSA 结果不对 —— 模数/指数/补零/反转任一处变了"
+        );
+    }
+
+    /// KAT-2：song_url 形状的请求体（含 ASCII 与数字），验第二组独立向量
+    #[test]
+    fn kat_song_url_body() {
+        let json = r#"{"id":"123456","level":"exhigh","encodeType":"flac"}"#;
+        let secret = "0123456789abcdef";
+
+        let first = aes_cbc_base64(json, PRESET_KEY);
+        assert_eq!(
+            first,
+            "dd7TIY4OTDPG94bZoBmo9XYQGp/JLVq5Dn9gIXFyCzYWzwwgHuO3VyC+lZxb+qvt0Yy0qDI/3kgUdfjt++d24Q==",
+            "KAT-2 第一次 AES 结果不对"
+        );
+
+        let params = aes_cbc_base64(&first, secret.as_bytes());
+        assert_eq!(
+            params,
+            "zXCJsLE4q6R+ixAGfArdoou+uJK5G3Fte8jNm4Lh9YfTDmibm/gP9JP3SGuUPcrUOYw9ULf0thb62vuusb0o3RP/8bfL/apAdCRZliq26q/5+h5er7dnOID4CqoJJ+ST",
+            "KAT-2 第二次 AES 结果不对"
+        );
+
+        let rev: String = secret.chars().rev().collect();
+        assert_eq!(
+            rsa_no_padding(rev.as_bytes()),
+            "35701388baf89fed412e11269b9c76625d095ecaf17f03fa018abe19ea2d38b949debf242ee39a71ca1f6cda71b1b86a45aa909ee27f7e78e267d34e732f0de948206c3340a788d0003372183e2f753c1f78b66ac23d134ac1fc9b993156520ea826b8aa89a962d4491b4b8d7e08738e1da9b07aa39bf4a7ef0b1c210728cd52",
+            "KAT-2 RSA 结果不对"
+        );
+    }
+
+    /// KAT-3：form_with_key 的完整产物（含 urlencode 口径）
+    ///
+    /// params 里的 + / = 必须被转义、encSecKey 里不能有未转义的 =。
+    #[test]
+    fn kat_form_body_full_string() {
+        let f = form_with_key(r#"{"s":"周杰伦","type":1}"#, "abcdefghijklmnop");
+        assert!(
+            f.starts_with("params=n2nXn8LzSZtTIMti%2F1xqFqy5fgWVpTduKbnKYofx58y9iihREQxDVYhuI1MIV3GS"),
+            "params 的 urlencode 口径不对，实际开头：{}", &f[..80.min(f.len())]
+        );
+        assert!(
+            f.contains("&encSecKey=d15a1683c992095d"),
+            "encSecKey 不对，实际：{}",
+            &f[f.find("&encSecKey=").unwrap_or(0)..][..100.min(f.len())]
+        );
+    }
+
     /// AES 的固定向量：同样输入必须永远得到同样输出
     #[test]
     fn aes_is_deterministic() {

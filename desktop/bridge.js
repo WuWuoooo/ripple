@@ -46,7 +46,18 @@
       pending.set(id, true);
       invoke('netease', { cmd: String(cmd), params: String(paramsJson || '{}'), cbId: id })
         .then(function () {
-          // Rust 侧已经负责在完成后调 __rippleNativeResult，这里什么都不用做
+          /*
+           * 成功路径也必须从在飞表里删掉。
+           *
+           * Rust 侧确实会自己调 __rippleNativeResult 把结果送回前端，
+           * 所以这一行以前被当成「什么都不用做」。但 pending 表的作用是
+           * 「记录还没回结果的调用」，成功之后它就不再是在飞状态了 ——
+           * 不删的话这张 Map 只增不减（前端的 cbId 是严格递增的），
+           * 桌面端长开一天按 1 次/秒就能堆到 8 万多条，且没有任何消费方。
+           *
+           * 审查 D-01 实测：10 万次成功调用后 pending.size = 100000。
+           */
+          pending.delete(id);
         })
         .catch(function (e) {
           // 通道本身出错（命令名拼错、Rust panic）：也要回一条，否则前端只能干等超时
@@ -70,20 +81,20 @@
     /*
      * 登录：桌面端用**扫码登录**，纯 HTTP 实现，不需要内嵌 webview。
      *
-     * 为什么不提供 `login` 而是留空：前端的登录界面判断 `Netease.mode !== 'native'`
-     * 就直接拒绝（见 app.js 的 chooseLoginMode），而 mode 又取决于
-     * `RippleNative.netease` 是否存在 —— 也就是说桌面端**自动**就落进了
-     * 「浏览器模式」，前端提示「浏览器里无法内嵌登录」。
+     * 这里不提供 `login`（内嵌登录页）是**有意为之**，不是缺项：
+     * 1.3.0 起 `chooseLoginMode` 三端统一走扫码（见 app.js），
+     * 而扫码只需要 `login_qr_key` / `login_qr_check` 两条普通命令 ——
+     * 它们在 Rust 侧已实现，走的就是下面同一个 `netease` 通道。
      *
-     * 要打通它，必须在前端那 13000 行里加一个桌面专属的登录弹窗。
-     * 那是「前端零改动」这条约束的第一次破例，值得单独决策，所以本轮
-     * 先把底层命令（login_qr_key / login_qr_check）备好，UI 留到下一轮。
+     * 所以桌面端点界面上的「登录网易云」就能扫码登录，UI 一行都不用改。
+     * `login`（内嵌 webview 登录页）那条老链路只在历史上用过，现在三端都不走它，
+     * 桌面端保持不提供即可 —— 前端所有原生调用点都有 `typeof === 'function'` 判空，
+     * 不给就自动降级，不会报错。
      *
-     * 换句话说：现在桌面端可以用「把 MUSIC_U 写进配置目录」的方式登录
-     * （见 README），扫码界面是待补的一项。
+     * 备用：扫码不可用时可以把 MUSIC_U 写进配置目录的 netease-cookie（见 README）。
      */
 
-    /** 前端判断登录能力时会看这个；恒 false 让它走「浏览器模式」的降级提示 */
+    /** 内嵌登录页：三端都不再走这条链路（扫码才是主路径），保持不提供 */
     login: undefined,
     loginClose: function () {},
 

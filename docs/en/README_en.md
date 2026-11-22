@@ -11,7 +11,7 @@
 
 **Platforms:** Android (APK) · browser / PWA (`node server.js`) · desktop (Windows / Linux, Tauri 2)
 
-> The desktop client reuses **the same `app/` frontend with not a single line of logic changed**; a bridge layer reproduces Android's `@JavascriptInterface` verbatim. See [desktop/README.md](../../desktop/README.md).
+> The desktop client reuses **the same `app/` frontend with not a single line of logic changed**; a bridge layer reproduces Android's `@JavascriptInterface` verbatim. See [desktop/README_en.md](../../desktop/README_en.md).
 >
 > All three platforms ship in the same Release. macOS is not built — it needs the Apple SDK and signing
 > certificates, which this machine can neither produce nor verify; better to be explicit than to ship a package nobody tested.
@@ -104,7 +104,7 @@ x86 / x86_64 / arm64 all use the same package — ABI only matters for apps ship
 - Minimum Android 7.0 (API 24)
 - Ready to use after installation; **no need to start a separate service or configure an API address**
 
-> **The installation source is important**: This app uses a public **debug signature** (the debug keystore is public with the repository; the password is the industry-standard `android`, and anyone can use it to sign an APK with the same package name). Therefore, please **install only from this repository's Releases**, and do not install APKs with the same package name from other sources — otherwise you are giving others the permission to overwrite and upgrade your Ripple. See [SECURITY.md](SECURITY.md) for details.
+> **The installation source is important**: This app uses a public **debug signature** (the debug keystore is public with the repository; the password is the industry-standard `android`, and anyone can use it to sign an APK with the same package name). Therefore, please **install only from this repository's Releases**, and do not install APKs with the same package name from other sources — otherwise you are giving others the permission to overwrite and upgrade your Ripple. See [SECURITY.md](SECURITY_en.md) for details.
 
 ### Desktop (Windows / Linux)
 
@@ -119,7 +119,7 @@ Download the format you need from [Releases](../../releases) (same Release as th
 | Windows | `.zip` | Portable, unpack and run |
 
 The packages are unsigned, so the first run is blocked by the OS (Windows SmartScreen; no effect on Linux).
-See [desktop/README.md](../../desktop/README.md) for the workaround.
+See [desktop/README_en.md](../../desktop/README_en.md) for the workaround.
 
 ### Run the Web Version / PWA
 
@@ -141,10 +141,10 @@ bash android/build-apk.sh
 ```
 
 Output: `android/build-manual/Ripple-<version>-debug.apk`.
-For detailed environment requirements and pitfalls on ARM machines, see [CONTRIBUTING.md](CONTRIBUTING.md#2-打包-apk).
+For detailed environment requirements and pitfalls on ARM machines, see [CONTRIBUTING.md](CONTRIBUTING_en.md#2-building-the-apk).
 
 The build process does not depend on Gradle (`build-apk.sh` only uses `aapt2 / javac / d8`; see
-[android/build-apk.sh](android/build-apk.sh)); the repository keeps optional Gradle configuration
+[android/build-apk.sh](../../android/build-apk.sh)); the repository keeps optional Gradle configuration
 (`android/build.gradle`, `android/settings.gradle`, `android/gradle.properties`,
 `android/app/build.gradle`), but it is **not** the official build entry point. It is only used for IDE completion and as a starting point for those who want to use Gradle.
 
@@ -189,28 +189,28 @@ tests/                  ← Node built-in tests (bash tests/run.sh), currently c
 > On startup, the service reads back the file mode for verification and prints a conspicuous warning if it does not match (so you will see this warning; it is accurate).
 > If other apps on this machine can read your internal storage, move the project to an app-private directory before running it.
 
-For security-related matters, please read [SECURITY.md](SECURITY.md).
+For security-related matters, please read [SECURITY.md](SECURITY_en.md).
 
 ## Contributing
 
-Issues and PRs are welcome. Before you start, please read [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and PRs are welcome. Before you start, please read [CONTRIBUTING.md](CONTRIBUTING_en.md).
 **Android / web** deliberately introduce no Kotlin / AndroidX / npm dependencies / frontend build chain —
 that is the prerequisite for keeping it runnable with just `node server.js`.
 
 **The desktop client** (`desktop/`, in validation) breaks that rule: it needs cargo and a Rust dependency tree.
 That is the unavoidable cost of native desktop capabilities, so it is isolated in its own directory with its own CI,
-**leaving the zero-dependency builds of the other two platforms untouched**. The trade-off is documented in [desktop/README.md](../../desktop/README.md).
+**leaving the zero-dependency builds of the other two platforms untouched**. The trade-off is documented in [desktop/README_en.md](../../desktop/README_en.md).
 
 Run tests: `bash tests/run.sh` (Node built-in test runner, no `npm install` required).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../../LICENSE)
 
 ## Contributors
 
 **Coding:** Deepseek V4.1 Flash 1017  
-**Main review:** MiniMax M3.1 Flash, Hy4 Flash, GLM-5.3 Flash
+**Main review:** MiniMax M3.1 Flash, Hy4 Flash, GLM-5.3 Flash, Deepseek V4.1 Flash 1017
 
 ---
 

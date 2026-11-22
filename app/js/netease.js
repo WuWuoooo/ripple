@@ -8,6 +8,17 @@
    ============================================================ */
 (function (g) {
   const LEVELS = ['standard', 'higher', 'exhigh', 'lossless', 'hires'];
+  /*
+   * 扫码登录的四个状态码 —— 「状态码名单」的唯一来源。
+   *
+   * 800 过期 / 801 待扫码 / 802 待确认 / 803 授权成功
+   *
+   * 这张表同时被 _callOnce 的白名单和 app.js 的扫码状态机消费（走
+   * `Netease.QR_STATES` 导出）。历史上 1.3.0 把 803 漏在白名单外，
+   * 导致成功分支永不可达，所以这里刻意做成单一常量而不是各写一遍。
+   */
+  const QR_STATES = { EXPIRED: 800, WAITING: 801, SCANNED: 802, SUCCESS: 803 };
+  const QR_STATE_CODES = [QR_STATES.EXPIRED, QR_STATES.WAITING, QR_STATES.SCANNED, QR_STATES.SUCCESS];
   const _pending = new Map();
   /* 审查 3.1：在飞请求去重表（key = 命令+参数签名，value = Promise） */
   const _inflight = new Map();
@@ -252,8 +263,17 @@
         throw new Error('接口响应格式异常（' + cmd + '）');
       }
       const codeNum = json.code == null ? NaN : Number(json.code);
-      /* 200 = 正常；800/801/802 是扫码登录的过程态（过期/待扫/待确认），都不是错误 */
-      const codeOk = codeNum === 200 || codeNum === 800 || codeNum === 801 || codeNum === 802;
+      /*
+       * 200 = 正常；800/801/802/803 是扫码登录的状态码，都不是错误。
+       *
+       * 800 二维码过期 / 801 待扫码 / 802 待确认 / 803 授权成功
+       *
+       * 803 必须在这里 —— app.js 的扫码状态机等 `code === 803` 才进成功分支，
+       * 漏了它这个分支永不可达，控制流直接落进 catch 被当成网络抖动重试，
+       * 表现是「手机上点了确认、界面一直转圈、最后报二维码过期」（登录其实已成功）。
+       * 用命名常量而不是散落的字面量，是为了让「状态码名单」只有一份。
+       */
+      const codeOk = codeNum === 200 || QR_STATE_CODES.indexOf(codeNum) >= 0;
       if (!codeOk) {
         const msg = json.message || json.msg
           || (Number.isFinite(codeNum) ? '错误码 ' + codeNum : '接口未返回 code（' + cmd + '）');
@@ -662,4 +682,7 @@
   };
 
   g.Netease = Netease;
+  /* 扫码状态码：export 给 app.js 的扫码状态机，保证两边用同一份名单 */
+  Netease.QR_STATES = QR_STATES;
+  Netease.QR_STATE_CODES = QR_STATE_CODES;
 })(window);

@@ -1529,6 +1529,21 @@ public class MainActivity extends Activity {
 
     /** 网页是否正在播放音频（由 JS 通过 setPlaying 上报） */
     private volatile boolean webPlaying = false;
+    /**
+     * 后台冻结计时器的「票号」（见 setWebPlaying 的说明）。
+     * 每次状态变化自增；延迟冻结执行时票号对不上就说明期间状态又变了，直接放弃。
+     */
+    private int pauseToken = 0;
+    /**
+     * 后台暂停后多久才真正冻结 WebView 计时器（毫秒）。
+     *
+     * 存在的理由：一首歌自然播完时浏览器会先发 pause，而我们同一个事件循环里
+     * 已经在播下一首了。立刻冻结会把「进度推进 / 通知栏刷新 / 播完续下一首」
+     * 的定时器冻死，表现为「后台播完到下一首不开始」。
+     * 1500ms 足够覆盖「解析下一首地址 + 起播」这条链路，又不会让假暂停
+     * 一直骗着系统不省电。
+     */
+    private static final long ADVANCE_GRACE_MS = 1500;
     /** Activity 是否在前台（onResume / onPause 维护，供 J-09 判断要不要补 pauseTimers） */
     private volatile boolean isForeground = false;
 
@@ -1553,17 +1568,55 @@ public class MainActivity extends Activity {
          * 表现为「回到播放态但进度条不动、一首放完就没声」。
          * 所以恢复播放时，只要还没回前台就补一次 resumeTimers()。
          */
+        /*
+         * 后台「暂停」时延迟一小会儿再冻结计时器。
+         *
+         * 一首歌自然播完时浏览器的时序是「ended → paused=true（可能补发
+         * pause）→ 我们立刻去播下一首」。如果在这中间立刻 pauseTimers()，
+         * 驱动「进度推进 / 通知栏刷新 / 播完续下一首」的定时器会被冻住，
+         * 而下一首的解析往往还要走异步原生通道 + 跨桥 —— 结果就是
+         * 「后台播完到下一首不开始」。
+         *
+         * 这里给一个宽限窗口：暂停后过 ADVANCE_GRACE_MS 仍然是暂停态才真正冻结。
+         * 切歌途中（几百毫秒内）状态一定会翻回 playing，这次冻结就被取消了。
+         * 同时冻结动作本身也带条件复查，避免「定时器已到期但状态已经变了」
+         * 的竞态。
+         */
         if (!playing && !isForeground) {
+            final int token = ++pauseToken;
             runOnUiThread(() -> {
                 try {
-                    if (web != null && !webPlaying && !isForeground) web.pauseTimers();
+                    /*
+                     * 真正的冻结延迟到宽限窗口之后执行。
+                     * 自然播完→自动下一首的间隔通常只有几十到几百毫秒，
+                     * 期间状态会翻回 playing，这次冻结随之作废。
+                     */
+                    if (web == null) return;
+                    web.postDelayed(() -> {
+                        try {
+                            if (web == null || webPlaying || isForeground || token != pauseToken) return;
+                            web.pauseTimers();
+                            LogBridge.add(this, "WEB", "后台且未在播，暂停 WebView 计时器");
+                        } catch (Throwable ignored) {
+                        }
+                    }, ADVANCE_GRACE_MS);
                 } catch (Throwable ignored) {
                 }
             });
         } else if (playing && !isForeground) {
+            /*
+             * 恢复播放时无条件 resumeTimers()。
+             *
+             * 以前这里有 `&& webPlaying` 复查，看似无害，但后台「通知栏点播放」
+             * 这条路上 webPlaying 刚刚被 setWebPlaying(true) 设过、
+             * 而 pauseTimers 可能在前一轮已经执行 —— 只要有任何一次时序错位，
+             * 计时器就永久停在暂停，表现为「在放但进度不动 / 一首完就没声」。
+             * 进来这个分支本身就说明「应该恢复」，直接 resume 更安全：
+             * resumeTimers() 对未暂停的 WebView 是幂等的。
+             */
             runOnUiThread(() -> {
                 try {
-                    if (web != null && webPlaying && !isForeground) web.resumeTimers();
+                    if (web != null && !isForeground) web.resumeTimers();
                 } catch (Throwable ignored) {
                 }
             });

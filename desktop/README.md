@@ -1,13 +1,15 @@
 # Ripple 桌面端（Tauri）
 
+**简体中文** | [English](./README_en.md)
+
 Ripple 的桌面客户端。**复用 `app/` 那 13000 行前端，一行不改**，
 只补一个 Rust 侧的原生桥和网易云客户端。
 
-> ⚠️ **当前状态：验证阶段**
+> **当前状态：已随 1.3.0 正式发布**
 >
-> 本目录在 `feat/desktop-tauri` 分支上开发。构建产物**只上传为 GitHub Actions
-> Artifacts**（需登录、14 天过期），**不进公开 Release**。
-> 等维护者在真实桌面环境实测通过之后，再决定是否并入 `main` 并正式发布。
+> 桌面端产物（`.deb` / `.AppImage` / `.tar.gz` / `-setup.exe` / `.zip`）
+> 与 Android APK **一起发布在同一个公开 Release** 里；CI 另传 Artifacts 便于排查。
+> 代码已并入 `main`。
 
 ---
 
@@ -79,7 +81,7 @@ N.netease(cmd, paramsJson, cbId)   // 立刻返回
 | `RippleNative.notify(title,body)` | 通知栏 | ❌ 恒 false（走降级） |
 | `RippleNative.mediaState(json)` | MediaSession | ❌ 恒 false |
 | `RippleNative.canDrawOverlay()` | 悬浮窗权限 | ❌ 恒 false |
-| `RippleNative.login(mode,id)` | 内嵌登录页 | ❌ 待补（见下） |
+| `RippleNative.login(mode,id)` | 内嵌登录页 | 不需要（登录走扫码，见下） |
 
 前端所有原生调用点都写成 `if (window.RippleNative && typeof N.xxx === 'function')`，
 所以某个方法不给时会自动降级 —— 这也是桌面端能只实现最重要的 `netease` 一条、
@@ -105,11 +107,14 @@ N.netease(cmd, paramsJson, cbId)   // 立刻返回
 
 ### ❌ 未实现
 
-- **扫码登录**：底层命令（`login_qr_key` / `login_qr_check`）已备好，
-  但 UI 要改 `app/js/app.js` 的登录弹窗 —— 那是「前端零改动」的第一次破例，
-  留作单独决策
+目前没有「本该有但没做」的功能项。
 
-**当前怎么登录**：把网易云的 `MUSIC_U` cookie 写进配置目录的 `netease-cookie`：
+> **扫码登录已可用**（1.3.0 起）：`chooseLoginMode` 三端统一走扫码，
+> 底层 `login_qr_key` / `login_qr_check` 在 Rust 侧已实现，直接点界面上的
+> 「登录网易云」就能扫码。此处不再需要手写 cookie。
+
+**备用登录方式**（扫码不可用时）：把网易云的 `MUSIC_U` cookie 写进配置目录的
+`netease-cookie`：
 
 ```bash
 # Linux
@@ -186,7 +191,7 @@ AES 填充错了还是 base64 换行不同。所以 `weapi.rs` 带了一组固�
 同样的输入必须永远得到同样的输出，且长度/字符集必须符合协议要求。
 
 **CI 里没法测「点开能不能用」** —— GUI 交互、登录、播放必须人在真实桌面上点。
-所以产物先进 Artifacts 让人验，验过了再考虑发 Release。
+产物会随 Release 一起发布，同时上传 Artifacts 方便 CI 内排查。
 
 ---
 

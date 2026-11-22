@@ -106,8 +106,42 @@ jobs:
         with:
           node-version: 22
 
+      # 审查 D-03：校验必须在**组装之前**。
+      #
+      # 组装脚本的第 4 段职责正好是「把 tauri.conf.json 的 version 写成
+      # version.json 的值」—— 先组装再校验，等于让检查者先把被检查的文件
+      # 改成期望值，这条断言在任何输入下都不可能失败（恒真）。
+      #
+      # 现在挪到前面，同时加上 Cargo.toml 的 [package] version（D-02 的
+      # 那个漂移点），三条链一起校。
+      - name: 版本号与 version.json 一致（必须在组装之前）
+        run: |
+          V=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
+          CONF=$(python3 -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")
+          CV=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)
+          # Cargo.lock 里 ripple-desktop 的 version 在 name 行的下一行，用 awk 精确取
+          CLV=$(awk '/^name = "ripple-desktop"$/{f=1;next} f && /^version = /{gsub(/[^0-9.]/,"");print;exit}' \
+                  desktop/src-tauri/Cargo.lock)
+          echo "version.json=$V tauri.conf.json=$CONF Cargo.toml=$CV Cargo.lock=$CLV"
+          rc=0
+          [ "$V" = "$CONF" ] || { echo "::error::tauri.conf.json $CONF ≠ version.json $V"; rc=1; }
+          [ "$V" = "$CV" ]   || { echo "::error::Cargo.toml $CV ≠ version.json $V"; rc=1; }
+          [ "$V" = "$CLV" ]  || { echo "::error::Cargo.lock $CLV ≠ version.json $V"; rc=1; }
+          exit $rc
+
       - name: 组装桌面端前端包
         run: bash desktop/build-frontend.sh
+
+      # 组装之后不该再产生受控文件的 diff —— 如果产生了，说明源码里的版本号
+      # 和 version.json 不一致、被脚本临时抹平了（下一次就一定不一致）。
+      - name: 组装不应产生受控文件 diff
+        run: |
+          if ! git diff --quiet -- desktop/src-tauri/tauri.conf.json; then
+            echo "::error::组装脚本改写了受控文件 tauri.conf.json —— 说明源码里的版本号落后于 version.json"
+            git diff -- desktop/src-tauri/tauri.conf.json
+            exit 1
+          fi
+          echo "✅ 组装未改写受控文件"
 
       - name: 校验桥接层已注入
         run: |
@@ -138,13 +172,6 @@ jobs:
             node --check "$f" || fail=1
           done
           exit $fail
-
-      - name: 版本号与 version.json 一致
-        run: |
-          V=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
-          CONF=$(python3 -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")
-          echo "version.json=$V tauri.conf.json=$CONF"
-          [ "$V" = "$CONF" ] || { echo "::error::版本号不一致"; exit 1; }
 
   # ------------------------------------------------------------------
   # 第 3 关：实际打包
@@ -344,7 +371,12 @@ jobs:
       # 这样「三端一个 Release」不用等两个 workflow 互相等待。
       - name: 取同版本 Android APK
         run: |
-          set -e
+          # 审查 D-04：release/ 目录在整个 job 里**第一次**被创建必须在这里。
+          # 以前 mkdir 在后面「收拢安装包」那步，而这步就要往 release/ 写文件 ——
+          # curl -o 不会创建父目录，直接 rc=23（Failure writing output to
+          # destination），然后被下面的 else 分支吞成一句误导性的
+          # 「没有找到 Android APK」（真实原因是目录不存在）。
+          mkdir -p release
           VN='${{ steps.meta.outputs.version }}'
           URL="https://github.com/${{ github.repository }}/releases/download/v${VN}/Ripple-${VN}.apk"
           echo "尝试下载：$URL"
@@ -352,7 +384,14 @@ jobs:
             echo "✅ 拿到 Android APK"
             ls -lh "release/Ripple-${VN}.apk"
           else
-            echo "::warning::没有找到 v${VN} 的 Android APK，本次只发桌面端产物"
+            rc=$?
+            # 区分 curl 退出码，别再让排障方向跑偏
+            case "$rc" in
+              22) echo "::warning::v${VN} 的 Release 里还没有 APK（HTTP 404）。如果这次是三端一起发，先跑 Android 的 build.yml 再跑这个。URL=$URL" ;;
+              23) echo "::error::写盘失败（rc=23），release/ 目录或权限有问题"; exit 1 ;;
+               6) echo "::error::DNS 解析失败（rc=6），检查网络"; exit 1 ;;
+               *) echo "::warning::下载 APK 失败（curl rc=$rc），本次只发桌面端产物";;
+            esac
           fi
 
       # 把深目录里的安装包收拢到 release/，供后面精确上传

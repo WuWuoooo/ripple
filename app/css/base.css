@@ -170,7 +170,17 @@
   --glass-border:rgba(255,255,255,.9);--glass-hl:rgba(255,255,255,1);
   --shadow:0 20px 40px -26px rgba(50,35,20,.45);
   --dock-bg:rgba(255,253,250,.78);
-  --accent-ink:#fff;
+  /*
+   * 审查 U-02：这行必须删掉。
+   *
+   * 以前浅色主题把 --accent-ink 改成 #fff，而 --accent 是 #b3a2ff ——
+   * 实测对比度只有 2.20:1（WCAG 小字要求 4.5）。而 :root 里的 #17102b
+   * 配同一个主色是 8.32:1，本来是对的，被这一行改坏了。
+   *
+   * 删掉之后浅色主题会继承 :root 的 --accent-ink:#17102b。
+   * 动态取色时 JS 还会按实际对比度重算（见 app.js 的 inkForAccent）。
+   */
+  /* --accent-ink:#fff;  ← 已删除，别再加回来 */
   /* 浅色主题：投影只起「轻轻托起」的作用，不能出现明显的深色块。
      另外投影必须在 .cover-wrap 内部（底部还有约 20px 余量）就淡完，
      否则会被 overflow:hidden 一刀切出一条硬边灰带。 */
@@ -1163,6 +1173,33 @@ body.no-cover .np-bg{opacity:0}
 .segmini button{font-size:10.5px;padding:6px 9px;color:var(--text3);transition:.18s var(--ease);line-height:1.2}
 .segmini button+button{border-left:1px solid var(--line2)}
 .segmini button.on{background:var(--accent-soft);color:var(--accent)}
+
+/*
+ * 曲库分组 tab（.segline）
+ *
+ * 审查 U-04：这套样式**从 1.0.0 至今就没存在过** —— 四个 <b> 一直是
+ * 16px 加粗连排、选中态与未选中完全同色。git show 逐版本核对全为 0 命中，
+ * 不是本轮回归。
+ *
+ * 讽刺的是 1.2.3 的可访问性整改已经给它补了 role="tablist"/aria-selected/
+ * roving tabindex —— 读屏用户能感知选中态，明眼用户反而看不出。
+ *
+ * 这里照 .segmini 的视觉语言补一套，但因为 .segline 里是 <b> 而不是 <button>，
+ * 需要自己处理 flex / 可点区域 / focus-visible。
+ */
+.segline{display:flex;gap:7px;overflow-x:auto;scrollbar-width:none;
+  padding:11px 0;margin:-9px 0 -7px}
+.segline::-webkit-scrollbar{display:none}
+.segline b{flex:none;height:26px;padding:0 12px;border-radius:14px;
+  display:inline-flex;align-items:center;
+  border:1px solid var(--line2);color:var(--text2);
+  font-size:11.5px;font-weight:500;cursor:pointer;
+  transition:background .2s var(--ease),color .2s var(--ease),
+             border-color .2s var(--ease),transform .2s var(--ease)}
+.segline b.on{background:var(--accent-soft);border-color:var(--accent);
+  color:var(--accent);font-weight:600}
+.segline b:active{transform:scale(.96)}
+.segline b:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 
 /* 按钮 */
 .btn{height:44px;padding:0 20px;border-radius:22px;display:inline-flex;align-items:center;
