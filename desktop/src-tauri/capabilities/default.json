@@ -1,9 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Ripple 桌面端默认能力。只开窗口与自定义命令，不放宽任何文件/网络特权。",
+  "description": "Ripple 桌面端默认能力。只开窗口控制与自定义命令，不放宽任何文件/网络特权。",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging"
   ]
 }
