@@ -324,7 +324,16 @@ jobs:
           echo "code=$VC"     >> "$GITHUB_OUTPUT"
           echo "版本：$VN ($VC)"
 
-      # 把两个平台的 Artifacts 都拿下来，平铺到 dist/
+      # 把两个平台的 Artifacts 都拿下来。
+      #
+      # 注意：**不能**用 merge-multiple: true 就当它是平铺的。
+      # bundle job 上传时用的是 `desktop/src-tauri/target/release/bundle/**`，
+      # action 会把这段前缀原样保留在 Artifact 内部，所以下载下来是
+      #   dist/desktop/src-tauri/target/release/bundle/deb/Ripple_x.y.z_amd64.deb
+      # 这种深目录。第一版就是被这一点坑到：`dist/*.deb` 扫不到任何文件，
+      # 结果 Release 里只上去了 tar.gz 和 zip，deb/AppImage/exe 全丢，
+      # 而且 fail_on_unmatched_files: false 让这件事**静默通过**。
+      # 所以下面必须显式把散落的安装包收拢到 release/ 再上传。
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -339,19 +348,37 @@ jobs:
           VN='${{ steps.meta.outputs.version }}'
           URL="https://github.com/${{ github.repository }}/releases/download/v${VN}/Ripple-${VN}.apk"
           echo "尝试下载：$URL"
-          if curl -fsSL -o "dist/Ripple-${VN}.apk" "$URL"; then
+          if curl -fsSL -o "release/Ripple-${VN}.apk" "$URL"; then
             echo "✅ 拿到 Android APK"
-            ls -lh "dist/Ripple-${VN}.apk"
+            ls -lh "release/Ripple-${VN}.apk"
           else
             echo "::warning::没有找到 v${VN} 的 Android APK，本次只发桌面端产物"
           fi
 
+      # 把深目录里的安装包收拢到 release/，供后面精确上传
+      - name: 收拢安装包
+        run: |
+          set -e
+          mkdir -p release
+          # 先收工作区根上的便携包（bundle job 用 $GITHUB_WORKSPACE 生成）
+          cp -v dist/Ripple-*.tar.gz dist/Ripple-*.zip release/ 2>/dev/null || true
+          # 再递归捞 bundle 目录里的真正安装包（deb / AppImage / nsis）
+          find dist -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*-setup.exe' \) \
+            -exec cp -v {} release/ \; 2>/dev/null || true
+          echo "=== release/ ==="
+          ls -lh release/ || true
+
       - name: 整理产物清单
         run: |
-          echo "=== dist/ ==="
-          ls -lh dist/ || true
-          echo "=== 文件数 ==="
-          find dist -maxdepth 1 -type f | wc -l
+          echo "=== release/ ==="
+          ls -lh release/ || true
+          COUNT=$(find release -maxdepth 1 -type f | wc -l)
+          echo "文件数：$COUNT"
+          # 少于 5 个说明有平台没产物，别静默发一个残缺的 Release
+          if [ "$COUNT" -lt 5 ]; then
+            echo "::error::产物只有 $COUNT 个，预期至少 5 个（apk/tar.gz/zip/deb/AppImage/exe）。请检查上一步的收拢日志。"
+            exit 1
+          fi
 
       # 只**追加资产**，不改 Release 说明。
       #
@@ -368,12 +395,7 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: false
           files: |
-            dist/*.apk
-            dist/*.deb
-            dist/*.AppImage
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.exe
+            release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -384,7 +406,7 @@ jobs:
             echo ""
             echo "| 平台 | 文件 |"
             echo "|---|---|"
-            ls -1 dist/ | sed 's/^/| | `&` |/'
+            ls -1 release/ | sed 's/^/| | `&` |/'
             echo ""
             echo "> 桌面端为未签名包，用户侧需要在系统提示里手动放行。"
             echo ""
