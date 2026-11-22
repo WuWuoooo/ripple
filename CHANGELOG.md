@@ -81,7 +81,7 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
 - **纯 bash 组装前端**：`build-frontend.sh` 复制 `app/` 并注入桥接层，
   不需要 npm / 前端构建链
 - **产物格式**：Linux 出 `.deb` / `.AppImage` / `.tar.gz`，Windows 出 NSIS
-  安装包 / `.zip` 绿色版。CI 只上传 Actions Artifacts，**不进公开 Release**
+  安装包 / `.zip` 绿色版。三端产物和 APK 一起发布在同一个 Release 里
 - **取消 macOS**：本机（aarch64 Ubuntu proot）绝对无法产出 macOS 产物，
   需要 Apple SDK 与签名证书。与其出一个没测过的包，不如明确不做
 

@@ -19,7 +19,7 @@ The approach is to reproduce Android's `@JavascriptInterface` bridge verbatim in
 - **weapi encryption on the Rust side**: double AES-128-CBC + textbook RSA, with constants character-for-character identical to the Java / Node sides, covered by 9 fixed-vector tests. Get one byte wrong here and NetEase just returns `{"code":400}`; on screen you cannot tell whether the padding was wrong or the base64 line wrapping differed
 - **20 commands**, aligned one by one with Java / server.js (the frontend calls 20, and not one is missing)
 - **Pure bash frontend assembly**: `build-frontend.sh` copies `app/` and injects the bridge layer; no npm / frontend build chain required
-- **Artifact formats**: Linux produces `.deb` / `.AppImage` / `.tar.gz`; Windows produces an NSIS installer / `.zip` portable build. CI uploads only to Actions Artifacts and **never to a public Release**
+- **Artifact formats**: Linux produces `.deb` / `.AppImage` / `.tar.gz`; Windows produces an NSIS installer / `.zip` portable build. All three platforms ship in the same Release alongside the APK
 - **macOS dropped**: this machine (aarch64 Ubuntu proot) absolutely cannot produce macOS artifacts, which need the Apple SDK and signing certificates. Rather than ship an untested package, it is explicitly not done
 
 ### 2. Three Defects That "Look Right but Do Not Work"
