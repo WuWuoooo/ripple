@@ -227,8 +227,11 @@ mod tests {
     fn kat_form_body_full_string() {
         let f = form_with_key(r#"{"s":"周杰伦","type":1}"#, "abcdefghijklmnop");
         assert!(
-            f.starts_with("params=n2nXn8LzSZtTIMti%2F1xqFqy5fgWVpTduKbnKYofx58y9iihREQxDVYhuI1MIV3GS"),
-            "params 的 urlencode 口径不对，实际开头：{}", &f[..80.min(f.len())]
+            f.starts_with(
+                "params=n2nXn8LzSZtTIMti%2F1xqFqy5fgWVpTduKbnKYofx58y9iihREQxDVYhuI1MIV3GS"
+            ),
+            "params 的 urlencode 口径不对，实际开头：{}",
+            &f[..80.min(f.len())]
         );
         assert!(
             f.contains("&encSecKey=d15a1683c992095d"),
