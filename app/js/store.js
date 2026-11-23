@@ -241,14 +241,56 @@
       }
       return this.state;
     },
+    /**
+     * 落盘。
+     *
+     * 审查 E-16：以前 catch 是**空的** —— QuotaExceededError 被静默吞掉，
+     * 无日志、无提示、无重试，于是「内存里改了、磁盘没改」可以持续整个会话：
+     * 用户只看到「设了又变回去」，而开发者从日志里找不到任何痕迹。
+     * 这是「重启丢设置」这一类最难排查的问题。
+     *
+     * 现在：首次失败时记一条日志 + 弹一次 toast（用 _saveFailed 防刷屏，
+     * 免得拖滑块时每秒几十条），并主动瘦身后重试一次 ——
+     * history 200→100、onlineCache 60→30 通常就够腾出空间。
+     */
     save() {
       const s = this.state;
+      const payload = () => JSON.stringify({
+        settings: s.settings, liked: s.liked, history: s.history.slice(0, 200),
+        playedSec: s.playedSec, imports: s.imports, onlineCache: (s.onlineCache || []).slice(0, 60),
+      });
       try {
-        localStorage.setItem(KEY, JSON.stringify({
-          settings: s.settings, liked: s.liked, history: s.history.slice(0, 200),
-          playedSec: s.playedSec, imports: s.imports, onlineCache: (s.onlineCache || []).slice(0, 60),
-        }));
-      } catch (e) {}
+        localStorage.setItem(KEY, payload());
+        this._saveFailed = false;          /* 成功一次就复位，允许下次再报 */
+        return true;
+      } catch (e) {
+        /* 第一次失败：先瘦身重试，多数情况这样就能救回来 */
+        try {
+          const slim = JSON.stringify({
+            settings: s.settings, liked: s.liked, history: s.history.slice(0, 100),
+            playedSec: s.playedSec, imports: s.imports, onlineCache: (s.onlineCache || []).slice(0, 30),
+          });
+          localStorage.setItem(KEY, slim);
+          if (!this._saveWarnedSlim) {
+            this._saveWarnedSlim = true;
+            try { g.Log && g.Log.add('STORE', '存储接近上限，已裁剪 history/onlineCache 后写入'); } catch (e2) {}
+          }
+          this._saveFailed = false;
+          return true;
+        } catch (e2) {
+          if (!this._saveFailed) {
+            this._saveFailed = true;
+            try { g.Log && g.Log.err('STORE', e2, '设置写入失败（本机存储已满）'); } catch (e3) {}
+            try {
+              const A = g.RippleApp;
+              if (A && typeof A.toast === 'function') {
+                A.toast('设置无法保存', '本机存储已满，请在「我的」里清理已导入的音乐', 'warn');
+              }
+            } catch (e3) {}
+          }
+          return false;
+        }
+      }
     },
     /**
      * L-16：只写进度相关的 4 个字段（几十字节），不碰 history / onlineCache。
@@ -262,7 +304,18 @@
           lastQueue: Array.isArray(prog.lastQueue) ? prog.lastQueue.slice(0, 200) : [],
           queueIndex: Number(prog.queueIndex) || 0,
         }));
-      } catch (e) {}
+        this._progFailed = false;
+      } catch (e) {
+        /*
+         * E-16 同源问题：进度写盘以前也是空 catch。
+         * 进度写不进去的直接后果是「重启后从 0 开始」，而日志里毫无痕迹。
+         * 这里只记一次日志（不弹 toast —— 进度丢失不像设置丢失那样需要立刻打扰）。
+         */
+        if (!this._progFailed) {
+          this._progFailed = true;
+          try { g.Log && g.Log.err('STORE', e, '播放进度写入失败'); } catch (e2) {}
+        }
+      }
     },
     /**
      * 改一个设置项。

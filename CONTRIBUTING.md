@@ -9,6 +9,11 @@
 > `android/gradle.properties`、`android/app/build.gradle`（AGP 8.4.2），那只是可选配置，
 > 不是官方构建入口 —— 它主要给 IDE 补全用，也让想用 Gradle 的人有个起点。
 > 请不要依赖它出包，也不要为了它引入依赖树。
+>
+> ⚠️ **仓库里没有 Gradle wrapper**（没有 `gradlew`、没有 `gradle/wrapper/`），
+> 所以在克隆下来的仓库里直接跑 `./gradlew assembleDebug` 是**跑不了的**。
+> 本机要装 Gradle 8.x + AGP 8.4.2 之后用 `gradle assembleDebug`；这只是可选的旁路，
+> 官方出包始终是 `bash android/build-apk.sh`。
 
 ## 这个项目刻意不使用的东西
 
@@ -51,8 +56,8 @@ bash android/build-apk.sh
 
 ### 版本同步清单（全部由 `android/sync-version.sh` 自动写，**不要手改**）
 
-`build-apk.sh` 开头会调用 `android/sync-version.sh`；Gradle 路径（`./gradlew assembleDebug`）
-也调同一个脚本，所以两条构建路径的版本号不会分叉。
+`build-apk.sh` 开头会调用 `android/sync-version.sh`；Gradle 路径（`gradle assembleDebug`，
+注意本仓库不带 wrapper）也调同一个脚本，所以两条构建路径的版本号不会分叉。
 
 | 文件 | 被写的内容 | 来源 |
 |---|---|---|

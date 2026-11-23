@@ -21,7 +21,17 @@
 
 /* ---------- 底部：胶囊 Tab + 浮动 Dock ---------- */
 .tabbar{
-  display:flex;position:absolute;left:12px;right:12px;bottom:calc(var(--safe-b) + 8px);z-index:19;
+  /*
+   * 审查 U-14（CSS-10）：left/right 要让开挖孔安全区。
+   *
+   * 以前写的是 left:12px;right:12px（写死），而同一个屏幕上的 .dock
+   * 用 padding 让开了 --safe-l/--safe-r。手机横屏 + 挖孔设备时
+   * 两者实测差 44px（#tabbar left=12 vs #dockInner left=56），
+   * 胶囊导航和迷你播放器明显不齐。
+   * 现在两者统一用 calc(var(--safe-l/r) + 12px)。
+   */
+  display:flex;position:absolute;left:calc(var(--safe-l) + 12px);right:calc(var(--safe-r) + 12px);
+  bottom:calc(var(--safe-b) + 8px);z-index:19;
   height:62px;border-radius:22px;align-items:center;justify-content:space-around;
   background:var(--glass);
   -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
@@ -233,8 +243,26 @@ html[data-rail="mini"] .rail-foldrow{justify-content:center}
  */
 html[data-rail="mini"] .rail-foldrow{flex-direction:column;gap:4px}
 
+/*
+ * 审查 U-17（CSS-13）：侧栏三个块的图标左边缘必须共线。
+ *
+ * 以前三块各写各的横向内缩（brand 0+4、nav a 0+11、acct 0+8），
+ * 展开态图标左沿实测 16/24/25，参差肉眼可见。1.2.3 只修了「居中」没修「左沿共线」。
+ *
+ * 关键约束：.rail 容器**自己**已经有 8px 横向 padding，而且 nav 的 <a> 与 acct
+ * 按钮各自还有内部 padding。要共线，等于让三者「容器 padding + 块偏移 + 自身 padding」
+ * 之和相等。统一目标取 rail 左边缘 +16px：
+ *   · brand：块偏移 0 + logo 无 padding  → 8 + 0  + 0  = 16 ✓
+ *   · nav  ：块偏移 -3（用 margin，padding 不能为负）+ a 自身 11 → 8 - 3 + 11 = 16 ✓
+ *   · acct ：块偏移 0 + 按钮自身 8        → 8 + 0  + 8  = 16 ✓
+ *
+ * 刻意不用一个共享变量：三者的算式不同，共享反而对不齐。
+ * 收起态（mini）走另一套 —— 图标在窄栏里居中，不适用共线规则。
+ */
+
 .rail-brand{display:flex;align-items:center;gap:9px;flex:none;min-width:0;
-  padding:0 4px;overflow:hidden}
+  /* 图标左沿目标 16px：容器 8 + 本块 8 + logo 无 padding = 16（实测校准，U-17 CSS-13） */
+  padding:0 0 0 8px;overflow:hidden}
 .rail-logo{width:30px;height:30px;flex:none;border-radius:10px;display:grid;place-items:center;
   background:var(--accent-soft);color:var(--accent)}
 .rail-logo svg{width:18px;height:18px}
@@ -243,7 +271,10 @@ html[data-rail="mini"] .rail-foldrow{flex-direction:column;gap:4px}
 .rail-brand b span{font-size:10px;font-weight:500;color:var(--text3);letter-spacing:.1em}
 
 .rail-nav{display:flex;flex-direction:column;gap:3px;flex:1;min-height:0;overflow-y:auto;
-  scrollbar-width:none;padding-top:6px}
+  scrollbar-width:none;padding-top:6px;
+  /* 图标左沿目标 16px：容器 8 + 本块 -3（margin）+ a 自身 11 = 16（U-17 CSS-13）
+     padding 不能为负，所以外扩用负 margin */
+  margin-left:-3px;margin-right:-3px}
 .rail-nav::-webkit-scrollbar{display:none}
 .rail-nav a{
   display:flex;align-items:center;gap:11px;flex:none;
@@ -260,7 +291,10 @@ html[data-rail="mini"] .rail-foldrow{flex-direction:column;gap:4px}
 
 .rail-foot{flex:none;overflow:hidden}
 .rail-acct{display:flex;align-items:center;gap:9px;width:100%;
-  padding:8px;border-radius:12px;border:1px solid var(--glass-border);
+  /* 图标（头像）左沿目标 16px：容器 8 + 按钮 padding 7 + border 1 = 16
+     （实测校准：写 8px 时因为 border-box 下 1px 边框，头像会落在 17 而非 16） */
+  padding:7px;box-sizing:border-box;
+  border-radius:12px;border:1px solid var(--glass-border);
   background:var(--panel);transition:.2s var(--ease);overflow:hidden;text-align:left}
 .rail-acct:hover{border-color:var(--accent-soft)}
 .rail-acct .ava{width:30px;height:30px;flex:none;border-radius:50%;overflow:hidden;

@@ -11,7 +11,7 @@
 <!-- 说清你怎么确认改动生效，以及在哪台设备 / 哪个浏览器上试过 -->
 
 - [ ] `node --check` 全部 JS 通过
-- [ ] 改了前端 → `app/sw.js` 的 `CACHE` 版本已加一
+- [ ] 改了前端 → 已跑 `bash android/sync-version.sh`（**不要手改** `app/sw.js` 的 `CACHE`，它由脚本从 `version.json` 同步）
 - [ ] 没有提交 `.ripple-cookie` / `.ripple-token` / `android/debug.keystore`
 - [ ] 界面改动附了截图
 

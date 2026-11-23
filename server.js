@@ -352,7 +352,19 @@ function allowedHosts() {
     const ifs = os.networkInterfaces();
     Object.keys(ifs).forEach((name) => {
       (ifs[name] || []).forEach((i) => {
-        if (i && i.address) set.add(String(i.address).toLowerCase());
+        if (!i || !i.address) return;
+        const a = String(i.address).toLowerCase();
+        set.add(a);
+        /*
+         * 审查 S-06：IPv6 必须同时收**带方括号**的形式。
+         *
+         * 白名单以前只存裸 IPv6（240e:565:...），而浏览器/客户端发来的 Host
+         * **一定带方括号**（[240e:565:...]:18080）。hostKey 对 [..] 保留方括号，
+         * 与集合里的裸地址永远不相等 → 双栈环境下 IPv6 访问一律 421，
+         * 而 421 正文里拼出来的 URL 用的是带方括号的正确写法、照着点还是 421。
+         * 表现就是「地址明明在允许列表里，就是进不去，而且无法自救」。
+         */
+        if (a.includes(':')) set.add('[' + a + ']');
       });
     });
   } catch (e) {}
@@ -387,6 +399,19 @@ function hostRejectBody(req) {
     if (h.includes(':')) return 'http://[' + h + ']:' + PORT + '/';
     return 'http://' + h + ':' + PORT + '/';
   };
+  /*
+   * S-06 配套：白名单现在同时有「裸 IPv6」与「[IPv6]」两种写法，
+   * 展示时只保留裸的（urlFor 会自己补方括号），避免 421 页面里同一个地址列两遍。
+   */
+  const seen = new Set();
+  const dedup = list.filter((h) => {
+    const key = h.replace(/^\[|\]$/g, '');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  list.length = 0;
+  list.push(...dedup);
   const v4 = list.filter((h) => !h.includes(':') || h === 'localhost').sort();
   const v6 = list.filter((h) => h.includes(':') && h !== 'localhost').sort();
   return 'misdirected request: host not allowed\n'
@@ -932,6 +957,20 @@ function serveStatic(req, res) {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('bad request');
   }
+  /*
+   * 审查 S-12：解码后含 NUL 的路径必须回 400，不能往下走。
+   *
+   * `decodeURIComponent('/a%00.js')` 本身**不抛**（%00 是合法转义），
+   * 于是带着 '\0' 的字符串一路走到 fs.statSync —— Node 对含空字节的路径
+   * 同步抛 TypeError（"...without null bytes"），被外层 catch 兜成 500。
+   *
+   * 语义上这是客户端畸形输入，应当是 400 不是 500；而且一个**不需要令牌**
+   * 的 GET 就能无限刷服务端日志（实测 /a%00.js → 500）。
+   */
+  if (p.indexOf('\0') >= 0) {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('bad request');
+  }
   if (p === '/' || p === '') p = '/index.html';
   const file = path.normalize(path.join(ROOT, p));
   /* 前缀校验要带分隔符：只判断 startsWith(ROOT) 时，
@@ -1257,7 +1296,23 @@ function reportDataDir() {
     + '     （详见 README 的「安全与隐私」一节。）\n');
 }
 
-server.listen(PORT, '0.0.0.0', () => {
+/*
+ * 审查 S-13：server.js 的 HTTP 行为此前**零测试**。
+ *
+ * 根因是 `require('./server.js')` 会直接 listen —— 测试一加载就占端口，
+ * 于是 1148 行里约 200 行 HTTP 逻辑没有任何覆盖，而它恰恰是本项目里
+ * 唯一「经手用户网易云登录态」的组件。上一轮 S-01（.local 页面签得出令牌
+ * 但 API 全 403）就是「接线」问题，纯函数测试天生测不到。
+ *
+ * 现在：
+ *   · `module.exports = { server, PORT, DATA_DIR, ... }` 让 e2e 测试能 require
+ *     后自己选端口 listen（不再由本文件抢占）；
+ *   · 只有当本文件是被**直接执行**（`node server.js`）时才自动 listen，
+ *     行为与以前完全一致。
+ */
+const IS_MAIN = require.main === module;
+
+if (IS_MAIN) server.listen(PORT, '0.0.0.0', () => {
   const nets = os.networkInterfaces();
   const ips = [];
   for (const k of Object.keys(nets)) {
@@ -1274,4 +1329,21 @@ server.listen(PORT, '0.0.0.0', () => {
     + sec.formatTtl(TOKEN_TTL_MS));
   reportDataDir();
   console.log('\n  按 Ctrl+C 停止\n');
-});
+  });
+
+/*
+ * 导出给测试用。
+ *
+ * 注意：这里只导出句柄，**不**自动 listen —— 测试自己调 server.listen(0)
+ * 拿临时端口，用完 server.close()，互不干扰。
+ */
+module.exports = {
+  server: server,
+  PORT: PORT,
+  DATA_DIR: DATA_DIR,
+  ROOT: ROOT,
+  SEC: sec,
+  /* 几个测试要直接断言的内部函数（纯读，不改变状态） */
+  allowedHosts: allowedHosts,
+  tokenStats: tokenStats,
+};

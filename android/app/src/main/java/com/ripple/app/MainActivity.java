@@ -53,20 +53,11 @@ public class MainActivity extends Activity {
     private WebView web;
     private ValueCallback<Uri[]> filePathCallback;
     private NeteaseClient netease;
-    private WebView loginWeb;
-    private FrameLayout loginLayer;
     /** 已提交验证的 MUSIC_U，避免同一 token 反复验证 */
-    private volatile String loginVerifiedToken;
-    private volatile long loginLastVerifyAt;
     /** 打开登录页那一刻的 cookie 快照：只有出现「新的 MUSIC_U」才算登录成功 */
-    private String loginBaseline = "";
     /** 打开登录页前的完整 cookie：取消登录时原样写回，避免把用户静默登出 */
-    private String loginBackupCookies;
     /** 本次登录流程是否已经真正成功（成功就不回滚 cookie） */
-    private volatile boolean loginSucceeded = false;
     /** 自动校验连续失败次数：失败也要能重试，但不能变成每 900ms 一轮的请求风暴 */
-    private volatile int loginVerifyFailures = 0;
-    private long loginOpenedAt = 0;
     private final String pendingLoginCb = "loginCb";
     private boolean pageLoaded = false;
     /** 上一次已经下发过的系统栏状态（幂等缓存：值没变就不再发跨进程调用） */
@@ -735,356 +726,21 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
     }
 
-    /* ================= 网易云登录 ================= */
-
-    /**
-     * 打开网易云官方登录页。
+    /* ================= 网易云登录（纯扫码，见 app/js/app.js） ================= */
+    /*
+     * 审查 AND-02：内嵌 WebView 登录链已整段删除（原约 330 行）。
      *
-     * @param mode "phone" = 手机号登录（移动版页面），"qr" = 扫码登录（桌面版页面）
+     * 1.3.0 起三端统一走扫码登录（`chooseLoginMode` → `startQrLogin`），
+     * 数据通道就是普通的 `login_qr_key` / `login_qr_check` 两条命令 ——
+     * 不需要在 Activity 上再叠一个 WebView 去加载 music.163.com。
      *
-     * 之前「弹出就自动回去」的原因：onPageFinished 一触发就去读 cookie，
-     * 而 CookieManager 里还留着上次的 MUSIC_U（甚至游客态也会写），
-     * 于是立刻判定「已登录」把页面关了。现在改成：
-     *   1. 打开前先记下当前 cookie 快照（并清掉旧登录态）
-     *   2. 只有读到「和快照不同」的 MUSIC_U 才算成功
-     *   3. 还要真的拿到 profile 才关页面
-     */
-    void openLogin(final String mode, final String cbId) {
-        runOnUiThread(() -> {
-            try {
-                if (loginLayer != null || web == null) return;
-                ViewGroup parent = (ViewGroup) web.getParent();
-                if (parent == null) return;
-
-                boolean qr = "qr".equals(mode);
-
-                // 先清掉旧的登录态，避免残留 cookie 让登录页瞬间被判成功
-                try {
-                    CookieManager cm = CookieManager.getInstance();
-                    String old = cm.getCookie("https://music.163.com");
-                    loginBaseline = muscU(old);
-                    // B-1：整串 cookie 先备份，取消登录时写回，否则用户会被静默登出
-                    loginBackupCookies = old;
-                    loginSucceeded = false;
-                    loginVerifyFailures = 0;
-                    if (loginBaseline != null) {
-                        // 主动置空：下一次写进来的才是真登录
-                        cm.setCookie("https://music.163.com", "MUSIC_U=; Max-Age=0; Path=/");
-                    }
-                    cm.flush();
-                } catch (Throwable ignored) {
-                }
-                loginOpenedAt = System.currentTimeMillis();
-                LogBridge.add(this, "LOGIN", "open mode=" + mode + " baseline="
-                        + (loginBaseline == null ? "none" : "had"));
-
-                loginLayer = new FrameLayout(this);
-                loginLayer.setBackgroundColor(Color.parseColor("#0a0a10"));
-
-                loginWeb = new WebView(this);
-                WebSettings ls = loginWeb.getSettings();
-                safe(() -> ls.setJavaScriptEnabled(true));
-                safe(() -> ls.setDomStorageEnabled(true));
-                safe(() -> ls.setDatabaseEnabled(true));
-                safe(() -> ls.setLoadWithOverviewMode(true));
-                safe(() -> ls.setUseWideViewPort(true));
-                safe(() -> ls.setSupportZoom(false));
-                safe(() -> ls.setBuiltInZoomControls(false));
-                if (Build.VERSION.SDK_INT >= 21) {
-                    // 登录页自身就是 https：明文子资源一律不加载
-                    safe(() -> ls.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW));
-                    try {
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(loginWeb, true);
-                    } catch (Throwable ignored) {
-                    }
-                }
-                // 二维码在桌面版页面里最完整；手机号登录用移动版页面
-                safe(() -> ls.setUserAgentString(qr
-                        ? "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                          + "Chrome/124.0.0.0 Safari/537.36"
-                        : "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) "
-                          + "Chrome/124.0.0.0 Mobile Safari/537.36"));
-
-                loginWeb.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public void onPageFinished(WebView view, String url) {
-                        super.onPageFinished(view, url);
-                        LogBridge.add(MainActivity.this, "LOGIN", "page finished " + url);
-                        harvestLogin(cbId);
-                    }
-
-                    /**
-                     * 只在网易云域名里跳转。
-                     * 以前没有这个钩子：登录页里任何外链（用户协议、帮助中心、
-                     * 甚至广告）都会把整个登录层带到别的站点，
-                     * 而登录层没有地址栏也没有返回键，用户就卡在那儿了。
-                     *
-                     * R-17：判定必须是「解析出来的 host」做域名后缀比较。
-                     * 以前用 url.contains("music.163.com")，
-                     * https://evil.example/?music.163.com 这种 URL 能直接绕过。
-                     */
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                        if (url == null) return false;
-                        if (url.startsWith("about:") || url.startsWith("javascript:")) return false;
-                        if (isNeteaseHost(url)) return false;
-                        LogBridge.add(MainActivity.this, "LOGIN", "block external nav " + url);
-                        return true;   // 拦掉站外跳转，留在登录页
-                    }
-
-                    /** targetSdk 24+ 的命中走这里（新签名优先，避免只实现旧的那个） */
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
-                        return shouldOverrideUrlLoading(view, req == null || req.getUrl() == null
-                                ? null : req.getUrl().toString());
-                    }
-                });
-
-                loginLayer.addView(loginWeb, new FrameLayout.LayoutParams(-1, -1));
-                parent.addView(loginLayer, new FrameLayout.LayoutParams(-1, -1));
-                loginWeb.loadUrl(qr
-                        ? "https://music.163.com/#/login"
-                        : "https://music.163.com/login?targetUrl=%2F");
-                startLoginPoll(cbId);
-            } catch (Throwable e) {
-                CrashLog.recordAsync(this, "login-open", e);
-                closeLogin();
-                replyToWeb(cbId, "{\"code\":-1,\"msg\":\"登录页打不开\"}");
-            }
-        });
-    }
-
-    /**
-     * 是不是网易云自己的域名。
+     * 而前端 `Netease.login()` 已无任何调用方（grep 仅命中定义本身）。
+     * 留着不只是死代码：它在主 Activity 上叠第二个 WebView 并暴露
+     * @JavascriptInterface，是额外的攻击面；两份注释还互相矛盾
+     * （HttpBridge 头注释说在用、NeteaseClient 说不再用）。
      *
-     * 必须用解析出来的 host 做后缀比较 —— 字符串 contains 会被
-     * "https://evil.example/?music.163.com" 这种 URL 绕过。
-     * 后缀比较也要带上点，否则 "notmusic.163.com.evil.com" 会被误判：
-     *   允许：music.163.com / 163.com / *.163.com / *.126.net / *.127.net
+     * 现在扫码登录只走 NeteaseClient 的普通命令通道，这条链整体移除。
      */
-    private static boolean isNeteaseHost(String url) {
-        try {
-            String host = Uri.parse(url).getHost();
-            if (host == null) return false;
-            host = host.toLowerCase(Locale.US);
-            return host.equals("163.com") || host.endsWith(".163.com")
-                    || host.equals("126.net") || host.endsWith(".126.net")
-                    || host.equals("127.net") || host.endsWith(".127.net");
-        } catch (Throwable e) {
-            return false;
-        }
-    }
-
-    /**
-     * 把一整串 cookie 写回 WebView。
-     * 取消登录时的回滚不能直接 setCookie("MUSIC_U=; Max-Age=0")，因为我们要恢复的是
-     * 原来的每一项（MUSIC_U / __csrf / NMTID …），逐项写回才能和打开登录页前一致。
-     *
-     * R-09：getCookie() 返回的是 "name=value; name=value" 这种**没有属性**的串，
-     * 所以 Domain / Expires 在这一步已经丢了。折中方案：
-     *   · 已知会话 cookie 默认 Path=/，并且补上 Domain=.music.163.com，
-     *     这样 api 子域也能拿到（music.163.com 下发的 cookie 默认就是整站）；
-     *   · 已经带属性的（理论上不会有，getCookie 不返回属性）不重复拼。
-     */
-    private static void restoreCookie(String cookies) {
-        try {
-            CookieManager cm = CookieManager.getInstance();
-            for (String part : cookies.split(";")) {
-                String p = part.trim();
-                if (p.isEmpty()) continue;
-                int eq = p.indexOf('=');
-                if (eq <= 0) continue;
-                cm.setCookie("https://music.163.com", p + "; Path=/; Domain=.music.163.com");
-            }
-            cm.flush();
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 从 cookie 串里取 MUSIC_U 的值 */
-    private static String muscU(String cookies) {
-        if (cookies == null) return null;
-        for (String part : cookies.split(";")) {
-            String p = part.trim();
-            if (p.startsWith("MUSIC_U=")) {
-                String v = p.substring(8).trim();
-                return v.isEmpty() ? null : v;
-            }
-        }
-        return null;
-    }
-
-    /** 登录页是半 SPA，扫码成功后不一定再触发 onPageFinished，所以轮询 cookie */
-    /**
-     * 登录轮询。
-     *
-     * 以前每 900ms 无上限地跑，直到用户关掉登录层。而每次 harvestLogin 命中新
-     * cookie 都会起一个线程跑 status()（内部 4 个 POST）。用户把登录页晾在那儿时，
-     * cookie 被服务端反复刷新 → 反复起线程、反复发请求。
-     * 现在：总次数有上限（约 5 分钟），且两次 status 之间有去抖。
-     */
-    private void startLoginPoll(final String cbId) {
-        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
-        final Runnable[] task = new Runnable[1];
-        final int[] ticks = new int[]{0};
-        final int MAX_TICKS = 340;      // 340 × 900ms ≈ 5 分钟
-        task[0] = () -> {
-            if (loginLayer == null) return;
-            if (ticks[0]++ > MAX_TICKS) {
-                LogBridge.add(this, "LOGIN", "poll timeout, stop checking");
-                return;
-            }
-            try {
-                harvestLogin(cbId);
-            } catch (Throwable ignored) {
-            }
-            if (loginLayer != null) h.postDelayed(task[0], 900);
-        };
-        // 给登录页留出加载时间，别一打开就判
-        h.postDelayed(task[0], 2000);
-    }
-
-    private void harvestLogin(final String cbId) {
-        if (loginLayer == null) return;
-        // 刚打开的前 1.2 秒不判定，等页面把旧 cookie 清干净
-        if (System.currentTimeMillis() - loginOpenedAt < 1200) return;
-
-        String cookies;
-        try {
-            cookies = CookieManager.getInstance().getCookie("https://music.163.com");
-        } catch (Throwable e) {
-            return;
-        }
-        String token = muscU(cookies);
-        if (token == null) return;
-        if (loginBaseline != null && token.equals(loginBaseline)) {
-            // 还是旧的那个 cookie，说明用户还没真的登录
-            return;
-        }
-        if (netease == null) return;
-
-        netease.setCookie(cookies);
-        /*
-         * 去抖：这个 token 已经**验证成功**过就别再验一遍。
-         * 轮询每 900ms 跑一次，cookie 不变的情况下以前会反复起线程。
-         * 注意这里不预写 loginVerifiedToken —— 失败也要能重试（见下面线程里）。
-         * 两次校验的间隔随连续失败次数指数放宽（4s → 8s → 16s → 30s 封顶），
-         * 这样既不会「失败一次就永久卡死」，也不会变成每 4 秒一轮的请求风暴。
-         */
-        if (token.equals(loginVerifiedToken)) return;
-        if (System.currentTimeMillis() - loginLastVerifyAt < verifyCooldownMs()) return;
-        loginLastVerifyAt = System.currentTimeMillis();
-
-        final String id = (cbId == null || cbId.isEmpty()) ? pendingLoginCb : cbId;
-        final String verifying = token;
-        LogBridge.add(this, "LOGIN", "got new MUSIC_U, verifying...");
-
-        new Thread(() -> {
-            String payload;
-            boolean ok = false;
-            try {
-                payload = netease.call("status", null);
-                ok = hasProfile(payload);
-            } catch (Throwable e) {
-                CrashLog.recordAsync(MainActivity.this, "login-status", e);
-                payload = "{\"code\":-1,\"msg\":\"登录后读取账号失败\"}";
-            }
-            LogBridge.add(MainActivity.this, "LOGIN", ok ? "verify ok" : "verify failed");
-            if (!ok) {
-                /*
-                 * B-2：cookie 有了但账号无效（限流/瞬时断网等），保持页面开着让用户重试。
-                 * 关键是把「已验证」的 token 清掉，否则同一 token 再也不会重试，
-                 * 用户点「我已登录」也没反应，只能杀 App 重来。
-                 * loginLastVerifyAt 不复位：保留冷却窗口，靠 verifyCooldownMs() 随失败次数放宽，
-                 * 避免轮询每 900ms 就再发一轮 status()（每次 4 个 POST，会触发服务端限流）。
-                 * 手动点「我已登录」走 finishLoginFromWeb，那里会把冷却清零立即重试。
-                 */
-                loginVerifiedToken = null;
-                if (loginVerifyFailures < 8) loginVerifyFailures++;
-                return;
-            }
-            loginVerifiedToken = verifying;
-            loginSucceeded = true;
-            loginVerifyFailures = 0;
-            runOnUiThread(MainActivity.this::closeLogin);
-            replyToWeb(id, payload);
-        }, "ripple-login").start();
-    }
-
-    /** 用 JSON 解析判断账号是否有效（字符串包含判断会被嵌套的 "profile":null 骗到） */
-    private static boolean hasProfile(String payload) {
-        if (payload == null || payload.isEmpty()) return false;
-        try {
-            org.json.JSONObject o = new org.json.JSONObject(payload);
-            return o.optJSONObject("profile") != null;
-        } catch (Throwable e) {
-            return false;
-        }
-    }
-
-    /**
-     * 自动校验的冷却时间：连续失败越多，间隔越长（4s / 8s / 16s / 30s 封顶）。
-     * 目的是「允许重试」和「不刷爆网易云接口」之间取平衡。
-     */
-    private long verifyCooldownMs() {
-        int n = loginVerifyFailures;
-        if (n <= 0) return 4000;
-        if (n == 1) return 8000;
-        if (n == 2) return 16000;
-        return 30000;
-    }
-
-    private void closeLogin() {
-        runOnUiThread(() -> {
-            try {
-                /*
-                 * B-1：本次登录没成功（用户点返回/遮罩/取消）就把打开登录页前
-                 * 备份的 cookie 原样写回。不写回的话，WebView 里的 MUSIC_U 已经被删，
-                 * 而 NeteaseClient 里还留着旧的 —— 两套状态从此不一致，
-                 * 用户表现为「明明登录过却要重新登录」。
-                 */
-                if (!loginSucceeded && loginBackupCookies != null) {
-                    try {
-                        restoreCookie(loginBackupCookies);
-                        LogBridge.add(this, "LOGIN", "cancel: restored previous cookie");
-                    } catch (Throwable ignored) {
-                    }
-                }
-                loginBackupCookies = null;
-                loginSucceeded = false;
-
-                if (loginLayer == null) return;
-                ViewGroup parent = (ViewGroup) loginLayer.getParent();
-                if (parent != null) parent.removeView(loginLayer);
-                if (loginWeb != null) {
-                    loginWeb.loadUrl("about:blank");
-                    loginWeb.destroy();
-                    loginWeb = null;
-                }
-                loginLayer = null;
-            } catch (Throwable ignored) {
-                loginLayer = null;
-                loginWeb = null;
-                loginBackupCookies = null;
-                loginSucceeded = false;
-            }
-        });
-    }
-
-    void closeLoginFromWeb() {
-        closeLogin();
-    }
-
-    void finishLoginFromWeb(String cbId) {
-        // 用户手动点「我已登录」：跳过基线判定，直接验证当前 cookie
-        loginBaseline = null;
-        loginOpenedAt = 0;
-        // B-2：手动重试必须无条件放开去抖，否则上一次失败记下的冷却会把用户挡回去
-        loginVerifiedToken = null;
-        loginLastVerifyAt = 0;
-        loginVerifyFailures = 0;
-        harvestLogin(cbId);
-    }
 
     /* ================= 回调网页 ================= */
 
@@ -1128,10 +784,6 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (loginLayer != null) {
-            closeLogin();
-            return;
-        }
         /*
          * 渲染进程崩溃后 web 会短暂为 null（重建期间）。
          * 此时不能再 evaluateJavascript —— 那个回调永远不会来，返回键等于失灵，
@@ -1709,16 +1361,6 @@ public class MainActivity extends Activity {
                 o.hide();
             }
             lyricOverlay = null;
-        } catch (Throwable ignored) {
-        }
-        // 登录用的 WebView 也要一起销毁，否则会一直持有 Activity 引用（内存泄漏）
-        try {
-            if (loginWeb != null) {
-                loginWeb.loadUrl("about:blank");
-                loginWeb.destroy();
-                loginWeb = null;
-            }
-            loginLayer = null;
         } catch (Throwable ignored) {
         }
         /*

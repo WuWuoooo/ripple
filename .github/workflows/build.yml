@@ -47,6 +47,16 @@ jobs:
       # 目前只覆盖 app/js/lrc.js：LRC 解析、同时间戳去重、原文/译文最近邻合并。
       # 走 tests/run.sh 而不是直接 `node --test tests/`：目录参数在部分 Node 构建
       #（含本机 24.22.1）上会报 ERR_UNSUPPORTED_DIR_IMPORT，脚本里显式展开文件列表。
+      # 审查 3.1：这是本仓库**头号缺陷模式**的结构性防护。
+      #
+      # 四轮审查里最集中的主题都是「同一份名单抄成多份，然后各走各的」——
+      # 1.3.0 又复发四处（扫码状态码漏 803 → 扫码登录全断；Rust 上游路径写错 →
+      # 桌面漫游 404；首页缓存清理漏项；版本号四处漂移）。
+      # 这类缺陷单看任何一处都「读起来没问题」，只有把几处放一起比才看得出来，
+      # 所以最有效的办法不是「注意一点」，而是让机器替人比对。
+      - name: 名单一致性（三端命令/路径/状态码/版本号）
+        run: node scripts/check-manifest-consistency.js
+
       - name: 单元测试
         run: bash tests/run.sh
 
@@ -210,6 +220,31 @@ jobs:
             echo "::error::缺少 app/sw.js"
             bad=1
           fi
+
+          # ------------------------------------------------------------------
+          # 审查 U-05：桌面端三处版本副本也必须在这里校验。
+          #
+          # 以前这段只覆盖 Android 侧 5 处，桌面端两个副本（Cargo.toml / Cargo.lock）
+          # 无人看管 —— 这正是 D-02「Cargo.toml 停在 1.2.3」能长期存活的原因。
+          # 现在两个 workflow 交叉校验：Android 这边也查桌面端。
+          # ------------------------------------------------------------------
+          if [ -f desktop/src-tauri/tauri.conf.json ]; then
+            CONF=$(python3 -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")
+            [ "$CONF" = "$VN" ] \
+              || { echo "::error::desktop/src-tauri/tauri.conf.json 版本 $CONF ≠ version.json $VN"; bad=1; }
+            CV=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)
+            [ "$CV" = "$VN" ] \
+              || { echo "::error::Cargo.toml [package] version $CV ≠ version.json $VN"; bad=1; }
+            CLV=$(awk '/^name = "ripple-desktop"$/{f=1;next} f && /^version = /{gsub(/[^0-9.]/,"");print;exit}' \
+                    desktop/src-tauri/Cargo.lock)
+            [ "$CLV" = "$VN" ] \
+              || { echo "::error::Cargo.lock 的 ripple-desktop 版本 $CLV ≠ version.json $VN"; bad=1; }
+            echo "桌面端版本副本：tauri.conf.json=$CONF Cargo.toml=$CV Cargo.lock=$CLV"
+          else
+            echo "::error::缺少 desktop/src-tauri/ 目录"
+            bad=1
+          fi
+
           exit $bad
 
   build:

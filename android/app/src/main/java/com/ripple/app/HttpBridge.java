@@ -22,7 +22,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  *  网页只发命令名和参数，不再需要自建代理（老接口 /api/search/get 明文那套已弃用）。
  *
  *  其余保留：notify（低优先级静默通知，不打断播放）、
- *  login / loginClose / loginFinish（内嵌官方登录页）、
  *  mediaState / mediaProgress / setPlaying（通知栏与计时器联动）、
  *  日志与状态栏歌词那一组。
  *
@@ -44,11 +43,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  *      这是当初 E-06 那条「服务被 FGS 白养」的成因之一）。
  *    · lockLyricOverlay —— 浮层锁定状态由 showLyricOverlay 一次带下去，前端没有
  *      「运行中改锁定」的需求，MainActivity 侧也无内部调用方。
- *
- *  == 保留但前端也暂时零调用（不是漏删，理由在此）==
- *    · loginFinish —— 见其方法注释：B-2 承诺的「我已登录」手动重试入口，
- *      前端按钮还没接。删掉等于把「登录被限流时用户唯一能自救的动作」一起删了，
- *      所以保留并把契约写清楚，等前端补按钮。
+ *    · login / loginClose / loginFinish —— 1.3.0 起三端统一走扫码登录
+ *      （普通命令通道 login_qr_key / login_qr_check），不再需要内嵌 WebView
+ *      登录页；前端 Netease.login() 也已无调用方。详见下面那段说明。
  */
 public class HttpBridge {
 
@@ -145,44 +142,23 @@ public class HttpBridge {
         }
     }
 
-    /**
-     * 打开官方登录页；登录成功后回调 cbId，payload 是 status 接口的返回
-     * @param mode "phone" = 手机号/短信登录，"qr" = 扫码登录
+    /*
+     * 审查 AND-02：内嵌 WebView 登录链的三个桥方法已删除
+     * （login / loginClose / loginFinish）。
+     *
+     * 理由：
+     *   · 三端从 1.3.0 起统一走扫码登录（app.js 的 chooseLoginMode → startQrLogin），
+     *     走的是普通命令通道 login_qr_key / login_qr_check，不碰这里；
+     *   · 前端 `Netease.login()` / `loginCancel()` 已无任何调用方
+     *     （全目录 grep 只命中定义本身）；
+     *   · 留着的实际代价不是「多几行」：`login` 会在主 Activity 上叠第二个 WebView
+     *     加载 music.163.com，并暴露 @JavascriptInterface —— 是额外的攻击面；
+     *     而本文件头注释还宣称在用、NeteaseClient 的注释却写着「不再用内嵌登录页」，
+     *     两份注释互相矛盾，后来人无法判断哪句是真的。
+     *
+     * 如果将来真要恢复内嵌登录页，正确做法是连同 MainActivity 的登录浮层、
+     * 前端登录按钮一起加回来（上轮 J-07 就是按「前端零调用就删」的口径删的）。
      */
-    @JavascriptInterface
-    public void login(final String mode, final String cbId) {
-        act.openLogin(mode == null ? "phone" : mode, cbId);
-    }
-
-    @JavascriptInterface
-    public void loginClose() {
-        act.closeLoginFromWeb();
-    }
-
-    /**
-     * 用户手动点「我已登录」→ 立刻放弃冷却、重新校验当前 cookie（J-06）。
-     *
-     * 保留理由：登录被网易云限流时，自动轮询的冷却会指数放宽到 30 秒封顶，
-     * 用户看不出「其实只是在等」，会以为卡死。这个入口让用户能主动推一把。
-     *
-     * 现状要写清（审查 1.2.2 的 J-06 就是骂这里「注释承诺了按钮，前端压根没有」）：
-     * **前端目前没有任何按钮调用它**（全目录 grep `loginFinish` 零命中）。
-     * 要么前端在登录浮层补一个「我已登录」按钮，要么这条桥方法应连同
-     * MainActivity.finishLoginFromWeb 一起删 —— 二选一，别留半截。
-     *
-     * 契约（前端补按钮时照这个接）：
-     *   · 前端：`RippleNative.loginFinish(cbId)`
-     *   · 时机：登录浮层还开着、用户刚在手机/网页上完成扫码或短信验证时手动点按；
-     *   · 回调：校验成功 → `window.__rippleNativeResult(cbId, <status 接口的 JSON>)`
-     *     然后登录层自动关闭；校验失败 → **没有回调**（Java 侧保持登录层开着，
-     *     用户可以再点一次，冷却已清零所以会立即重试）。
-     *   · cbId：要跟 `RippleNative.login(mode, cbId)` 用同一套 `__rippleNativeResult`
-     *     pending 表；传空串则回落到打开登录页时那个 pendingLoginCb。
-     */
-    @JavascriptInterface
-    public void loginFinish(String cbId) {
-        act.finishLoginFromWeb(cbId);
-    }
 
     /* ================= 通用 ================= */
 

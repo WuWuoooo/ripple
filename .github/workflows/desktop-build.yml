@@ -25,6 +25,9 @@ on:
     paths:
       - 'desktop/**'
       - 'app/**'
+      # 审查 U-05（BLD-26）：改 version.json 也必须触发桌面端校验 ——
+      # 它是版本号的唯一来源，桌面端两个副本由同步脚本写，没这条就漏测。
+      - 'version.json'
   workflow_dispatch:
 
 concurrency:
@@ -280,6 +283,12 @@ jobs:
             echo "tar.gz 已产出"
           else
             cp "$REL/ripple.exe" "$STAGE/Ripple.exe" 2>/dev/null || true
+            # 审查 U-19（BLD-25）：7z 是 GitHub runner 预装的，但真要缺了整个 job 会
+            # 莫名其妙地失败。先检查一下，缺了给一句能看懂的错。
+            if ! command -v 7z >/dev/null 2>&1; then
+              echo "::error::找不到 7z（GitHub runner 通常预装 p7zip）。Windows zip 产物无法生成。"
+              exit 1
+            fi
             (cd "$STAGE" && 7z a -tzip "$GITHUB_WORKSPACE/Ripple-${VN}-windows-x64.zip" Ripple.exe > /dev/null)
             echo "zip 已产出"
           fi

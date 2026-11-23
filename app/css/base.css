@@ -399,7 +399,15 @@ html:not(.perf-low) .dock-inner{
       rgba(255,255,255,0) 68%,
       rgba(255,255,255,var(--dk-s3)) 100%),
     linear-gradient(180deg,rgba(255,255,255,.06) 0%,transparent 34%,rgba(0,0,0,.05) 100%),
-    var(--glass);
+    /*
+     * 审查 U-13：这里以前直接铺 var(--glass)，把底层底色整个盖住 ——
+     * 而 --dock-bg 在 :root / 浅色块里各定义了一份（深色 .66 黑 / 浅色 .78 白），
+     * 两套值从来没有任何消费者，属于「看起来在工作其实没接线」。
+     *
+     * 现在用 --dock-bg 作为**最底层**：玻璃渐变仍叠在上面负责反射质感，
+     * 底色由主题决定 —— 浅色主题的 dock 不再透出深色底、深色主题也不会发灰。
+     */
+    var(--dock-bg, var(--glass));
   /* 边缘的厚度感：上缘一条亮线、下缘一条暗线、外圈一圈内亮边 */
   box-shadow:
     var(--shadow),
@@ -461,7 +469,6 @@ html:not(.perf-low) .dock-inner{
 .row .r-fmt.vip{color:var(--gold);border-color:var(--gold-line)}
 .row .r-du{font-size:10.5px;color:var(--text3);font-variant-numeric:tabular-nums;flex:none}
 .row.on .r-tx b{color:var(--accent)}
-.row .r-al{display:none}
 
 /* ---------- 全屏播放 ---------- */
 /*
@@ -1243,10 +1250,18 @@ body.no-cover .np-bg{opacity:0}
      「再按一次返回退出」这类提示出现的 2.5 秒里，正好盖住歌名和控制区
      （pointer-events:none 不挡点击，但挡视线，看着像界面坏了）。
    146 = 138（让开 dock 顶边）+ 8（呼吸余量）。
-   窄屏（<360px）的 dock 是 bottom +72 / 高 54 → 顶边 +126，146 在那档只会更宽松。 */
+   窄屏（<360px）的 dock 是 bottom +72 / 高 54 → 顶边 +126，146 在那档只会更宽松。
+
+   审查 U-17（CSS-15）：宽屏档（左侧栏那套）把 dock 改成了 bottom = safe-b + 13，
+   而这里还按 +78 推 146 —— 实测 1280×800 时 toast 底在 146、dock 顶在 73，
+   中间空出一大条 73px，提示浮在半空看着像没对齐。
+   现在用一个变量承接「让开 dock 所需的高度」，各档自己覆盖：
+     · 手机档（默认）：146
+     · 宽屏/平板档：dock 顶边 = safe-b + 13 + 60 = 73，再 +8 呼吸 → 81
+*/
 .toasts.bottom{
   top:auto;left:50%;right:auto;transform:translateX(-50%);
-  bottom:calc(var(--safe-b) + 146px);
+  bottom:calc(var(--safe-b) + var(--toast-dock-clear, 146px));
   width:auto;max-width:min(90vw,380px);
   align-items:center;gap:6px;
 }

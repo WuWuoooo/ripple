@@ -51,7 +51,7 @@ The output is at `android/build-manual/Ripple-<version>-debug.apk`.
 
 ### Version Sync Checklist (All Automatically Written by `android/sync-version.sh`; **Do Not Edit Manually**)
 
-`build-apk.sh` calls `android/sync-version.sh` at the beginning; the Gradle path (`./gradlew assembleDebug`)
+`build-apk.sh` calls `android/sync-version.sh` at the beginning; the Gradle path (`gradle assembleDebug`)
 also calls the same script, so the version numbers of the two build paths will not diverge.
 
 | File | What Is Written | Source |

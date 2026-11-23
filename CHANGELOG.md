@@ -61,6 +61,180 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
 
 ---
 
+## 1.3.2 — 第九个版本
+
+> **本次依据**：1.3.1 那节「这一版没做的事」的清单 —— 即 1.3.0 审查报告的
+> 第三批（下个小版本）+ 第四批（技术债），全部做完。
+> **审查与整改执行**：Deepseek V4.1 Flash 1017。
+>
+> 这一版不新增功能，把上一版如实留下的欠账清干净。
+
+### 一、第三批：交互与可访问性
+
+- **E-05 [medium] 播放设置面板拖滑块看不到数值气泡**
+  同一事件内先开后关：`input` 处理器先 `paintSlider(el, true)` 点亮气泡，
+  紧接着无条件 `syncOptSheet()` 又把它关掉 —— 1.2.2 专门修过的「气泡显示裸数字
+  0.85 / 1.05」因此一次都没被看见，等于修了个不可见的东西。
+  修法：`syncOptSheet({ keepTip: true })` + `paintSlider` 支持 `null`（只更新填充与
+  文字、不动气泡显隐）；`change`（真正松手）与初次渲染仍按默认收气泡。
+- **E-06 [medium] 「换一首」第二次起永远挑到同一首**
+  以前是 `use[(dayKey + (force ? 1 : 0)) % use.length]` —— `dayKey` 与 `use.length`
+  同日内都不变，所以**每一次** force 都算出同一个下标（连点两次挑到同一首，
+  注释还写着「否则点了等于没点」）。改成单调递增游标，换种子时重置。
+- **E-08 / E-09 [medium] 队列行与设置行不可键盘访问**
+  1.2.3 的可访问性整改给列表行补了语义，但**队列模板没跟进**、**设置页 37 个
+  `.set-row` 全是裸 `div`** —— 结果是「能 Tab 到的都是控件、点不动的都是行」，
+  恰好把一半入口排除在无障碍树外。
+  修法：`.qitem` 补 `role`/`tabindex`/`aria-label`（含「正在播放」与第几首）；
+  逐个判定 `.set-row` 的可点性后给 **17 个**补语义（另外 2 个含 `<button role=switch>`
+  的行**故意不加** —— 加了会变成「按钮套开关」，读屏念两遍、Enter 行为歧义）；
+  键盘委派白名单同步补 `.qitem[tabindex]` / `.set-row[tabindex]`。
+  实测：设置页 37 行 → 17 行可 Tab、17 个都有 aria-label。
+- **E-16 [medium] `localStorage` 写满后设置永久不落盘且零提示**
+  两处 `save()` / `saveProgress()` 的空 `catch` 把 `QuotaExceededError` 静默吞掉：
+  「内存里改了、磁盘没改」可以持续整个会话，用户只看到「设了又变回去」，
+  而开发者从日志里找不到任何痕迹。
+  修法：首次失败先**瘦身重试一次**（history 200→100、onlineCache 60→30，多数情况
+  这一下就救回来了）；仍失败则记日志 + 弹一次 toast（`_saveFailed` 防刷屏），
+  进度写盘失败只记日志不打扰。
+
+### 二、第三批：布局细节
+
+- **U-14 [low] 平板/挖孔设备的播放页顶部与底部胶囊位置**
+  - CSS-06：宽屏档 `.np-inner` 的 top padding 写死 `8px`，而该档**同时覆盖 Android
+    平板/折叠屏**（edge-to-edge 下 `--safe-t` 是 24~32px）→ 播放页顶部「收起」按钮
+    与歌名被状态栏压住。改成 `calc(var(--safe-t) + 8px)`。
+  - CSS-10：手机横屏 + 挖孔设备时 `.tabbar` 用写死的 `left/right:12px`，而 `.dock`
+    让开了安全区 → 两者差 **44px**（实测 tabbar left=12 vs dock left=56）。
+    统一成 `calc(var(--safe-l/r) + 12px)`。实测修复后两者同为 12。
+- **U-17 [low] 其他布局细节**
+  - CSS-09：展开歌词时只有 `grid-template-rows` 有过渡、columns 瞬变 →
+    实测 1280×800 下 meta 的 left 从 680 一下跳到 44。两轴一起过渡。
+  - CSS-13：侧栏三个块的图标左沿不齐（实测 8 / 16 / 17）。按「容器 padding +
+    块偏移 + 自身 padding = 同一基准」把三处算式各自写准，**实测校准到 16 / 16 / 16**。
+    （刻意不用共享变量：三者算式不同，共享反而对不齐。）
+  - CSS-15：两处注释与实现不符 —— `--rail-w` 注释写「取 112」实际 138；
+    toast 的 `bottom` 按「dock 在 +78」推 146，而宽屏档 dock 已改成 `safe-b + 13`
+    → 实测 toast 底 146 而 dock 顶 73，空出 73px。改用 `--toast-dock-clear` 变量，
+    宽屏档覆盖为 81。
+- **U-13 [low] 死 CSS / 死配置**
+  - `.login-opt` 整块 12 条（登录已改扫码弹窗，HTML/JS 零命中）→ 删除
+  - `.row .r-al` 死规则 → 删除
+  - `--dock-bg` 两套值**从未生效**（被 `html:not(.perf-low) .dock-inner` 的
+    `background` 简写整条覆盖）→ 接进背景栈最底层，深浅两套底色这才真正起作用
+  - `--h`：JS 写着 `setProperty('--h', …)` 且注释承诺「竖条高度跟着走」，
+    而全仓 `var(--h)` **零消费**（均衡器竖条其实是原生 range 旋转画的）→
+    删掉这条没兑现的承诺，并在注释里说清竖条的真实实现。
+
+### 三、第三批：服务端
+
+- **S-06 [medium] IPv6 网卡的 Host 判定与自身文案自相矛盾**
+  白名单只存**裸** IPv6，而浏览器发来的 Host **一定带方括号** → `hostKey` 保留方括号，
+  与集合里的裸地址永不相等 → 双栈环境下 IPv6 访问一律 421，而 421 正文拼出来的
+  替代地址照着点**还是 421**，用户无法自救。
+  修法：白名单同时收裸地址与 `[地址]` 两种写法；421 正文做去重展示。
+- **S-12 [low] 解码后含 NUL 的路径回 500**
+  `decodeURIComponent('/a%00.js')` 不抛（`%00` 是合法转义），带着 `\0` 一路走到
+  `fs.statSync` 抛 TypeError → 被兜成 500。语义上应是 400，且一个**不需要令牌**的
+  GET 就能无限刷日志。修法：解码后立刻拒空字节。
+- **S-13 [medium] `server.js` 的 HTTP 行为零测试**
+  根因是 `require('./server.js')` 会直接 listen，测试一加载就占端口。
+  修法：导出 `{ server, PORT, allowedHosts, tokenStats }` 且**只在被直接执行时**才
+  listen（`require.main === module`），行为与以前完全一致。
+  配套新增 `tests/server-http.test.js`，用真实 http 请求打真实实例
+  （临时端口 + 隔离 data-dir）覆盖审查点名的 6 个盲区：
+  Host 放行/421、令牌签发与 401、`/ncm` 只收 POST、路径穿越 + `%00` + 畸形转义、
+  300KB body → 413、logout 后 cookie 落盘为空；另加启动参数非法退出码。
+
+### 四、第三批 / 第四批：Android 原生
+
+- **AND-02 [high] 删掉彻底死掉的 WebView 登录链（350 行）**
+  1.3.0 起三端统一走扫码，而内嵌登录页那条链**零调用**：前端 `Netease.login()`
+  grep 只命中定义本身，`openLogin` 等 10 个方法、9 个 `login*` 字段、
+  3 个 `@JavascriptInterface` 桥方法全都没人用。
+  留着的实际代价不只是「多几行」：它在主 Activity 上叠第二个 WebView 加载
+  music.163.com 并暴露 JS 接口，是额外攻击面；而两份注释互相矛盾
+  （HttpBridge 说在用、NeteaseClient 说不再用），后来人无法判断哪句是真的。
+  修法：Java 侧 350 行 + 前端 `login()`/`loginCancel()` + 三个桥方法一并删除，
+  原位置留一段说明「为什么删、将来要恢复该连 UI 一起加」。
+- **AND-03 [high] 前端补 `__rippleMediaUnavailable` 注册**
+  Java 侧在 `startForegroundService` 与 `startService` **双双**失败时会调这个回调，
+  而 `app/` 全目录 grep **零命中** —— 调用点有 `&&` 短接所以不报错，等于整条
+  「为什么通知栏控制不了」的提示通道是死的。
+  而这**不是边角路径**：该分支只在「服务没了、网页还在播」时走，那时 App 几乎必然
+  在后台，targetSdk 34 下后台 startForegroundService 会被 Android 12+ 直接拒 ——
+  「双双失败」正是主干。
+  修法：注册该函数，5 分钟内只提示一次（原契约明确说「每秒可能调一次，前端自己
+  去重」），并记一条带计数的日志。
+- **AND-04 [medium] 错误日志与真崩溃共用配额**
+  `recordAsync` 有 35 个调用点，全部生成 `crash-*.txt` 并与崩溃共用 10 份淘汰配额 ——
+  故障期一秒几十条错误，配额几秒被填满，**最早那份真崩溃报告被删掉**。
+  修法：错误日志改用 `err-` 前缀 + 独立保留 20 份，两套配额互不侵占。
+- **AND-05 [medium] 冷启动在主线程读最多 5 份进程 trace**
+  `getTraceInputStream()` 读到 EOF 且**无长度上限**，单份可达 MB 级，全压在
+  `Application.onCreate` 上。J-01/J-05 只把**写盘**挪到后台了，读盘留在主线程更重。
+  修法：整段挪到后台线程 + 单份限 256KB（超出截断并注明）。
+
+### 五、第四批：构建与仓库卫生
+
+- **「名单一致性」CI 检查（报告点名的「投入产出比最高」项）**
+  新增 `scripts/check-manifest-consistency.js` + 5 条回归测试，检查：
+  A. 三端命令名集合相等（前端 → server.js → Java → Rust）
+  B. 同一命令的三端上游路径逐条相同
+  C. 扫码状态码单一来源（803 必须在白名单、白名单必须由常量驱动）
+  D. 版本号四处一致（version.json / tauri.conf.json / Cargo.toml / Cargo.lock）
+  E. 首页缓存清理只允许一个入口
+  已接入 CI（`build.yml` 的 check job）。
+  **验证它真能抓问题**：把 1.3.0 的四个历史缺陷分别注入临时副本，
+  检查器全部报红 —— 一个抓不到问题的检查器比没有更糟，所以这条也进了测试。
+- **U-05 [medium] CI 版本校验覆盖不到桌面端**
+  `build.yml` 的版本一致性检查以前只覆盖 Android 侧 5 处；现在追加桌面端三处
+  （`tauri.conf.json` / `Cargo.toml` / `Cargo.lock`），两个 workflow 交叉校验。
+  同时给 `desktop-build.yml` 的 `pull_request.paths` 补 `version.json`。
+- **D-07 [medium] 桌面端退出不保证 cookie 落盘 / 没有单实例**
+  - `RunEvent::Exit` 分支以前**只有注释、没有任何代码**（注释说「这里只是兜底」）。
+    现在真的拿共享 Client 写一次盘。
+  - 单实例：本机 cargo 缓存没有 `tauri-plugin-single-instance`（构建是 `--offline`），
+    所以用最小实现 —— 配置目录里持一个 lock 文件并检查 pid 是否存活。
+    Windows 侧明确**不做**（没有 windows-sys 依赖做不出语义正确的版本，宁可做真也不做假）。
+- **U-11 [medium] eslint / prettier 去留**
+  两份配置从未被 CI 或任何脚本执行（项目刻意零依赖、不引前端构建链）。
+  决定**删除** —— 留着只会让贡献者以为存在 lint 门禁。
+  顺带解决 `.prettierrc` 里那个无效键 `insertFinalNewline`。
+- **U-19 其余构建卫生**
+  - Gradle wrapper：仓库**确实没有** `gradlew`，而文档让贡献者跑 `./gradlew assembleDebug`
+    （1.1.0 审查就报过）。决定**不引入 wrapper**（与「零构建链」取向一致），
+    改为在 CONTRIBUTING 里如实写明「没有 wrapper，那条命令跑不了」。
+  - `ISSUE_TEMPLATE/config.yml`：`OWNER/REPO` 占位符 → 真实仓库；`master` → `main`
+    （安全漏洞入口以前是失效的，尤其糟糕）。
+  - `pull_request_template.md` 要求手改 `app/sw.js` 的 `CACHE`，与 CONTRIBUTING
+    的「不要手改，由脚本同步」直接矛盾 → 改成「已跑 `sync-version.sh`」。
+  - `.editorconfig` 的行内注释污染了值（`trim_trailing_whitespace` 实际等于
+    `"false   # 行尾两个空格是硬换行"` 这一整串，导致 Markdown 行尾双空格仍被裁剪）
+    → 注释单独占行。
+  - `desktop-build.yml` 依赖预装的 `7z` 但无检查 → 加 `command -v` 并给可读的错误。
+
+### 六、回归测试：93 → 105（新增 12 条）
+
+- `tests/server-http.test.js`（7 条）：服务端 HTTP e2e，覆盖 S-13 点名的 6 个盲区。
+- `tests/manifest-consistency.test.js`（5 条）：名单检查器自身的回归 ——
+  1 条断言「当前仓库必须通过」，4 条注入历史缺陷（D-09 路径漂移 / G-01 状态码漏项 /
+  G-01 白名单绕过常量 / D-02 版本漂移）断言**都能被抓出来**。
+
+### 七、这一版没做的事（诚实说明）
+
+- **桌面端托盘 / SMTC / MPRIS 媒体控制**：确实没有，仍需系统级集成。
+- **歌词置顶小窗**：确实没有。
+- **Windows 真单实例**：如上，缺依赖做不出语义正确的版本，选择不做而非做假。
+- **Gradle wrapper**：决定不引入（见上）。
+- **`server.js` 拆成可注入的 `createServer({dataDir, upstream})` 工厂**：
+  这一版做到了「可测」（require 不抢端口 + 12 条 e2e），但**没有**做成完整工厂 ——
+  全局状态（cookie jar / 令牌表 / 数据目录）都还绑在模块作用域上，
+  同一进程内只能有一个实例。完整的工厂化改动面覆盖 1300 行，风险大于收益，
+  留作后续真正需要「同进程多实例」时再做。
+
+---
+
 ## 1.3.1 — 第八个版本
 
 > **本次整改依据**：`docs/code_review_record/代码审查_1.3.0.md`（1.3.0 全量审查，

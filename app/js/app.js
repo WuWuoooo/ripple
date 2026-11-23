@@ -842,15 +842,36 @@
         /*
          * 挑一首当 hero：跳过种子本身（否则封面和「当前播放」重复），
          * 按天做确定性随机，同一天内不会每次刷新都跳。
-         * force 时错开一位，否则同一天同一批候选永远挑到同一首，
-         * 「换一首」点了等于没点。
+         *
+         * 审查 E-06：force 必须用**单调递增游标**，不能写 `dayKey + 1`。
+         *
+         * 以前是 `use[(dayKey + (force ? 1 : 0)) % use.length]` ——
+         * 而 dayKey 与 use.length 在同一天内都不变，所以**每一次** force
+         * 都算出同一个下标：连点两次「换一首」，第二次挑到的还是同一首
+         * （toast 报同一个歌名、封面也不变，因为 _homeSig 因 hero.id 未变而短路）。
+         * 注释还写着「否则点了等于没点」——只错开一位并没有解决它。
+         *
+         * 现在维护一个只增不减的游标，每次 force 前进一格，转一圈才回到原点。
+         * 非 force（首屏/切页）仍按 dayKey 确定性挑，保证同一天进来看到同一首。
          */
         const pool = list.filter((x) => x && x.neId && x.neId !== seed.neId);
         const use = pool.length ? pool : list;
         if (!use.length) return null;
         const d = new Date();
         const dayKey = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
-        const picked = use[(dayKey + (force ? 1 : 0)) % use.length];
+        let pickedIdx;
+        if (force) {
+          /* 同一个种子的候选池变了（换种子）就重置游标，避免跳得太随机 */
+          if (App._roamHeroCursorSeed !== seed.neId) {
+            App._roamHeroCursorSeed = seed.neId;
+            App._roamHeroCursor = 0;
+          }
+          App._roamHeroCursor = ((App._roamHeroCursor || 0) + 1) % use.length;
+          pickedIdx = App._roamHeroCursor;
+        } else {
+          pickedIdx = dayKey % use.length;
+        }
+        const picked = use[pickedIdx];
         App._roamHero = picked;
         App._roamHeroSeed = seed.neId;
         saveRoamHeroCache(seed.neId, picked);
@@ -2706,13 +2727,30 @@
     const box = $('#npQueue');
     if (!box) return;
     const keep = box.scrollTop;                 // 保留滚动位置，切歌不再跳回顶部
-    box.innerHTML = q.map((t, i) =>
-      `<div class="qitem${Player.track && Player.track.id === t.id ? ' on' : ''}"
-            data-i="${i}" data-id="${esc(t.id)}">
-        <div class="idx">${Player.track && Player.track.id === t.id ? '▮▮' : String(i + 1).padStart(2, '0')}</div>
+    /*
+     * 审查 E-08：队列行必须可键盘访问。
+     *
+     * 1.2.3 的可访问性整改给列表行/卡片补了 role/tabindex/aria-label 与
+     * Enter/Space 委派（见 rowHTML），但**队列模板没跟进**，委派白名单里也没有
+     * .qitem。结果是：Tab 从关闭按钮直接跳出面板，永远进不到队列里的歌；
+     * 读屏也念不出第几首、什么歌。
+     *
+     * 队列是「换一首」的主入口，键盘/读屏用户完全用不了 —— 与 1.2.3 的方向
+     * 自相矛盾（改了 A、漏了同构的 B）。现在补齐语义，并在下面的键盘委派
+     * 选择器里加上 .qitem[tabindex]。
+     */
+    box.innerHTML = q.map((t, i) => {
+      const cur = Player.track && Player.track.id === t.id;
+      const label = (i + 1) + '. ' + (t.title || '') + (t.artist ? ' - ' + t.artist : '')
+        + (cur ? '（正在播放）' : '');
+      return `<div class="qitem${cur ? ' on' : ''}"
+            data-i="${i}" data-id="${esc(t.id)}"
+            role="button" tabindex="0" aria-label="${esc(label)}">
+        <div class="idx">${cur ? '▮▮' : String(i + 1).padStart(2, '0')}</div>
         <div class="tx"><b>${esc(t.title)}</b><span>${esc(t.artist)}</span></div>
         <div class="du">${fmtTime(t.duration)}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     if (keep) box.scrollTop = keep;
   }
 
@@ -2818,15 +2856,29 @@
     bindOptSheet();
   }
 
-  /** 面板内的控件状态与设置保持一致 */
-  function syncOptSheet() {
+  /**
+   * 面板内的控件状态与设置保持一致。
+   *
+   * 审查 E-05：加 opts.keepTip。
+   *
+   * 滑块被拖动时，input 处理器先 paintSlider(el, true) 点亮数值气泡，
+   * 紧接着无条件调 syncOptSheet() —— 而它内部对每个滑块调 paintSlider(el, false)
+   * 把气泡又关掉。同一事件内先开后关，结果是「拖滑块全程一个气泡都看不到」。
+   * 而同样的四项在「我的 → 设置」里正常（那条路径没有 syncOptSheet）。
+   *
+   * 现在 input 路径传 keepTip=true：值照同步、气泡状态不动；
+   * change（真正松手）与初次渲染仍按默认收气泡。
+   */
+  function syncOptSheet(opts) {
     const s = S();
     const body = $('#npOptBody');
     if (!body) return;
+    const keepTip = !!(opts && opts.keepTip);
     $$('[data-opt]', body).forEach((el) => {
       const k = el.dataset.opt;
       el.value = s[k];
-      paintSlider(el, false);
+      /* keepTip 时只更新轨道填充比例，不动气泡的显隐 */
+      paintSlider(el, keepTip ? null : false);
     });
     $$('[data-optseg]', body).forEach((seg) => {
       const k = seg.dataset.optseg;
@@ -2966,7 +3018,11 @@
       paintSlider(el, true);
       applyVars();
       onSettingChange(k, v);
-      syncOptSheet();
+      /*
+       * E-05：传 keepTip —— 否则这一行会把刚点亮的气泡立刻关掉
+       * （同一事件内先开后关，气泡永远看不到）。
+       */
+      syncOptSheet({ keepTip: true });
     });
     body.addEventListener('change', (e) => {
       const el = e.target.closest('[data-opt]');
@@ -3196,8 +3252,17 @@
       const lab = body.querySelector(`[data-eqv="${i}"]`);
       if (lab) lab.textContent = (v > 0 ? '+' : '') + v.toFixed(1);
       Player.setEQBands(arr);
-      // 竖条高度也跟着走，纯 CSS 变量驱动
-      el.parentElement.parentElement.style.setProperty('--h', ((v + 12) / 24 * 100) + '%');
+      /*
+       * 审查 U-13：删掉写 --h 的那行。
+       *
+       * 原来这里写着「竖条高度也跟着走，纯 CSS 变量驱动」并真的 setProperty('--h', …)，
+       * 但全仓 `grep 'var(--h)'` **零命中** —— CSS 从来没有消费过这个变量。
+       * 均衡器的竖条其实是原生 <input type=range> 旋转 90° 后由浏览器自己画的
+       * （见 base.css 的 .eq-track input），没有可被 --h 驱动的自绘元素。
+       *
+       * 也就是说这条注释承诺了一个不存在的机制。与其留一个「看起来在工作
+       * 其实没接线」的变量（下次有人读到这里会以为竖条是自绘的），不如删干净。
+       */
     });
     $('#eqBands').addEventListener('change', () => {
       Store.save();
@@ -4412,6 +4477,10 @@
     lyricOffset: (v) => (v > 0 ? '+' : '') + (+v).toFixed(1) + 's',
   };
 
+  /**
+   * 重绘滑块。
+   * @param {boolean|null} showTip true=点亮气泡 / false=收起气泡 / null=只更新填充与文字、不动气泡显隐
+   */
   function paintSlider(el, showTip) {
     const min = +el.min || 0, max = +el.max || 100, v = +el.value;
     const p = ((v - min) / (max - min)) * 100;
@@ -4442,6 +4511,8 @@
     // thumb 14px 宽，可用轨道宽度 = 容器宽 - 14（容器还有 0 padding）
     const trackW = Math.max(1, wrap.clientWidth - 14);
     tip.style.left = (7 + (p / 100) * trackW) + 'px';
+    /* showTip === null：只更新填充/文字，气泡显隐保持不变（E-05） */
+    if (showTip === null || showTip === undefined) return;
     if (showTip) tip.classList.add('on');
     else tip.classList.remove('on');
   }
@@ -4608,7 +4679,14 @@
       if (e.key !== 'Enter' && e.key !== ' ') return;
       const t = e.target;
       if (!t || !t.matches) return;
-      if (!t.matches('[role="button"][tabindex], .row[tabindex], .gcard[tabindex], .plrow[tabindex], .c-card[tabindex]')) return;
+      /*
+       * 审查 E-08 / E-09：白名单补 .qitem 与 .set-row。
+       *
+       * 只给 DOM 加 role/tabindex 而不加进这里，结果是「能 Tab 到、按 Enter 没反应」——
+       * 比完全不能 Tab 更让人困惑，所以两者必须一起做。
+       */
+      if (!t.matches('[role="button"][tabindex], .row[tabindex], .gcard[tabindex],'
+        + ' .plrow[tabindex], .c-card[tabindex], .qitem[tabindex], .set-row[tabindex]')) return;
       e.preventDefault();
       const active = document.activeElement;
       t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
@@ -6288,6 +6366,46 @@
       Log.err('MEDIA', e, 'mediaState failed');
     }
   }
+
+  /*
+   * 原生：后台播放控件彻底起不来时（审查 AND-03）。
+   *
+   * Java 侧在 startForegroundService 与 startService **双双**失败时会调
+   * `window.__rippleMediaUnavailable(原因类型名)`，但前端此前**从未注册过**
+   * 这个函数 —— 调用点有 `&&` 短接所以不报错，等于「提示通道整条是死的」。
+   * 对照：__rippleNativeResult / __rippleBack / __rippleLyricMoved /
+   * __rippleMediaCmd / __rippleMediaSeek / __rippleNotifyPerm /
+   * __rippleSystemTheme / __rippleViewport 全部有定义，只有它漏了。
+   *
+   * 为什么这条值得修：触发它的不是边角路径 —— `applyMediaNotification` 只在
+   * 「服务已经没了、网页还在播」时才走启动分支，那时 App 几乎必然在后台，
+   * targetSdk 34 下后台 startForegroundService 会被 Android 12+ 直接
+   * 抛 ForegroundServiceStartNotAllowedException，随后的 startService 同样受限。
+   * 所以「双双失败 → 走这条回调」是主干路径，不是意外。
+   * 后果：通知栏/锁屏/耳机控制彻底消失、而且用户完全不知道为什么。
+   *
+   * 契约（见 MainActivity 的调用点注释）：
+   *   · 参数是原因类型名，仅供排查，文案不依赖它；
+   *   · 本函数**每秒可能被调一次**，必须自己去重，不能每秒弹一条 toast。
+   */
+  let _mediaUnavailableShownAt = 0;
+  let _mediaUnavailableCount = 0;
+  window.__rippleMediaUnavailable = function (reason) {
+    _mediaUnavailableCount++;
+    try {
+      Log.add('MEDIA', '后台播放控件不可用（' + (reason || 'unknown') + '），第 '
+        + _mediaUnavailableCount + ' 次上报');
+    } catch (e) {}
+    /*
+     * 去重：5 分钟内只提示一次。用户真正需要知道的是「为什么控制不了」，
+     * 而不是被反复打扰 —— 而且他通常在回 App 之后才看得到。
+     */
+    const now = Date.now();
+    if (now - _mediaUnavailableShownAt < 5 * 60 * 1000) return;
+    _mediaUnavailableShownAt = now;
+    toast('后台播放受系统限制',
+      '通知栏 / 锁屏控制这次起不来，回到应用内即可继续控制播放', 'warn');
+  };
 
   /* 通知栏 / 锁屏 / 耳机键 → 这里的命令 */
   window.__rippleMediaCmd = function (cmd) {

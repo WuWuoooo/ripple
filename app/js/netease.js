@@ -323,93 +323,20 @@
      * 打开官方登录页
      * @param mode 'phone' 手机号登录 | 'qr' 扫码登录
      */
-    async login(mode) {
-      const N = g.RippleNative;
-      if (!N || typeof N.login !== 'function') throw new Error('当前环境不支持账号登录');
-      let timedOut = false;
-      let text;
-      try {
-        text = await new Promise((res, rej) => {
-          const id = 'login_' + (++_seq);
-          const timer = setTimeout(() => {
-            _pending.delete(id);
-            timedOut = true;
-            /*
-             * 超时不能只清自己的 pending 表：原生登录页还开着、Java 侧还会
-             * 继续轮询 cookie 并在成功时回调，而 JS 这边的接收方已经被删掉，
-             * 回调落到 __rippleNativeResult 的「无主回调」分支被吞掉 ——
-             * 用户明明扫码成功了，界面上最后一条消息却是「登录超时」。
-             * 先把登录页收掉（loginCancel → HttpBridge.loginClose），
-             * 让原生侧也停下来，代价是用户可能需要重开一次登录；
-             * 但「真正的已登录」还会由下面的 status() 探测兜住（见 catch）。
-             */
-            try { this.loginCancel(); } catch (e) {}
-            rej(new Error('登录超时（3 分钟）'));
-          }, 180000);
-          _pending.set(id, (t) => { clearTimeout(timer); res(t); });
-          try {
-            N.login(mode || 'phone', id);
-          } catch (e) {
-            clearTimeout(timer);
-            _pending.delete(id);
-            rej(e);
-          }
-        });
-      } catch (e) {
-        /*
-         * 超时路径的自愈：loginCancel 与 Java 侧的「登录成功」是两条独立的时间线，
-         * 存在「cookie 已经写好、回调刚好错过超时」的窗口。这里补一次 status()
-         * 探测 —— 已经登录就当作成功返回，而不是把一次真实的成功报成失败。
-         * 只在超时路径探测：其他错误（登录页打不开等）说明 cookie 根本没写，
-         * 多发一次 status 只会白打 4 个请求。
-         */
-        if (timedOut) {
-          try {
-            const p = await this.status();
-            if (p && p.userId) {
-              try {
-                if (g.Log) g.Log.add('ACCOUNT', '登录回调虽已超时，但账号实际已登录，按成功处理');
-              } catch (_) {}
-              return this._profile;
-            }
-          } catch (_) {}
-        }
-        throw e;
-      }
-      let json = {};
-      try { json = JSON.parse(text || '{}'); } catch (e) {}
-      if (!json.profile) throw new Error('没有读到登录信息，请重试');
-      /*
-       * 登录成功与否只看这个回调（profile 已经在手，cookie 也已写入）。
-       *
-       * 以前这里是 `return this.status()` —— status 内部 4 次串行请求，
-       * 最长 60 秒。它一旦失败/超时，doLogin 就进 catch 弹「登录未完成」，
-       * 但账号其实**已经登录成功**了，用户会反复重试，越试越乱。
-       *
-       * 现在：先把 profile 直接用上（账号卡片立刻正确），
-       * status 只用来补 VIP/等级这类附加信息，失败就算了。
-       */
-      this._profile = {
-        userId: json.profile.userId,
-        nickname: json.profile.nickname,
-        avatar: cover(json.profile.avatarUrl, 200),
-        background: cover(json.profile.backgroundUrl, 800),
-        signature: json.profile.signature || '',
-        level: 0, vip: false, vipLevel: 0, vipIcon: '', vipUntil: 0, likeIds: [],
-      };
-      /* 后台补全资料，失败不影响"登录成功"这个结论 */
-      this.status().then((p) => {
-        if (p) this._profile = p;
-      }).catch((e) => {
-        try { if (g.Log) g.Log.add('ACCOUNT', 'status 补全失败（不影响登录）: ' + e.message); } catch (_) {}
-      });
-      return this._profile;
-    },
-
-    loginCancel() {
-      const N = g.RippleNative;
-      if (N && typeof N.loginClose === 'function') N.loginClose();
-    },
+    /*
+     * 审查 AND-02：`login()` / `loginCancel()` 已删除。
+     *
+     * 这两个方法走的是「内嵌 WebView 登录页」那条链：
+     *   login()       → RippleNative.login(mode, cbId)  → MainActivity.openLogin()
+     *   loginCancel() → RippleNative.loginClose()       → MainActivity.closeLogin()
+     *
+     * 1.3.0 起三端统一走扫码登录（见 app.js 的 chooseLoginMode / startQrLogin），
+     * 用的是普通命令通道 login_qr_key / login_qr_check，完全不经过这里。
+     * 而 `Netease.login()` 全目录 grep **零调用方** —— 删掉后 Java 侧那 350 行
+     * 也已同步移除，前后端不会再出现「一边说在用、一边说不用」的矛盾。
+     *
+     * 如果将来要恢复内嵌登录，正确做法是连 UI 入口一起加回来。
+     */
 
     async logout() {
       try { await this.call('logout', {}); } catch (e) {}

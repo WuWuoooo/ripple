@@ -25,7 +25,7 @@ public class RippleApp extends Application {
      * 正常路径下不起作用 —— 版本号优先从 PackageManager 读（J-04），
      * 免得有人绕开 build-apk.sh 手改版本后，日志里报的还是旧版本。
      */
-    private static final String FALLBACK_VERSION_TAG = "version=1.3.1(131)";
+    private static final String FALLBACK_VERSION_TAG = "version=1.3.2(132)";
 
     @Override
     public void onCreate() {
@@ -40,7 +40,24 @@ public class RippleApp extends Application {
          * installQuietly 内部也有幂等标记，两处都调也只会生效一次。
          */
         CrashLog.installQuietly(getApplicationContext());
-        readPreviousExit(this);
+        /*
+         * 审查 AND-05：readPreviousExit 必须离开主线程。
+         *
+         * 它会遍历最多 5 份进程 trace，每份都用 getTraceInputStream() 读到 EOF
+         * 且**没有任何长度上限** —— 单份可达 MB 级，五份就是几 MB 的同步 IO
+         * 全压在 Application.onCreate 上，直接拖慢冷启动（用户感知是「点开图标
+         * 后卡一下才出画面」）。J-01/J-05 当初只把**写盘**挪到后台了，
+         * 读盘留在主线程而且更重 —— 同一类问题换了个入口复发。
+         *
+         * 这份数据只是「上次怎么死的」的取证信息，迟到几百毫秒完全无害，
+         * 所以直接丢给后台单线程。
+         */
+        new Thread(() -> {
+            try {
+                readPreviousExit(getApplicationContext());
+            } catch (Throwable ignored) {
+            }
+        }, "ripple-exit-read").start();
 
         /*
          * 崩溃自保护：连续多次「没走到前台就重启」才关掉 edge-to-edge。
@@ -71,7 +88,7 @@ public class RippleApp extends Application {
     }
 
     /**
-     * 运行时版本标记（"version=1.3.1(131)" 这种形状）。
+     * 运行时版本标记（"version=1.3.2(132)" 这种形状）。
      * 读不到时回落 FALLBACK_VERSION_TAG；任何异常都不能冒出去 ——
      * 这行日志是启动取证的一部分，不能反过来把启动搞挂。
      */
@@ -112,12 +129,26 @@ public class RippleApp extends Application {
                 try {
                     InputStream in = info.getTraceInputStream();
                     if (in != null) {
+                        /*
+                         * 审查 AND-05：单份 trace 限 256KB。
+                         * 以前读到 EOF 不限长度，单份可达 MB 级 —— 取证只需要
+                         * 调用栈，不需要整个堆转储，256KB 足够放几千帧。
+                         */
+                        final int MAX_TRACE_BYTES = 256 * 1024;
                         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
                         byte[] buf = new byte[4096];
+                        int total = 0;
                         int n;
-                        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                        while (total < MAX_TRACE_BYTES && (n = in.read(buf)) > 0) {
+                            int take = Math.min(n, MAX_TRACE_BYTES - total);
+                            bos.write(buf, 0, take);
+                            total += take;
+                        }
                         in.close();
-                        sb.append(bos.toString("UTF-8")).append('\n');
+                        sb.append(bos.toString("UTF-8"));
+                        if (total >= MAX_TRACE_BYTES) sb.append("\n…（trace 已截断于 ")
+                                .append(MAX_TRACE_BYTES / 1024).append("KB）");
+                        sb.append('\n');
                     }
                 } catch (Throwable ignored) {
                 }

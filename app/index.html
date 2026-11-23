@@ -294,12 +294,12 @@
 
       <div class="sec-head"><span class="n">IMP</span><h2>导入</h2></div>
       <div class="set-card glass">
-        <div class="set-row" id="rowImport">
+        <div class="set-row" role="button" tabindex="0" id="rowImport" aria-label="从手机导入音乐">
           <div class="ic"><svg><use href="#i-folder"/></svg></div>
           <div class="tx"><b>从手机导入音乐</b><span>支持 MP3 / FLAC / M4A / WAV / OGG，保存在本机</span></div>
           <div class="val"><svg><use href="#i-chev-right"/></svg></div>
         </div>
-        <div class="set-row" id="rowSheet">
+        <div class="set-row" role="button" tabindex="0" id="rowSheet" aria-label="从链接添加">
           <div class="ic"><svg><use href="#i-plus"/></svg></div>
           <div class="tx"><b>从链接添加</b><span>粘贴音频直链，或网易云歌曲链接</span></div>
           <div class="val"><svg><use href="#i-chev-right"/></svg></div>
@@ -471,7 +471,7 @@
             <div class="tx"><b>状态栏歌词</b><span id="sbHint">关闭</span></div>
             <button type="button" class="sw" role="switch" aria-checked="false" data-set="sbLyric" aria-label="状态栏歌词"></button>
           </div>
-          <div class="set-row" id="rowSbTune" data-desktop-hide>
+          <div class="set-row" role="button" tabindex="0" id="rowSbTune" data-desktop-hide aria-label="状态栏歌词样式">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
             <div class="tx"><b>状态栏歌词样式</b><span>颜色 / 字号 / 位置 / 锁定</span></div>
             <div class="val" id="sbLockVal">已锁定 ›</div>
@@ -481,27 +481,27 @@
       <div class="set-group">
         <div class="lbl">网易云</div>
         <div class="set-card glass">
-          <div class="set-row">
+          <div class="set-row" role="button" tabindex="0" aria-label="接口通道">
             <div class="ic"><svg><use href="#i-link"/></svg></div>
             <div class="tx"><b>接口通道</b><span id="apiHint">检测中…</span></div>
             <div class="val" id="apiVal">—</div>
           </div>
-          <div class="set-row" id="rowApiBase">
+          <div class="set-row" role="button" tabindex="0" id="rowApiBase" aria-label="接口地址">
             <div class="ic"><svg><use href="#i-link"/></svg></div>
             <div class="tx"><b>接口地址</b><span id="apiBaseHint">留空 = 同源 / 原生通道</span></div>
             <div class="val" id="apiBaseVal">设置 ›</div>
           </div>
-          <div class="set-row" id="rowApiTest">
+          <div class="set-row" role="button" tabindex="0" id="rowApiTest" aria-label="测试连接">
             <div class="ic"><svg><use href="#i-cloud"/></svg></div>
             <div class="tx"><b>测试连接</b><span>搜索一次「周杰伦」看返回耗时</span></div>
             <div class="val">测试 ›</div>
           </div>
-          <div class="set-row" id="rowRefreshLike">
+          <div class="set-row" role="button" tabindex="0" id="rowRefreshLike" aria-label="同步「我喜欢」">
             <div class="ic"><svg><use href="#i-heart"/></svg></div>
             <div class="tx"><b>同步「我喜欢」</b><span>把网易云收藏同步到本机列表</span></div>
             <div class="val">同步 ›</div>
           </div>
-          <div class="set-row" id="rowLogout" hidden>
+          <div class="set-row" role="button" tabindex="0" id="rowLogout" hidden aria-label="退出网易云账号">
             <div class="ic"><svg><use href="#i-trash"/></svg></div>
             <div class="tx"><b>退出网易云账号</b><span>只清本地登录态，不改动账号</span></div>
             <div class="val">退出 ›</div>
@@ -531,7 +531,7 @@
             <div class="tx"><b>音量</b><span id="volHint">85%</span></div>
             <div class="sld"><input type="range" min="0" max="1" step="0.05" data-set="volume" aria-label="音量"></div>
           </div>
-          <div class="set-row">
+          <div class="set-row" role="button" tabindex="0" aria-label="均衡器">
             <div class="ic"><svg><use href="#i-eq"/></svg></div>
             <div class="tx"><b>均衡器</b><span id="eqHint">关闭</span></div>
             <div class="val" id="eqVal">关闭 ›</div>
@@ -561,7 +561,7 @@
             <div class="tx"><b>播放速度</b><span id="speedHint">1.0×</span></div>
             <div class="sld"><input type="range" min="0.75" max="1.5" step="0.05" data-set="speed" aria-label="播放速度"></div>
           </div>
-          <div class="set-row">
+          <div class="set-row" role="button" tabindex="0" aria-label="睡眠定时">
             <div class="ic"><svg><use href="#i-moon"/></svg></div>
             <div class="tx"><b>睡眠定时</b><span id="sleepHint">关闭</span></div>
             <div class="val" id="sleepVal">关闭 ›</div>
@@ -581,22 +581,22 @@
             桌面端（Windows / Linux）由 app.js 按 RippleNative.platform === 'desktop'
             隐藏掉，见 syncSettingsUI()。
           -->
-          <div class="set-row" id="rowMediaSession">
+          <div class="set-row" id="rowMediaSession" data-row-container="1" aria-label="通知栏播放控件">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知栏播放控件</b><span id="mediaHint">锁屏 / 通知中心显示</span></div>
             <button type="button" class="sw on" role="switch" aria-checked="true" data-set="mediaSession" aria-label="通知栏播放控件"></button>
           </div>
-          <div class="set-row" id="rowNotifyQuiet">
+          <div class="set-row" id="rowNotifyQuiet" data-row-container="1" aria-label="通知不打断播放">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>通知不打断播放</b><span>横幅只提示，不暂停、不压低音量</span></div>
             <button type="button" class="sw on" role="switch" aria-checked="true" data-set="notifyQuiet" aria-label="通知不打断播放"></button>
           </div>
-          <div class="set-row" id="rowTestNotify">
+          <div class="set-row" role="button" tabindex="0" id="rowTestNotify" aria-label="发送测试通知">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>发送测试通知</b><span>验证音乐是否继续播放</span></div>
             <div class="val">试一试 ›</div>
           </div>
-          <div class="set-row" id="rowPerm">
+          <div class="set-row" role="button" tabindex="0" id="rowPerm" aria-label="请求通知权限">
             <div class="ic"><svg><use href="#i-bell"/></svg></div>
             <div class="tx"><b>请求通知权限</b><span id="permHint">未授权</span></div>
             <div class="val" id="permVal">授权 ›</div>
@@ -606,17 +606,17 @@
       <div class="set-group">
         <div class="lbl">存储</div>
         <div class="set-card glass">
-          <div class="set-row">
+          <div class="set-row" role="button" tabindex="0" aria-label="已导入音乐">
             <div class="ic"><svg><use href="#i-download"/></svg></div>
             <div class="tx"><b>已导入音乐</b><span id="storageHint">0 首 · 0 MB</span></div>
             <div class="val" id="clearLocal">清空 ›</div>
           </div>
-          <div class="set-row" id="rowClearHistory">
+          <div class="set-row" role="button" tabindex="0" id="rowClearHistory" aria-label="清除播放记录">
             <div class="ic"><svg><use href="#i-trash"/></svg></div>
             <div class="tx"><b>清除播放记录</b><span>不影响已导入的音乐</span></div>
             <div class="val">清除 ›</div>
           </div>
-          <div class="set-row" id="rowReset">
+          <div class="set-row" role="button" tabindex="0" id="rowReset" aria-label="恢复默认设置">
             <div class="ic"><svg><use href="#i-info"/></svg></div>
             <div class="tx"><b>恢复默认设置</b><span>布局、主题、播放选项全部重置</span></div>
             <div class="val">重置 ›</div>
@@ -629,12 +629,12 @@
       <div class="set-group">
         <div class="lbl">关于</div>
         <div class="set-card glass">
-          <div class="set-row" id="rowLog">
+          <div class="set-row" role="button" tabindex="0" id="rowLog" aria-label="软件日志">
             <div class="ic"><svg><use href="#i-list"/></svg></div>
             <div class="tx"><b>软件日志</b><span id="logHint">记录播放/接口/状态栏的运行情况</span></div>
             <div class="val">查看 ›</div>
           </div>
-          <div class="set-row" id="rowAbout">
+          <div class="set-row" role="button" tabindex="0" id="rowAbout" aria-label="Ripple 涟漪">
             <div class="ic"><svg><use href="#i-info"/></svg></div>
             <div class="tx"><b>Ripple 涟漪</b><span id="aboutVer">— · build —</span></div>
             <div class="val"><svg><use href="#i-chev-right"/></svg></div>

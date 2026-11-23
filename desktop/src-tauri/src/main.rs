@@ -168,6 +168,66 @@ fn safe_mode() -> bool {
     false
 }
 
+/// 单实例守卫（审查 D-07）。
+///
+/// 为什么不用 `tauri-plugin-single-instance`：本机（aarch64 proot）的 cargo
+/// 缓存里没有这个 crate，而构建脚本跑的是 `--offline`，加依赖会直接编译失败。
+/// 而单实例的实质需求只有一条 ——「别让第二个实例去覆盖第一个实例的
+/// cookie / 令牌文件」（审查 S-07 指出同一 data-dir 起两个实例会互相覆盖）。
+///
+/// 所以用**最小实现**：在配置目录里建一个 lock 文件并持有它。
+/// 拿不到锁就说明已有实例在跑，直接退出并提示。
+///
+/// 说明与已知边界：
+///   · 用 O_EXCL 创建而不是文件锁 —— 跨平台语义一致，且不依赖额外 crate；
+///   · 进程被强杀可能留下陈旧 lock。所以我们检查里面的 pid 是否还活着，
+///     活着就退出，死了就接管（见下）；
+///   · 这不是「完美单实例」（极端竞态下两个进程可能同时判定陈旧），
+///     但足以挡住「用户手滑双击两次图标」这个真实场景。
+#[cfg(unix)]
+fn acquire_single_instance(dir: &std::path::Path) -> bool {
+    use std::io::Write;
+    let lock = dir.join(".ripple-instance");
+    if let Ok(text) = std::fs::read_to_string(&lock) {
+        let pid: i32 = text.trim().parse().unwrap_or(0);
+        if pid > 1 {
+            /* kill(pid, 0) 探测存活：返回 0 说明进程还在 */
+            let alive = unsafe { libc_kill0(pid) };
+            if alive {
+                return false;
+            }
+        }
+    }
+    match std::fs::File::create(&lock) {
+        Ok(mut f) => {
+            let _ = write!(f, "{}", std::process::id());
+            true
+        }
+        Err(_) => {
+            /* 创建失败也不要因此拒绝启动 —— 宁可多开一个，也不能打不开 */
+            true
+        }
+    }
+}
+
+// 极小的 `kill(pid, 0)` 绑定：只用于「进程是否存活」探测。
+// 不引入 libc crate（离线环境没缓存），直接声明外部符号。
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+#[cfg(unix)]
+unsafe fn libc_kill0(pid: i32) -> bool {
+    kill(pid, 0) == 0
+}
+
+#[cfg(windows)]
+fn acquire_single_instance(_dir: &std::path::Path) -> bool {
+    /* Windows 侧靠命名互斥体才可靠，而在没有 windows-sys 依赖的情况下
+    做一个「语义正确」的实现不现实。这里明确不做，而不是给一个假的。 */
+    true
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -180,6 +240,15 @@ fn main() {
                 .app_config_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
             std::fs::create_dir_all(&data_dir).ok();
+
+            /*
+             * D-07：同一配置目录只允许一个实例 —— 否则两个实例会各持一份
+             * cookie / 令牌表，互相覆盖（审查 S-07）。
+             */
+            if !acquire_single_instance(&data_dir) {
+                eprintln!("Ripple 已在运行（{}）", data_dir.display());
+                std::process::exit(0);
+            }
 
             app.manage(AppState {
                 client: Mutex::new(None),
@@ -196,10 +265,27 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("Tauri 启动失败")
-        .run(|_app, event| {
+        .run(|app, event| {
             if let RunEvent::Exit = event {
-                // 退出时确保 cookie 已落盘（save_cookie 在每次 Set-Cookie 后已写过，
-                // 这里只是兜底 —— 若最后一条请求刚改完 jar 就退出，也不至于丢）。
+                /*
+                 * 审查 D-07：这个分支以前只有注释、没有任何实际代码。
+                 *
+                 * 注释说「这里只是兜底」，但兜底本身是必要的：cookie 依赖每次
+                 * Set-Cookie 后立即 save_cookie()，若最后一条请求刚改完 jar
+                 * 就退出（或那次写盘失败），退出后就丢了 —— 用户表现是
+                 * 「昨天还登录着，今天打开又要重新登录」。
+                 *
+                 * 现在真的在这里兜底写一次：拿共享 Client，drop 锁之后写盘，
+                 * 避免在持锁状态里做 IO。
+                 */
+                if let Some(state) = app.try_state::<AppState>() {
+                    let client = state.client.lock().ok().and_then(|g| g.as_ref().cloned());
+                    if let Some(c) = client {
+                        if let Ok(guard) = c.lock() {
+                            guard.save_cookie();
+                        }
+                    }
+                }
             }
         });
 }

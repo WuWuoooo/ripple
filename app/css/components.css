@@ -196,15 +196,3 @@ body.compact .qitem{padding-top:3px;padding-bottom:3px}
   color:var(--text2);white-space:pre-wrap;word-break:break-all}
 
 /* 登录方式选择 */
-.login-opt{display:flex;align-items:center;gap:12px;width:100%;padding:13px 12px;
-  border-radius:14px;border:1px solid var(--line);background:var(--panel2);
-  margin-bottom:10px;text-align:left;transition:var(--dur-s) var(--ease)}
-.login-opt:active{transform:scale(.98);border-color:var(--accent);background:var(--accent-soft)}
-.login-opt .ic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;flex:none;
-  background:var(--accent-soft);color:var(--accent);border:1px solid var(--line)}
-.login-opt .ic svg{width:17px;height:17px}
-.login-opt .tx{flex:1;min-width:0}
-.login-opt .tx b{display:block;font-size:12.5px;font-weight:560}
-.login-opt .tx span{display:block;font-size:10px;color:var(--text3);margin-top:3px;line-height:1.5}
-.login-opt .go{color:var(--text3);flex:none}
-.login-opt .go svg{width:14px;height:14px}

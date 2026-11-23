@@ -62,7 +62,11 @@ impl Client {
     ///
     /// 与 `server.js` 的 R-14 整改一致：先写临时文件再 rename，
     /// 避免进程在写一半时被杀留下半截 cookie（下次启动就是「莫名掉登录」）。
-    fn save_cookie(&self) {
+    /// 落盘 cookie。
+    ///
+    /// 审查 D-07：改成 `pub` 以便 main.rs 在 `RunEvent::Exit` 里兜底调一次
+    /// （原来那个分支是空的，只有注释说「这里只是兜底」）。
+    pub fn save_cookie(&self) {
         let tmp = self.cookie_path.with_extension("tmp");
         let ok = fs::write(&tmp, &self.cookie_jar).is_ok()
             && fs::rename(&tmp, &self.cookie_path).is_ok();

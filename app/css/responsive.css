@@ -47,7 +47,8 @@
      * 导航栏展开宽度必须容得下「图标 + 文字 + 内外边距」：
      *   图标 19 + gap 11 + 「设置」两字约 26 + 左右 padding 22 + 栏内边距 20 ≈ 98
      * 以前这里写 84，两字标签已经开始被截断（「发」「曲」「搜」「我」）。
-     * 取 112 是为了给三字以内的二级入口也留余量。
+     * 本档实际取值 138px（早期注释写「取 112」与实现不符，已按实测更正，U-17 CSS-15）；
+     * 给三字以内的二级入口留了余量。
      */
     --pad-x:26px;--rail-w:138px;--sheet-max:720px;--content-max:1100px;
     --np-pad-x:30px;--grid-cols:3;--hero-pad:26px;
@@ -132,6 +133,9 @@
    * 撑出一条空白。
    */
   html[data-rail="mini"]{--rail-w:var(--rail-mini)}
+
+  /* 审查 U-17（CSS-15）：宽屏档的 dock 贴底（safe-b + 13），toast 不该再让 146px */
+  :root{--toast-dock-clear:81px}
 
   /* dock 与底部渐变要让开左侧导航 */
   .dock{
@@ -313,9 +317,25 @@
      * 桌面上通常是 0）+ 默认 padding，标题栏离窗口顶太远，显得空。
      * 8px 是纯粹的呼吸量，不是安全区。
      */
-    padding:8px var(--np-pad-x) 0;
+    /*
+     * 审查 U-14（CSS-06）：顶部 padding 必须是 safe-t + 8px，不能写死 8px。
+     *
+     * 这一档同时覆盖 Android 平板 / 折叠屏（宽屏但仍是 edge-to-edge），
+     * 那些设备 --safe-t 是 24~32px（状态栏）。写死 8px 会让播放页顶部的
+     * 「收起」按钮与歌名被状态栏压住 —— 与 1.2.2 修掉的「窗口标题栏遮挡页面顶部」
+     * 是同一类问题，只是留在了播放页里。
+     */
+    padding:calc(var(--safe-t) + 8px) var(--np-pad-x) 0;
     /* 展开/收起时行高变化要平滑过渡（数值型轨道可以被 transition 插值） */
-    transition:grid-template-rows var(--dur-ani) var(--ease-inout);
+    /*
+     * 审查 U-17（CSS-09）：columns 也要有过渡。
+     *
+     * 以前只写了 grid-template-rows —— 展开歌词时行是平滑的，但列宽**瞬变**：
+     * 实测 1280×800 下 meta 的 left 从 680 一下跳到 44，然后再纵向平滑开。
+     * 观感就是「歌名先横着闪一下」。现在两轴一起过渡。
+     */
+    transition:grid-template-rows var(--dur-ani) var(--ease-inout),
+               grid-template-columns var(--dur-ani) var(--ease-inout);
   }
   .np-top{grid-area:top}
   .cover-wrap{grid-area:cover;align-items:center;padding:6px 0}

@@ -64,6 +64,19 @@ final class CrashLog {
 
     /** 崩溃文件保留份数：只留最近这么多份，避免下载目录被历史崩溃刷爆 */
     private static final int MAX_CRASH_FILES = 10;
+    /**
+     * 审查 AND-04：非崩溃错误日志用**独立前缀与独立配额**。
+     *
+     * 以前 recordAsync（35 个真实调用点：LyricOverlay 9 + MainActivity 19 +
+     * PlaybackService 7）走的是同一个 writePrivate，生成的都是 crash-*.txt，
+     * 与真崩溃共用 MAX_CRASH_FILES=10 的淘汰配额。
+     * 故障期一秒钟就能刷出几十条错误 → 配额几秒被填满 →
+     * **最早那份真正的 uncaught- 崩溃报告被删掉**，而这恰恰是最有价值的证据。
+     *
+     * 现在错误日志用 err- 前缀、独立保留 ERR_KEEP_FILES 份，
+     * 两套配额互不侵占；崩溃文件永远留着。
+     */
+    private static final int ERR_KEEP_FILES = 20;
     /** 幂等标记：装过就不再装第二次（否则会形成链式 handler + 重复写文件） */
     private static boolean installed = false;
 
@@ -253,7 +266,8 @@ final class CrashLog {
         }
         post(() -> {
             try {
-                writePrivate(app, tag, text);
+                /* AND-04：非崩溃错误用 err- 前缀，与真崩溃的配额隔离 */
+                writePrivate(app, tag, text, "err-");
                 writeDownloads(app, tag, text, false);
             } catch (Throwable ignored) {
             }
@@ -293,7 +307,7 @@ final class CrashLog {
          * "version: x.y.z (" + NNN + ")"：android/sync-version.sh 用 sed 同步它，
          * CI 也用 grep -F 校验这一串，改成别的写法会让构建直接失败。
          */
-        String fallbackVersion = "version: 1.3.1 (" + 131 + ")";
+        String fallbackVersion = "version: 1.3.2 (" + 132 + ")";
         String realVersion = versionOf(ctx);
         pw.println(realVersion == null ? fallbackVersion : "version: " + realVersion);
         pw.println();
@@ -343,15 +357,29 @@ final class CrashLog {
     }
 
     private static void writePrivate(Context ctx, String tag, String text) {
+        writePrivate(ctx, tag, text, "crash-");
+    }
+
+    /**
+     * @param prefix 文件名前缀："crash-" = 真崩溃（配额 10）；
+     *               "err-" = 非崩溃错误（配额 20，独立，见 AND-04）
+     */
+    private static void writePrivate(Context ctx, String tag, String text, String prefix) {
         if (ctx == null) return;
         try {
-            File f = new File(ctx.getFilesDir(), "crash-" + stamp() + "-" + safe(tag) + ".txt");
+            File f = new File(ctx.getFilesDir(), prefix + stamp() + "-" + safe(tag) + ".txt");
             FileOutputStream out = new FileOutputStream(f, false);
             try {
                 out.write(text.getBytes("UTF-8"));
             } finally {
                 out.close();
             }
+            /*
+             * AND-04：按前缀走各自的淘汰逻辑 —— 错误日志不会挤掉崩溃报告。
+             * 注意这里在写盘线程（post 出来的单线程）里跑，不占主线程。
+             */
+            if ("err-".equals(prefix)) prunePrivateErrFiles(ctx);
+            else prunePrivateCrashFiles(ctx);
         } catch (Throwable ignored) {
         }
     }
@@ -409,6 +437,32 @@ final class CrashLog {
      * 文件名形如 crash-yyyyMMdd-HHmmss-tag.txt：时间戳是零填充的，
      * 所以按名字倒序排就是「新 → 旧」，删尾部的即可。
      */
+    /**
+     * 审查 AND-04：错误日志独立的淘汰逻辑（配额 ERR_KEEP_FILES）。
+     * 与 prunePrivateCrashFiles 完全分开 —— 两套文件互不影响。
+     */
+    private static void prunePrivateErrFiles(Context ctx) {
+        try {
+            File dir = ctx.getFilesDir();
+            if (dir == null) return;
+            File[] all = dir.listFiles((d, n) -> n.startsWith("err-") && n.endsWith(".txt"));
+            if (all == null || all.length <= ERR_KEEP_FILES) return;
+            Arrays.sort(all, Comparator.comparing(File::getName).reversed());
+            for (int i = ERR_KEEP_FILES; i < all.length; i++) {
+                try {
+                    if (all[i].getParentFile() != null
+                            && all[i].getParentFile().getAbsolutePath()
+                                    .equals(dir.getAbsolutePath())) {
+                        //noinspection ResultOfMethodCallIgnored
+                        all[i].delete();
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static void prunePrivateCrashFiles(Context ctx) {
         try {
             File dir = ctx.getFilesDir();

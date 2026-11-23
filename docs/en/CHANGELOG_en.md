@@ -6,6 +6,214 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.2 — Ninth Version
+
+> **Basis**: the "what this version did not do" list from 1.3.1 — that is, batch 3
+> (next minor version) and batch 4 (tech debt) from the 1.3.0 review report. All done.
+> **Review and remediation by**: Deepseek V4.1 Flash 1017.
+>
+> No new features; this version clears the debt the previous one honestly left behind.
+
+### 1. Batch 3: interaction and accessibility
+
+- **E-05 [medium] Dragging a slider in the playback-settings panel shows no value bubble**
+  Open-then-close within one event: the `input` handler first calls
+  `paintSlider(el, true)` to light up the bubble, then unconditionally calls
+  `syncOptSheet()` which turns it off again — so the "bare number 0.85 / 1.05" fix that
+  1.2.2 specifically made was **never once visible**. Fix: `syncOptSheet({ keepTip: true })`
+  plus `paintSlider` accepting `null` (update fill/text only, leave bubble visibility
+  alone); `change` (real release) and first render still hide the bubble by default.
+- **E-06 [medium] "Shuffle one" picks the same track from the second click on**
+  The old code was `use[(dayKey + (force ? 1 : 0)) % use.length]` — `dayKey` and
+  `use.length` are both constant within a day, so **every** forced call computed the
+  same index (two clicks in a row gave the same song, while the comment claimed it
+  fixed exactly that). Replaced with a monotonic cursor, reset when the seed changes.
+- **E-08 / E-09 [medium] Queue rows and settings rows were not keyboard accessible**
+  1.2.3's accessibility pass gave list rows proper semantics, but the **queue template
+  was not updated** and **all 37 `.set-row` settings rows were bare `div`s** — the net
+  effect was "everything you can Tab to is a control, everything you can't is a row",
+  excluding half the entry points from the accessibility tree.
+  Fix: `.qitem` now has `role`/`tabindex`/`aria-label` (including "now playing" and the
+  track number); each `.set-row` was individually classified and **17** got semantics
+  (the other 2 contain a `<button role=switch>` and are **deliberately** left alone —
+  adding a role would create "button wrapping a switch", read twice by screen readers
+  and ambiguous for Enter); the keyboard delegation whitelist gained
+  `.qitem[tabindex]` / `.set-row[tabindex]`.
+  Measured: 37 rows → 17 tabbable, all 17 with aria-label.
+- **E-16 [medium] When `localStorage` is full, settings silently never persist**
+  Two empty `catch` blocks swallowed `QuotaExceededError`: "changed in memory, not on
+  disk" could persist for the whole session, and the user only sees "I set it and it
+  reverted", with nothing in the logs.
+  Fix: on first failure, **slim the payload and retry once** (history 200→100,
+  onlineCache 60→30, which usually recovers); if it still fails, log plus one toast
+  (`_saveFailed` prevents spam). Progress-write failures only log, no toast.
+
+### 2. Batch 3: layout details
+
+- **U-14 [low] Tablet / punch-hole playback-page top and bottom pill positioning**
+  - CSS-06: the wide tier's `.np-inner` top padding was hard-coded to `8px`, but that
+    tier **also covers Android tablets / foldables** (edge-to-edge, `--safe-t` is
+    24–32px) → the "collapse" button and title sat under the status bar.
+    Changed to `calc(var(--safe-t) + 8px)`.
+  - CSS-10: on phone-landscape punch-hole devices `.tabbar` used hard-coded
+    `left/right:12px` while `.dock` respected the safe area → a **44px** gap measured
+    (tabbar left=12 vs dock left=56). Both now use `calc(var(--safe-l/r) + 12px)`;
+    measured 12 and 12 after the fix.
+- **U-17 [low] Other layout details**
+  - CSS-09: expanding lyrics transitioned `grid-template-rows` but columns changed
+    instantly → measured at 1280×800, meta's `left` jumped from 680 to 44. Now both
+    axes transition.
+  - CSS-13: the three rail blocks' icons were not left-aligned (measured 8 / 16 / 17).
+    Each of the three formulas was rewritten to the same "container padding + block
+    offset + own padding" base and **measured to 16 / 16 / 16**. (Deliberately no shared
+    variable: the three formulas differ, sharing would misalign them.)
+  - CSS-15: two comments contradicted the code — `--rail-w` said "use 112" while it is
+    138; the toast `bottom` was derived as 146 assuming dock at `+78`, but the wide tier
+    had moved dock to `safe-b + 13` → measured toast bottom 146 vs dock top 73, a 73px
+    gap. Introduced `--toast-dock-clear`, overridden to 81 in the wide tier.
+- **U-13 [low] Dead CSS / dead config**
+  - The whole `.login-opt` block (12 rules; login moved to a QR dialog, zero HTML/JS hits) → deleted
+  - Dead `.row .r-al` rule → deleted
+  - `--dock-bg`'s two values **never took effect** (fully overridden by the
+    `background` shorthand in `html:not(.perf-low) .dock-inner`) → wired into the
+    bottom of the background stack so the dark/light base colors finally apply
+  - `--h`: JS called `setProperty('--h', …)` with a comment promising "bar heights
+    follow", but `var(--h)` has **zero consumers** repo-wide (the EQ bars are actually
+    drawn by a rotated native range input) → removed the unfulfilled promise and
+    documented how the bars really work.
+
+### 3. Batch 3: server
+
+- **S-06 [medium] IPv6 Host validation contradicted its own message**
+  The whitelist stored **bare** IPv6 while browsers always send bracketed Host →
+  `hostKey` keeps the brackets, never equal to the bare entry → IPv6 access always 421
+  in dual-stack, and the substitute addresses printed in the 421 body **also 421**,
+  leaving the user unable to self-rescue.
+  Fix: whitelist now holds both bare and `[addr]` forms; the 421 body deduplicates.
+- **S-12 [low] Paths containing NUL returned 500**
+  `decodeURIComponent('/a%00.js')` does not throw (`%00` is a legal escape), the string
+  with `\0` reached `fs.statSync`, which throws TypeError → wrapped into 500. Semantically
+  this is malformed client input (400), and a token-less GET could spam logs forever.
+  Fix: reject null bytes immediately after decoding.
+- **S-13 [medium] Zero tests for `server.js`'s HTTP behaviour**
+  Root cause: `require('./server.js')` listened immediately, so a test grabbed the port
+  on load. Fix: export `{ server, PORT, allowedHosts, tokenStats }` and **only listen when
+  run directly** (`require.main === module`), behaviour unchanged for CLI use.
+  Added `tests/server-http.test.js`, hitting a real instance with real HTTP requests
+  (temporary port + isolated data-dir) across the six blind spots the review named:
+  Host allow/421, token issuance and 401, `/ncm` POST-only, traversal + `%00` + malformed
+  escapes, 300KB body → 413, cookie file empty after logout; plus invalid startup args.
+
+### 4. Batch 3/4: Android native
+
+- **AND-02 [high] Removed the completely dead WebView login chain (350 lines)**
+  Since 1.3.0 all three platforms use QR login, and the embedded-login chain had **zero
+  callers**: the frontend `Netease.login()` grep only hits its own definition; 10 methods
+  (`openLogin` etc.), 9 `login*` fields and 3 `@JavascriptInterface` bridge methods were
+  all unused. The cost was not merely dead lines: it layered a second WebView loading
+  `music.163.com` onto the main Activity and exposed a JS interface (extra attack
+  surface), and two comments contradicted each other (HttpBridge said it was in use,
+  NeteaseClient said it was not), leaving no way to tell which was true.
+  Fix: 350 lines of Java + frontend `login()`/`loginCancel()` + the three bridge methods
+  removed together, with a note in place explaining why and that restoring it must bring
+  the UI back too.
+- **AND-03 [high] Registered `__rippleMediaUnavailable` on the frontend**
+  When both `startForegroundService` and `startService` fail, Java calls this callback,
+  yet `app/` had **zero hits** repo-wide — the call site is `&&`-guarded so nothing
+  errored, meaning the entire "why can't I control playback from the notification"
+  channel was dead. And this is **not** a corner case: the branch only runs when "the
+  service is gone but the page is still playing", which almost always means the app is
+  backgrounded, where targetSdk 34 makes background `startForegroundService` throw on
+  Android 12+ — "both fail" is the main path.
+  Fix: registered, showing at most one toast per 5 minutes (the contract explicitly says
+  "may be called every second, the frontend must dedupe"), with a counted log entry.
+- **AND-04 [medium] Error logs shared a quota with real crash reports**
+  `recordAsync` has 35 call sites, all writing `crash-*.txt` and competing for the same
+  10-file quota — during a fault storm dozens per second would fill it in seconds,
+  **deleting the earliest genuine crash report**.
+  Fix: error logs use an `err-` prefix with an independent quota of 20; the two quotas
+  no longer interfere.
+- **AND-05 [medium] Cold start read up to 5 process traces on the main thread**
+  `getTraceInputStream()` read to EOF with **no length cap**, up to megabytes per trace,
+  all in `Application.onCreate`. J-01/J-05 had only moved **writing** off the main
+  thread — reading stayed and was heavier.
+  Fix: moved to a background thread, capped at 256KB per trace (truncated with a note).
+
+### 5. Batch 4: build and repository hygiene
+
+- **"Manifest consistency" CI check (the highest-ROI item the report named)**
+  Added `scripts/check-manifest-consistency.js` plus 5 regression tests, checking:
+  A. the three platforms' command-name sets are equal (frontend → server.js → Java → Rust)
+  B. the same command maps to the same upstream path on all three
+  C. QR state codes have a single source (803 must be whitelisted, whitelist must be
+     constant-driven)
+  D. version numbers agree in four places (version.json / tauri.conf.json / Cargo.toml /
+     Cargo.lock)
+  E. home-cache invalidation has exactly one entry point
+  Wired into CI (`build.yml`'s check job).
+  **Verified it actually catches things**: injecting each of 1.3.0's four historical
+  defects into a temp copy turned the checker red every time — a checker that cannot
+  catch problems is worse than none, so that is covered by tests too.
+- **U-05 [medium] CI version validation did not cover desktop**
+  `build.yml`'s version check only covered the 5 Android-side spots; the three desktop
+  copies are now checked too, giving cross-validation between the two workflows. Also
+  added `version.json` to `desktop-build.yml`'s `pull_request.paths`.
+- **D-07 [medium] Desktop exit did not guarantee cookie persistence / no single instance**
+  - `RunEvent::Exit` previously had **only a comment and no code** (the comment said
+    "just a backstop"). Now it actually takes the shared Client and writes to disk.
+  - Single instance: this machine's cargo cache has no `tauri-plugin-single-instance`
+    (builds run `--offline`), so a minimal implementation is used: hold a lock file in
+    the config dir and check whether the recorded pid is alive. On Windows it is
+    explicitly **not** done (without windows-sys a semantically correct version is not
+    feasible — better to do it for real than to fake it).
+- **U-11 [medium] Decision on eslint / prettier**
+  Neither config was ever executed by CI or any script (the project deliberately has
+  zero dependencies and no frontend build chain). Decision: **delete both** — keeping
+  them only makes contributors believe a lint gate exists. This also removes the invalid
+  `insertFinalNewline` key in `.prettierrc`.
+- **U-19 remaining build hygiene**
+  - Gradle wrapper: the repo genuinely has **no** `gradlew`, yet the docs told
+    contributors to run `./gradlew assembleDebug` (reported as far back as the 1.1.0
+    review). Decision: **do not add a wrapper** (consistent with the zero-build-chain
+    stance); instead CONTRIBUTING now states plainly that there is no wrapper and that
+    command will not work.
+  - `ISSUE_TEMPLATE/config.yml`: `OWNER/REPO` placeholders → real repo; `master` → `main`
+    (the security-advisory entry point was broken, which is especially bad).
+  - `pull_request_template.md` told contributors to hand-edit `app/sw.js`'s `CACHE`,
+    directly contradicting CONTRIBUTING's "do not hand-edit, it is script-synced" →
+    now "ran `sync-version.sh`".
+  - `.editorconfig` had an inline comment polluting the value
+    (`trim_trailing_whitespace` literally became
+    `"false   # 行尾两个空格是硬换行"`, so Markdown trailing double spaces were still
+    trimmed) → the comment now sits on its own line.
+  - `desktop-build.yml` relied on a preinstalled `7z` with no check → added
+    `command -v` and a readable error.
+
+### 6. Regression tests: 93 → 105 (12 new)
+
+- `tests/server-http.test.js` (7): server HTTP e2e covering the six blind spots S-13 named.
+- `tests/manifest-consistency.test.js` (5): regression for the checker itself — one
+  asserts "the current repo passes", four inject historical defects (D-09 path drift /
+  G-01 missing state code / G-01 whitelist bypass / D-02 version drift) and assert
+  **each is caught**.
+
+### 7. What this version did not do (said honestly)
+
+- **Desktop tray / SMTC / MPRIS media control**: genuinely absent, still needs
+  system-level integration.
+- **Always-on-top lyric mini window**: genuinely absent.
+- **Real single-instance on Windows**: as above, infeasible without the dependency, so
+  it is left undone rather than faked.
+- **Gradle wrapper**: deliberately not added (see above).
+- **Splitting `server.js` into an injectable `createServer({dataDir, upstream})` factory**:
+  this version made it **testable** (require no longer grabs the port, plus 12 e2e cases)
+  but did **not** produce a full factory — global state (cookie jar / token table / data
+  dir) is still module-scoped, so only one instance can exist per process. A full
+  factory touches 1300 lines; the risk outweighs the benefit until same-process multiple
+  instances are actually needed.
+
+---
+
 ## 1.3.1 — Eighth Version
 
 > **Basis for this round**: `docs/code_review_record/代码审查_1.3.0.md` (a full review of 1.3.0,

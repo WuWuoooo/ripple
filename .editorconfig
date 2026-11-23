@@ -16,4 +16,9 @@ indent_size = 4
 indent_size = 2
 
 [*.{md,markdown}]
-trim_trailing_whitespace = false   # 行尾两个空格是硬换行
+# 审查 U-19（BLD-24）：注释不能写在值后面 ——
+# `trim_trailing_whitespace = false   # 行尾两个空格是硬换行` 会让值真的变成
+# "false   # 行尾两个空格是硬换行" 这一整串，于是 Markdown 行尾双空格**仍被裁剪**，
+# 而 README 里有一处正依赖它做硬换行。
+# 注释单独占一行。
+trim_trailing_whitespace = false
