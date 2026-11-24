@@ -427,36 +427,6 @@ jobs:
           # ⚠️ 两个必须遵守的格式细节，否则折叠块会渲染成一堆纯文本：
           #   · <summary> 与 </summary> 必须在同一行，中间不能换行；
           #   · <details> 后面的内容要空一行，Markdown 才会被当成 Markdown 解析。
-          ZH_LINES=$(wc -l < "$ZH")
-          EN_LINES=$(wc -l < "$EN")
-          ZH_TOC=$(grep -E '^### ' "$ZH" | sed 's/^###[[:space:]]*//' | sed 's/^/- /' || true)
-          if [ -z "$ZH_TOC" ]; then
-            ZH_TOC="- （本版无小节标题 / no subsection headings）"
-          fi
-
-          {
-            echo "> 本文档为中英双语 · This release note is bilingual (Chinese / English)."
-            echo ""
-            echo "**本版包含 / What's in this release**"
-            echo ""
-            echo "$ZH_TOC"
-            echo ""
-            echo "<details open>"
-            echo "<summary><b>中文说明</b>（${ZH_LINES} 行 · 点击展开或收起）</summary>"
-            echo ""
-            cat "$ZH"
-            echo ""
-            echo "</details>"
-            echo ""
-            echo "<details>"
-            echo "<summary><b>English notes</b> (${EN_LINES} lines · click to expand or collapse)</summary>"
-            echo ""
-            cat "$EN"
-            echo ""
-            echo "</details>"
-          } > "$OUT"
-          echo "中英双版正文已合并（带折叠）：$(wc -l < "$OUT") 行（中文 $(wc -l < "$ZH") + 英文 $(wc -l < "$EN")）"
-
           # 指纹直接从**成品 APK** 读，而不是从 keystore 猜：
           # 用户真正关心的是「这个包是什么签名」，而 apksigner --print-certs 给的
           # 是实际打包用的证书摘要（顺带兼容 keytool 各版本 "SHA256:" / "SHA-256:" 的差异）。
@@ -465,6 +435,24 @@ jobs:
                  | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)
           echo "签名证书 SHA-256：${CERT:-（读取失败）}"
 
+          ZH_LINES=$(wc -l < "$ZH")
+          EN_LINES=$(wc -l < "$EN")
+          ZH_TOC=$(grep -E '^### ' "$ZH" | sed 's/^###[[:space:]]*//' | sed 's/^/- /' || true)
+          if [ -z "$ZH_TOC" ]; then
+            ZH_TOC="- （本版无小节标题 / no subsection headings）"
+          fi
+
+          {
+            # 头部：标题 + 本版要点清单（不折叠）。
+            # 这部分和下面的折叠块分开写，是为了让「安装包」区块能插在中间。
+            echo "> 本文档为中英双语 · This release note is bilingual (Chinese / English)."
+            echo ""
+            echo "**本版包含 / What's in this release**"
+            echo ""
+            echo "$ZH_TOC"
+          } > "$OUT"
+
+          # 安装包在最前（紧跟要点清单），用户不用展开折叠、也不用往下拉就能看到
           {
             echo ""
             echo "---"
@@ -489,6 +477,27 @@ jobs:
             echo "On Windows, SmartScreen -> \"More info\" -> \"Run anyway\". "
             echo "On Linux, \`chmod +x\` the AppImage/tar.gz, or \`sudo dpkg -i\` the deb."
           } >> "$OUT"
+
+          # 折叠正文：中英各一个 <details>
+          # 前面必须空一行，否则 <details> 会被当成上一段文字的延续，
+          # GitHub 就不会把它渲染成折叠块。
+          {
+            echo ""
+            echo "<details open>"
+            echo "<summary><b>中文说明</b>（${ZH_LINES} 行 · 点击展开或收起）</summary>"
+            echo ""
+            cat "$ZH"
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "<details>"
+            echo "<summary><b>English notes</b> (${EN_LINES} lines · click to expand or collapse)</summary>"
+            echo ""
+            cat "$EN"
+            echo ""
+            echo "</details>"
+          } >> "$OUT"
+          echo "中英双版正文已合并（带折叠）：$(wc -l < "$OUT") 行（中文 $(wc -l < "$ZH") + 英文 $(wc -l < "$EN")）"
 
           {
             echo "body<<__EOF__"
