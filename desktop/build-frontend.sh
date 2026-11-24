@@ -107,37 +107,54 @@ PY
 # 并顺手更新 Cargo.lock 里本包那一条 —— 否则 cargo 会认为 lock 过期。
 python3 - "$HERE/src-tauri/Cargo.toml" "$HERE/src-tauri/Cargo.lock" "$VNAME" <<'PY'
 import re, sys
+
+# ⚠️ Windows 的 Python 默认 stdout 编码是 cp1252，输出任何中文都会抛
+#    UnicodeEncodeError: 'charmap' codec can't encode ...
+#    1.3.4 的 CI 就栽在这上面（Windows 打包 job 直接失败）。
+#
+# 两道保险一起上：
+#   ① 显式把 stdout/stderr 重设为 utf-8（Python 3.7+ 支持 reconfigure）；
+#   ② 所有提示文字一律写成纯 ASCII —— 即使 ① 在某个老 Python 上不生效，
+#      也不会因为一条日志把整个构建搞崩。
+# 构建脚本的日志本来就不该依赖终端能显示什么字符。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 toml, lock, ver = sys.argv[1], sys.argv[2], sys.argv[3]
 
-# Cargo.toml：[package] 之后的第一处 version = "..."
+
 def sync_toml():
     src = open(toml, encoding='utf-8').read()
     m = re.search(r'^\[package\]([\s\S]*?)(?=^\[)', src, re.M)
     if not m:
-        print('Cargo.toml 找不到 [package] 段，跳过')
+        print('Cargo.toml: no [package] section, skipped')
         return
     seg = m.group(1)
     new_seg, n = re.subn(r'(?m)^(version\s*=\s*)"[^"]*"', r'\1"%s"' % ver, seg, count=1)
     if n and new_seg != seg:
         src = src[:m.start(1)] + new_seg + src[m.end(1):]
         open(toml, 'w', encoding='utf-8').write(src)
-        print(f'Cargo.toml 版本 → {ver}')
+        print('Cargo.toml version -> %s' % ver)
     else:
-        print(f'Cargo.toml 版本已是 {ver}')
+        print('Cargo.toml version already %s' % ver)
+
 
 def sync_lock():
     try:
         src = open(lock, encoding='utf-8').read()
     except OSError:
         return
-    # [[package]] 块里 name = "ripple-desktop" 紧跟的 version
     pat = re.compile(r'(\[\[package\]\]\nname\s*=\s*"ripple-desktop"\nversion\s*=\s*)"[^"]*"')
     new, n = pat.subn(r'\1"%s"' % ver, src, count=1)
     if n and new != src:
         open(lock, 'w', encoding='utf-8').write(new)
-        print(f'Cargo.lock 版本 → {ver}')
+        print('Cargo.lock version -> %s' % ver)
     else:
-        print('Cargo.lock 无需改动（未找到本包条目或已是最新）')
+        print('Cargo.lock unchanged (entry not found or already current)')
+
 
 sync_toml()
 sync_lock()
