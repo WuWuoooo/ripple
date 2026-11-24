@@ -10,6 +10,7 @@ import android.webkit.JavascriptInterface;
 
 import org.json.JSONObject;
 
+import java.io.File;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -486,5 +487,169 @@ public class HttpBridge {
             LogBridge.add(ctx, "APP", "clearSafeMode failed: " + t);
             return false;
         }
+    }
+
+    /* ================= 检查更新 ================= */
+    /*
+     * 与其它桥方法不同的地方：这三个是**异步**的。
+     *
+     * 网页侧调用后立刻返回，结果通过 evaluateJavascript 回调
+     * window.__rippleUpdate* 系列函数送回去。
+     *
+     * 为什么不用同步返回值：检查更新要发 HTTPS 请求，同步做会把 JS 桥线程
+     * 卡住几秒（弱网下更久），而那条线程同时还在处理播放进度推送 ——
+     * 用户会看到整个界面卡死。所以必须异步 + 回调。
+     */
+
+    /**
+     * 检查更新。
+     *
+     * @param manual "true" = 用户在设置页主动点的，不做 6 小时节流
+     */
+    @JavascriptInterface
+    public void checkUpdate(final String manual) {
+        final boolean m = "true".equalsIgnoreCase(String.valueOf(manual).trim());
+        LogBridge.add(ctx, "UPDATE", "checkUpdate called, manual=" + m);
+        UpdateChecker.check(ctx, m, new UpdateChecker.ResultCb() {
+            @Override
+            public void onResult(boolean hasNew, String version, int code, String notes,
+                                 String apkUrl, long size, String error) {
+                try {
+                    JSONObject o = new JSONObject();
+                    o.put("hasNew", hasNew);
+                    o.put("version", version == null ? "" : version);
+                    o.put("code", code);
+                    /* 正文可能很长（整份 CHANGELOG），只截一个够弹窗显示的摘要 */
+                    o.put("notes", brief(notes, 600));
+                    o.put("apkUrl", apkUrl == null ? "" : apkUrl);
+                    o.put("size", size);
+                    o.put("error", error == null ? "" : error);
+                    String js = "window.__rippleUpdateChecked && window.__rippleUpdateChecked("
+                            + o + ")";
+                    act.runJs(js);
+                } catch (Throwable e) {
+                    LogBridge.add(ctx, "UPDATE", "callback failed: " + e);
+                }
+            }
+        });
+    }
+
+    /**
+     * 下载更新包。下载进度与完成都通过回调送回网页。
+     *
+     * @param url       APK 下载地址（来自 checkUpdate 的回调）
+     * @param expectSize 期望字节数，0 = 不校验
+     * @param version   版本名，用于给下载的文件命名
+     */
+    @JavascriptInterface
+    public void downloadUpdate(final String url, final String expectSize, final String version) {
+        long sz = 0;
+        try { sz = Long.parseLong(String.valueOf(expectSize).trim()); } catch (Throwable ignored) {}
+        LogBridge.add(ctx, "UPDATE", "downloadUpdate: " + version + " " + url);
+        UpdateChecker.download(ctx, url, sz, version == null ? "new" : version,
+                new UpdateChecker.DownloadCb() {
+                    @Override
+                    public void onProgress(int percent) {
+                        try {
+                            act.runJs("window.__rippleUpdateProgress && "
+                                    + "window.__rippleUpdateProgress(" + percent + ")");
+                        } catch (Throwable ignored) {}
+                    }
+
+                    @Override
+                    public void onDone(File file) {
+                        /*
+                         * 下载完先问网页「现在就装吗」，而不是直接弹安装器。
+                         *
+                         * 理由：弹安装器会盖住整个屏幕，是一种很强的打断。
+                         * 用户可能只是想先下好、等会儿再装；
+                         * 也可能下载是自动触发的，不该突然跳走。
+                         * 推一个路径给网页，由网页弹确认框决定何时调用 installUpdate。
+                         */
+                        try {
+                            JSONObject o = new JSONObject();
+                            o.put("ok", true);
+                            o.put("path", file.getAbsolutePath());
+                            o.put("size", file.length());
+                            o.put("sha256", UpdateChecker.sha256(file));
+                            act.runJs("window.__rippleUpdateDownloaded && "
+                                    + "window.__rippleUpdateDownloaded(" + o + ")");
+                            /* 同时记进待安装槽位，供 installUpdate() 无参调用 */
+                            pendingApk = file;
+                        } catch (Throwable e) {
+                            LogBridge.add(ctx, "UPDATE", "onDone failed: " + e);
+                        }
+                    }
+
+                    @Override
+                    public void onError(String msg) {
+                        try {
+                            JSONObject o = new JSONObject();
+                            o.put("ok", false);
+                            o.put("error", msg == null ? "" : msg);
+                            act.runJs("window.__rippleUpdateDownloaded && "
+                                    + "window.__rippleUpdateDownloaded(" + o + ")");
+                        } catch (Throwable ignored) {}
+                    }
+                });
+    }
+
+    /** 上一次下载好的安装包（供 installUpdate 无参调用） */
+    private static File pendingApk = null;
+
+    /** 拉起系统安装器安装刚下载的包 */
+    @JavascriptInterface
+    public void installUpdate() {
+        final File f = pendingApk;
+        if (f == null || !f.isFile()) {
+            LogBridge.add(ctx, "UPDATE", "installUpdate: 没有待安装的包");
+            try {
+                act.runJs("window.__rippleUpdateInstallResult && "
+                        + "window.__rippleUpdateInstallResult(false,'没有待安装的包')");
+            } catch (Throwable ignored) {}
+            return;
+        }
+        act.runOnUiThread(() -> {
+            try {
+                UpdateChecker.install(act, f);
+                try {
+                    act.runJs("window.__rippleUpdateInstallResult && "
+                            + "window.__rippleUpdateInstallResult(true,'')");
+                } catch (Throwable ignored) {}
+            } catch (Throwable e) {
+                LogBridge.add(ctx, "UPDATE", "installUpdate failed: " + e);
+                try {
+                    act.runJs("window.__rippleUpdateInstallResult && "
+                            + "window.__rippleUpdateInstallResult(false,'"
+                            + brief(String.valueOf(e), 120).replace("'", " ") + "')");
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    /** 当前版本信息（网页侧显示用；比读 version.js 更准，因为来自安装包本身） */
+    @JavascriptInterface
+    public String updateCurrentVersion() {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("code", UpdateChecker.currentCode(ctx));
+            o.put("name", UpdateChecker.currentName(ctx));
+            return o.toString();
+        } catch (Throwable e) {
+            return "{}";
+        }
+    }
+
+    /**
+     * 把长正文压成适合弹窗的摘要。
+     *
+     * Release 正文包含整份 CHANGELOG（上千行），直接塞进弹窗会撑爆界面，
+     * 也不适合当通知内容。这里保留开头若干行，中间转折处补一个省略号。
+     */
+    private static String brief(String s, int max) {
+        if (s == null) return "";
+        String t = s.trim();
+        if (t.length() <= max) return t;
+        return t.substring(0, max).trim() + "…";
     }
 }

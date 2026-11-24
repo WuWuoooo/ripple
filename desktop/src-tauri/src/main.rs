@@ -35,7 +35,7 @@ use tauri::{Emitter, Manager, RunEvent, State};
 struct AppState {
     client: Mutex<Option<Arc<Mutex<netease::Client>>>>,
     data_dir: PathBuf,
-    /// 歌词窗口的状态（见 lyric.rs）。与 client 分开加锁，
+    /// 歌词窗口的状态（见本文件下方「歌词窗」注释块）。与 client 分开加锁，
     /// 免得「推一句歌词」和「发一次网络请求」互相等锁。
     lyric: Mutex<LyricState>,
 }
@@ -60,6 +60,26 @@ struct LyricState {
     shadow: bool,
     fill: bool,
     fill_hex: String,
+    /*
+     * ===== 时间外推的基准点（D-02，1.3.4）=====
+     *
+     * Android 侧 LyricOverlay 有同样的机制，原因也相同：
+     * 歌词窗最主要的用法就是「切到别的程序时看」，那时主窗口
+     * rAF 暂停、1 秒 ticker 被 clearInterval，逐帧推送断流 ——
+     * 表现就是「一下填满、换句才动」。
+     *
+     * 这里只负责**把基准带过去**，真正的按帧外推在 lyric.html 里
+     * 用 performance.now() 做（那个窗口自己可见，rAF 照常运行）。
+     * 不在 Rust 侧开定时器，是因为跨进程时钟比较容易错位，
+     * 而且多一个线程就多一处要维护的启停逻辑。
+     */
+    base_progress: f32,
+    /// 本句总时长（秒）。<= 0 表示未知，此时不启用外推。
+    line_dur: f32,
+    /// 播放倍速（1.0 = 正常）。外推时要按它缩放，否则 1.5x 会跟不上。
+    rate: f32,
+    /// 是否正在播放。false 时冻结在 base_progress，不继续推进。
+    playing: bool,
     /// 窗口是否已成功创建过。创建失败（无合成器 / 无 DISPLAY）时置 false，
     /// 后续 show 直接返回失败而不是反复尝试。
     window_ok: bool,
@@ -165,6 +185,54 @@ fn netease(
     Ok(())
 }
 
+/// 在系统默认浏览器里打开一个链接（1.3.4，供「检查更新」用）。
+///
+/// 为什么不引入 `tauri-plugin-opener` 或 shell 插件：
+///   本机构建是 `--offline --locked`，加依赖会直接失败（审查报告也记过
+///   缺 `adler2` 那件事）；而 `tauri-plugin-shell` 虽然在 Cargo.toml 里
+///   但从未注册，贸然启用还要配 capability 权限。
+///   这里只做一件事 —— 让系统按 URL 打开默认浏览器，各平台各有现成命令，
+///   直接 `Command::spawn` 是最小且可靠的做法。
+///
+/// 安全说明：只接受 http/https 且非空的 URL，其他 scheme 一律拒绝。
+/// 这条检查是必要的 —— 若将来有人把这个命令接到用户输入上，
+/// 没有 scheme 白名单就可能被用来执行 `file://` 或自定义协议。
+#[tauri::command]
+fn open_external(url: String) -> bool {
+    let u = url.trim();
+    if u.is_empty() || !(u.starts_with("http://") || u.starts_with("https://")) {
+        eprintln!("open_external: 拒绝非 http(s) 链接");
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        /* xdg-open 是 freedesktop 标准，主流发行版都自带 */
+        return std::process::Command::new("xdg-open")
+            .arg(u)
+            .spawn()
+            .is_ok();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        /*
+         * Windows 上不能直接 `start url`（那是 cmd 内建命令）。
+         * `cmd /C start "" "url"` 是标准做法；第一个空参数是窗口标题占位，
+         * 少了它，带引号的 URL 会被当成窗口标题而不打开。
+         */
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", "", u])
+            .spawn()
+            .is_ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open").arg(u).spawn().is_ok();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 /// 与 Android `HttpBridge.notify` 同签名。
 ///
 /// 桌面端目前返回 `false`：系统通知在三个平台上要走三套不同 API
@@ -178,17 +246,20 @@ fn notify(_title: String, _body: String) -> bool {
     false
 }
 
-/// 桌面端没有悬浮窗概念，恒 false。前端据此隐藏「状态栏歌词」相关设置项。
-#[tauri::command]
-fn can_draw_overlay() -> bool {
-    false
-}
-
-/// 请求悬浮窗权限：桌面端无事可做，恒 false。
-#[tauri::command]
-fn request_overlay_permission() -> bool {
-    false
-}
+/*
+ * D-06（审查报告，1.3.4）：删掉 can_draw_overlay / request_overlay_permission。
+ *
+ * 这两条命令以前恒返回 false，注释还写着「前端据此隐藏状态栏歌词设置项」——
+ * 但真相是 desktop/bridge.js 里 `canDrawOverlay: () => true` 硬编码返回 true，
+ * 从不 invoke 这两个 Rust 命令（全 desktop/ 目录 grep 无调用点）。
+ *
+ * 危害不是「多两条死代码」，而是**注释与事实相反**：
+ * 将来有人照着注释让 JS 真去调 Rust，返回 false 会立刻把整个歌词功能
+ * 从设置页抹掉 —— 一个本来好好的功能被一行「正确的注释」删掉。
+ *
+ * 桌面端的真实口径：没有悬浮窗权限这个概念（歌词是独立窗口），
+ * 所以 JS 桥直接返回 true 是对的。这里不再对外暴露语义相反的命令。
+ */
 
 /// 与 Android `HttpBridge.safeMode` 同签名：桌面端永远不是安全模式。
 #[tauri::command]
@@ -242,6 +313,10 @@ fn push_lyric_state(app: &tauri::AppHandle, st: &LyricState) {
         "shadow": st.shadow,
         "fill": st.fill,
         "fillHex": st.fill_hex,
+        "baseProgress": st.base_progress,
+        "lineDur": st.line_dur,
+        "rate": st.rate,
+        "playing": st.playing,
     });
     // 窗口还没建 / 已被关闭时 emit 会返回错误 —— 这不是异常情况，
     // 用户关掉歌词窗再打开就会走到这条路径，所以只忽略不报错。
@@ -355,11 +430,37 @@ fn lyric_overlay_show(
     if let Ok(v) = alpha.trim().parse::<f32>() {
         guard.alpha = v.clamp(0.15, 1.0);
     }
-    if let Ok(v) = x.trim().parse::<i32>() {
-        guard.x = v;
-    }
-    if let Ok(v) = y.trim().parse::<i32>() {
-        guard.y = v;
+    /*
+     * D-04（审查报告，1.3.4）：负值 = 「恢复默认位置」。
+     *
+     * 以前这里把 -1 当成合法坐标原样写进 state 和磁盘：
+     *   · 窗口已存在时，这个函数**从不 set_position**，
+     *     所以用户点完「恢复默认位置」窗口原地不动；
+     *   · -1 又被持久化了，重启后读回来还是 -1，等于一直没恢复。
+     *   UI 反馈「已恢复默认位置」，实际什么都没发生。
+     *
+     * 现在的口径：
+     *   · 收到 < 0 → 视为「恢复默认」：删掉位置文件、把 state 也清成 -1、
+     *     并对**已存在的窗口**真的 set_position 到默认位置；
+     *   · 收到 >= 0 → 正常保存（逻辑坐标，见 lyric_save_pos 的 D-03 说明）。
+     */
+    let want_reset = x.trim().parse::<i32>().map(|v| v < 0).unwrap_or(false)
+        || y.trim().parse::<i32>().map(|v| v < 0).unwrap_or(false);
+    if want_reset {
+        guard.x = -1;
+        guard.y = -1;
+        let dir = app
+            .path()
+            .app_config_dir()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let _ = std::fs::remove_file(dir.join("lyric-pos.json"));
+    } else {
+        if let Ok(v) = x.trim().parse::<i32>() {
+            guard.x = v;
+        }
+        if let Ok(v) = y.trim().parse::<i32>() {
+            guard.y = v;
+        }
     }
     guard.bold = bold == "true";
     guard.shadow = shadow == "true";
@@ -381,9 +482,37 @@ fn lyric_overlay_show(
     // 锁定状态变化要同步到窗口的点击穿透设置
     if let Some(win) = app.get_webview_window(LYRIC_WINDOW) {
         let _ = win.set_ignore_cursor_events(guard.locked);
+        /*
+         * D-04：位置变化（尤其「恢复默认」）必须作用到**已存在的窗口**。
+         * 以前这段完全缺失 —— set_position 只在创建时读一次，
+         * 于是「恢复默认位置」对已经开着的歌词窗永远无效。
+         */
+        if want_reset {
+            if let Ok(pos) = default_lyric_pos(&win) {
+                let _ = win.set_position(tauri::PhysicalPosition::new(pos.0, pos.1));
+            }
+        } else if guard.x >= 0 && guard.y >= 0 {
+            let scale = win.scale_factor().unwrap_or(1.0);
+            let px = (guard.x as f64 * scale).round() as i32;
+            let py = (guard.y as f64 * scale).round() as i32;
+            let _ = win.set_position(tauri::PhysicalPosition::new(px, py));
+        }
     }
     push_lyric_state(&app, &guard);
     true
+}
+
+/// 默认歌词窗位置（物理像素）：水平居中、竖直靠上。
+///
+/// 与 Android placeDefault() 的思路一致 —— 用户点「恢复默认位置」时
+/// 应该回到一个「一定能看见」的位置，而不是左上角或被别的窗口挡住的地方。
+fn default_lyric_pos(win: &tauri::WebviewWindow) -> Result<(i32, i32), ()> {
+    let monitor = win.current_monitor().ok().flatten().ok_or(())?;
+    let size = monitor.size();
+    let win_size = win.outer_size().map_err(|_| ())?;
+    let x = ((size.width as i32) - (win_size.width as i32)) / 2;
+    let y = (size.height as i32) / 8;
+    Ok((x.max(0), y.max(0)))
 }
 
 /// 更新歌词文字。与 Android `updateLyricOverlay` 同语义。
@@ -428,6 +557,57 @@ fn lyric_overlay_progress(app: tauri::AppHandle, state: State<'_, AppState>, pro
         return; // 0.4% 以内不推（与 Android setProgress 的阈值一致）
     }
     guard.progress = v;
+    push_lyric_state(&app, &guard);
+}
+
+/// 设置填充的「基准点」，由歌词窗口自己按时间外推（D-02，1.3.4）。
+///
+/// 与 Android `LyricOverlay.setTiming` 完全同语义，参数含义也一样：
+/// @param progress 当前这一句的进度 0..1（推送那一刻的真值）
+/// @param lineDur  本句总时长（秒）；<= 0 表示未知，不启用外推
+/// @param rate     播放倍速（1.0 = 正常）
+/// @param playing  是否正在播放；false 时冻结不推进
+///
+/// 为什么要这套机制（与 Android 同一个理由）：
+///   歌词窗的使用场景就是「切到别的程序时看」—— 那时主窗口 rAF 暂停、
+///   1 秒 ticker 被 clearInterval、timeupdate 被节流，逐帧推送断流。
+///   只推「基准点」让接收方自己外推，就不依赖发送方的定时器还活着。
+///
+/// 为什么外推在 lyric.html 里做、不在这里开定时器：
+///   那个窗口自己可见，rAF 照常运行；而在 Rust 侧要多开一个线程、
+///   多一处启停逻辑，还要处理跨进程时钟对齐 —— 不值得。
+#[tauri::command]
+fn lyric_overlay_timing(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    progress: String,
+    line_dur: String,
+    rate: String,
+    playing: String,
+) {
+    let mut guard = match state.lyric.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let p = progress.trim().parse::<f32>().unwrap_or(0.0);
+    let p = if p.is_finite() {
+        p.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let d = line_dur.trim().parse::<f32>().unwrap_or(0.0);
+    let d = if d.is_finite() && d > 0.0 { d } else { 0.0 };
+    let r = rate.trim().parse::<f32>().unwrap_or(1.0);
+    let r = if r.is_finite() && r > 0.0 { r } else { 1.0 };
+    let play = playing.trim().eq_ignore_ascii_case("true");
+
+    guard.base_progress = p;
+    guard.line_dur = d;
+    guard.rate = r;
+    guard.playing = play;
+    /* progress 也同步成基准值：外推不可用时（d<=0）退化成静态显示，
+    此时窗口读的就是 progress，必须是最新的。 */
+    guard.progress = p;
     push_lyric_state(&app, &guard);
 }
 
@@ -476,15 +656,33 @@ fn lyric_overlay_sync(state: State<'_, AppState>) -> serde_json::Value {
 /// 歌词窗拖动结束后回报新位置并落盘。
 #[tauri::command]
 fn lyric_save_pos(app: tauri::AppHandle, state: State<'_, AppState>, x: i32, y: i32) {
+    /*
+     * D-03（审查报告，1.3.4）：这里收到的 x/y 是**物理像素**，
+     * 而 builder.position() 接受的是**逻辑像素** —— 必须换算后再存，
+     * 否则 150% / 200% 缩放的屏幕上每拖一次就放大一次，
+     * 几次之后窗口跑出屏幕，「位置持久化」实际是坏的。
+     *
+     * lyric.html 那边用 window.outerPosition() 取位置，它返回物理像素
+     * （Tauri 的 webview_window.rs 里 outer_position 就是物理坐标）。
+     * 这里用当前窗口的 scale_factor 把它除回逻辑坐标。
+     */
+    let scale = app
+        .get_webview_window(LYRIC_WINDOW)
+        .and_then(|w| w.scale_factor().ok())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0);
+    let lx = (x as f64 / scale).round() as i32;
+    let ly = (y as f64 / scale).round() as i32;
+
     if let Ok(mut g) = state.lyric.lock() {
-        g.x = x;
-        g.y = y;
+        g.x = lx;
+        g.y = ly;
     }
     let dir = app
         .path()
         .app_config_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
-    save_lyric_pos(&dir, x, y);
+    save_lyric_pos(&dir, lx, ly);
 }
 
 /// 单实例守卫（审查 D-07）。
@@ -517,17 +715,59 @@ fn acquire_single_instance(dir: &std::path::Path) -> bool {
             }
         }
     }
-    match std::fs::File::create(&lock) {
+    /*
+     * D-05（审查报告，1.3.4）：必须用 create_new 才是真的 O_EXCL。
+     *
+     * 以前写的是 File::create（write+create+truncate）——
+     * 那根本不是排他创建，注释里说的「挡住极端竞态」形同虚设：
+     * 两个实例同时启动时都能成功 open 同一个路径，各自 truncate 后写自己的
+     * pid，最后活下来的是后写的那个，而两个实例都在跑。
+     *
+     * create_new(true) 映射到 O_CREAT|O_EXCL：文件已存在就返回 AlreadyExists，
+     * 由操作系统保证原子性，这是唯一能真正解决竞态的写法。
+     */
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
         Ok(mut f) => {
             let _ = write!(f, "{}", std::process::id());
             true
         }
-        Err(_) => {
-            /* 创建失败也不要因此拒绝启动 —— 宁可多开一个，也不能打不开 */
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            /* 上面已经处理过「锁文件里是死进程」的情况，走到这里说明真有一个活的，
+            或者上面那个 read_to_string 失败（权限/编码）导致没判出来。
+            两种都不拒绝启动 —— 宁可多开一个，也不能打不开。 */
             true
         }
+        Err(_) => true,
     }
 }
+
+/// 删除单实例锁文件（D-05）。
+///
+/// 以前的实现正常退出时不删 lock：pid 被系统复用后，若恰好命中一个活进程，
+/// `kill(pid,0)` 返回 0，于是每次启动都判定「已在运行」直接退出 ——
+/// 用户不手动删文件就再也打不开这个 App。
+///
+/// 这里在退出时删，但**先校验文件里写的是不是自己的 pid**：
+/// 如果读到的是别的 pid（说明这个文件已经不属于本次会话，可能是并发启动的
+/// 另一个实例写的），就不要删，免得把别人的锁误删掉。
+#[cfg(unix)]
+fn release_single_instance(dir: &std::path::Path) {
+    let lock = dir.join(".ripple-instance");
+    let mine = std::process::id().to_string();
+    match std::fs::read_to_string(&lock) {
+        Ok(text) if text.trim() == mine => {
+            let _ = std::fs::remove_file(&lock);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(windows)]
+fn release_single_instance(_dir: &std::path::Path) {}
 
 // 极小的 `kill(pid, 0)` 绑定：只用于「进程是否存活」探测。
 // 不引入 libc crate（离线环境没缓存），直接声明外部符号。
@@ -579,8 +819,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             netease,
             notify,
-            can_draw_overlay,
-            request_overlay_permission,
+            lyric_overlay_timing,
+            open_external,
             safe_mode,
             /* 歌词窗（状态栏歌词的桌面端对等物），见上方注释 */
             lyric_overlay_show,
@@ -612,6 +852,17 @@ fn main() {
                             guard.save_cookie();
                         }
                     }
+                }
+                /*
+                 * D-05：退出时删掉单实例锁文件。
+                 *
+                 * 不删的话，pid 被系统复用后若恰好命中一个活进程，
+                 * 下次启动会一直判定「已在运行」直接退出 ——
+                 * 用户不手动删文件就再也打不开 App。
+                 * release_single_instance 内部会先校验文件里的 pid 是不是自己的。
+                 */
+                if let Ok(dir) = app.path().app_config_dir() {
+                    release_single_instance(&dir);
                 }
             }
         });

@@ -307,7 +307,7 @@ final class CrashLog {
          * "version: x.y.z (" + NNN + ")"：android/sync-version.sh 用 sed 同步它，
          * CI 也用 grep -F 校验这一串，改成别的写法会让构建直接失败。
          */
-        String fallbackVersion = "version: 1.3.3 (" + 133 + ")";
+        String fallbackVersion = "version: 1.3.4 (" + 134 + ")";
         String realVersion = versionOf(ctx);
         pw.println(realVersion == null ? fallbackVersion : "version: " + realVersion);
         pw.println();

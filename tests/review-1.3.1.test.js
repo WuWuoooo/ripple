@@ -597,7 +597,7 @@ test('[报障] transition window：_onEnded 置位、load 成功解除', () => {
 
 /* ============ 1.3.3 第四轮：状态栏填充的「黑填充」防护 ============ */
 
-test('R-13 状态栏填充推送前会挡掉过暗的颜色', () => {
+test('R-13 状态栏填充推送前会挡掉已知的坏颜色（E-03/E-04 口径）', () => {
   const src = read('app/js/app.js');
   /* 必须有按 hex 算亮度的适配层，且不能覆盖掉 inkForAccent 用的那个 */
   assert.match(src, /function hexLuminance\(hex\)/, '必须有 hex → 相对亮度的适配函数');
@@ -606,9 +606,22 @@ test('R-13 状态栏填充推送前会挡掉过暗的颜色', () => {
   assert.ok(!/function relativeLuminance\(hex\)/.test(src),
     '不能用 hex 签名覆盖 (r,g,b) 版本，否则按封面主色挑墨色会整体算错');
 
-  /* 推送路径上必须真的有这道检查 */
-  assert.match(src, /hexLuminance\(pushFill\)/,
-    'applySbOverlay 推送前必须检查填充色亮度');
+  /*
+   * E-03 / E-04（1.3.4）：兜底口径收窄了。
+   *
+   * 以前是「相对亮度 < 0.12 就换默认紫」，有两个副作用：
+   *   ① 默认紫反色得 #4C5D00（亮度 0.0937）又被兜底改回紫 ——
+   *      「深色模式自动反色」对默认色永远无效；
+   *   ② 用户主动选的暗色（如纯黑）被静默替换，与 store v5 迁移
+   *      「尊重用户选的 #000000」互相打架。
+   *
+   * 现在只对「已知脏数据」兜底，且开了反色时完全不干预。
+   */
+  assert.match(src, /isDirty/, '必须有已知坏值判定');
+  assert.match(src, /'#000000'/, '纯黑是已知坏值之一');
+  assert.match(src, /'#4C5D00'/, '旧暗橄榄是已知坏值之一');
+  assert.ok(/if \(!\(darkNow && s\.sbFillInvert\)\)/.test(src),
+    '开了反色时不该再兜底，否则反色结果会被改回去（E-03）');
   assert.match(src, /DEFAULTS_SB_FILL/, '必须有兜底色常量');
 });
 

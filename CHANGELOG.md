@@ -7,6 +7,175 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
 
 ---
 
+## 1.3.4 — 第十一个版本
+
+> **本次依据**：来自 Hy4 Flash 的 1.3.3 代码审查报告，
+> 把剩余未完成的 18 条全部做完（3 high / 7 medium / 8 low）。
+> **实现与文档**：Deepseek V4.1 Flash 1017。
+
+这一版没有新功能，是**纯整改版** —— 上一版把「歌词染色」做对了，
+但审查报告指出还有一批遗留问题（含 3 个 high），这一版清完。
+
+### 一、三个 high
+
+**S-01 登出竞态：慢请求会把登录态复活**
+
+`epochAtStart` 原来写在 `https.request` 的**响应回调**里 —— 那是响应头到达的时刻，
+用户可能早就点过退出了（`cookieEpoch` 已自增）。于是采到的是新代际、
+后面的 `epochAtStart !== cookieEpoch` 永远相等，代际保护完全失效：
+一个慢请求（`status` 串发的 vip/level/like、大歌单）的 `Set-Cookie`
+会在登出之后把 `MUSIC_U` 合并回 `cookieJar` 并写盘，**下次启动又处于登录态**。
+
+这是 1.2.2 审查 S-03 的不完整修复 —— 机制建对了，采样点放错了。
+现在把采样移到 `https.request` 调用**之前**。
+
+**D-01 歌词窗「未锁定可拖动」从未实现**
+
+Tauri 2 的拖动靠 `data-tauri-drag-region` 属性找拖拽区域，而 `lyric.html`
+全文没有这个属性 —— 鼠标拖歌词窗纹丝不动，只有 WM 的 Alt+拖动有效。
+README 却把「可拖动」列为已实现。
+
+已给 `<div id="wrap">` 加上 `data-tauri-drag-region="deep"`
+（必须用 `deep`：点在 `<span id="t">` 子节点时裸属性会因 `el !== composedPath[0]` 失效）。
+
+**D-02 桌面桥缺 `setLyricTiming`，后台填充回退到坏路径**
+
+`app.js` 用 `typeof N.setLyricTiming === 'function'` 判断走「基准点 + 外推」
+还是「逐帧推送」。桌面桥没有这个方法 → 永远走后者。
+而歌词窗最主要的用法恰恰是**切到别的程序时看**，那时主窗口 rAF 暂停、
+ticker 被 clearInterval，逐帧推送断流 → 退化成「一下填满、换句才动」，
+正是 1.3.3 在 Android 上花十一轮才修掉的那个症状。
+
+已补全三层：
+- `bridge.js` 加 `setLyricTiming(p, lineDur, rate, playing)`
+- Rust 加 `lyric_overlay_timing` 命令 + `LyricState` 四个基准字段
+- `lyric.html` 用 `performance.now()` 自行外推（不额外开定时器，
+  那个窗口自己可见、rAF 照常运行）
+
+### 二、七个 medium
+
+| 编号 | 问题 | 修法 |
+|---|---|---|
+| E-03 | 亮度兜底写在反色**之后**，默认紫反色得 `#4C5D00`（亮度 0.094）又被改回紫 —— 「深色模式自动反色」对默认色永远无效 | 兜底移到反色之前、只判用户选的原色；开了反色则完全不干预 |
+| E-04 | 用户主动选的暗色填充被静默换成紫，与 store v5 迁移「尊重 #000000」冲突 | 兜底只认「已知脏数据」（`#000000` / `#4C5D00`），其余不动 |
+| E-06 | v1→v2 迁移无条件重开用户主动关掉的 `sbFill` | 新增 `sbFillUserSet` 标记，由设置变更入口写入；有标记则不迁移 |
+| E-07 | `Store.set()` 的 rAF 合帧，排队后立刻锁屏会丢这批设置 | 每次 set 重看可见性；发现已隐藏且挂着 rAF 就 `cancelAnimationFrame` 并改 `setTimeout` 立即补写 |
+| S-02 | 「换 IP 后失效」测试名不副实（`host` 写死 127.0.0.1），`tokenValid` 零覆盖 | helper 支持 `localAddress`，用 127.0.0.2 真正换源地址，断言 401 |
+| D-03 | 位置坐标单位错配（存物理像素、恢复当逻辑像素），HiDPI 越拖越偏 | `lyric_save_pos` 收到物理坐标后除以 `scale_factor()` 再存 |
+| D-04 | 「恢复默认位置」对已存在窗口无效，且不删 `lyric-pos.json` | 检测 x/y 由 ≥0 变 <0 → 删文件、清 state、对已有窗口真的 `set_position` |
+| D-05 | 单实例没用真 O_EXCL、退出不删 lock，pid 复用后永久拒绝启动 | 改 `OpenOptions.create_new(true)`（真 `O_CREAT|O_EXCL`）；退出时校验 pid 后删 lock |
+| D-06 | `can_draw_overlay` / `request_overlay_permission` 是死命令且语义与桥相反 | 删除两条命令与注册；JS 桥硬编码 `true` 本来就是对的 |
+
+### 三、八个 low
+
+| 编号 | 修法 |
+|---|---|
+| S-03 | workflow `paths` 里 `desktop.yml` → 实际的 `desktop-build.yml` |
+| S-04 | `server.js` 注释「3 个槽位」改为引用 `TOKEN_PER_IP` 常量 |
+| S-05 | `sw.js` 注释「3 个」→「每 IP 6 个（新 + 5 旧）」 |
+| S-06 | `lyricfill.test.js` 条数 21 → 31 |
+| S-07 | README「11 个类」→ 12 个 |
+| D-07 | 白名单测试自己重写判据、口径与生产相反 → 抽 `is_safe_upstream_path` 共用 |
+| D-08 | 删 `netease.rs` 里取一次即丢的死代码 |
+| D-09 | capabilities 拆成 `default.json`（main）+ `lyric.json`（歌词窗），按最小权限原则 |
+| D-10 | `build-frontend.sh` 补同步 Cargo.toml / Cargo.lock 版本（否则安装包与崩溃日志版本会对不上） |
+| D-11 | 桌面 README「已随 1.3.0 发布」→ 1.3.4；「没有未实现项」→ 如实清单（媒体控制/系统通知/macOS） |
+| D-12 | 注释引用的 `lyric.rs` 不存在 → 改为指向 `main.rs` 里的注释块 |
+
+### 四、顺带修正
+
+- 桌面端 workflow 头部与 bundle job 注释写着「macOS 默认参与」，
+  而实际 `matrix` 只有 Linux + Windows —— 两处自相矛盾的旧注释已改成与事实一致
+  （本项目不产出 macOS 包：未签名会被 Gatekeeper 拦，要能双击打开需要
+  Apple Developer + 公证，且本机无法验证）
+
+### 五、回归测试：169 → 170
+
+新增/更新 6 条，都直接对着上面某一条：
+
+| 变化 | 对应 |
+|---|---|
+| `S-13-e2e 令牌` 标题改名 + 真实换 IP 断言 401 | S-02 |
+| `E-06：主动关掉过的老用户（有标记）不会被重新打开`（新增） | E-06 |
+| `E-06：老存档（无标记）升级后补成 true`（改名改写） | E-06 |
+| `迁移后立刻 save()…` 测试数据改为「不带 sbFill」 | E-06 |
+| `R-13 状态栏填充…` 断言改为已知坏值口径 | E-03 / E-04 |
+| 清单一致性检查同步到 1.3.4 | 版本 |
+
+### 六、检查更新（用户需求）
+
+> 用户原话：「在设置的底下、软件日志的下方加一个检查更新，点击向 GitHub 发送请求
+> 查看是否有新版本，每次进入时也要检查有无新版本，然后点击弹窗弹出来的更新按钮
+> 可以直接下载新的安装包，然后可以点击安装。其他两端 Windows 和 Linux 也需要。」
+
+**先说一个被否掉的方案**：用户最初的想法其实更大胆 ——「只更新 HTML/CSS/JS，
+运行时重启生效」（热更新）。技术上完全可行（本项目无 Gradle、无打包器，
+`assets/www` 天然可替换，`sw.js` 还自带版本缓存）。
+
+但**APK 本体只有 0.6 MB**，用户下载一次就完了；而热更新要引入
+「可写目录 + 清单签名 + 原子切换 + 自动回滚」一整套机制，
+复杂度和风险远高于它省下的那 0.6 MB。所以改为直接下发安装包。
+
+#### Android
+
+设置页「关于」分组、软件日志下方新增「检查更新」一行：
+
+| 能力 | 实现 |
+|---|---|
+| 检查 | `UpdateChecker.check()` 在**后台单线程**请求 GitHub Release API |
+| 节流 | 自动检查 6 小时一次（SharedPreferences 记时间）；手动点击不受限 |
+| 下载 | 下到 `cacheDir/update/`，边下边推进度条 |
+| 校验 | 按 GitHub 给的 `size` 比对，不一致直接删包报错 |
+| 安装 | 自实现 `ApkProvider`（ContentProvider）+ 拉起系统安装器 |
+
+**为什么自己写 ContentProvider**：本项目硬约束是**不用 AndroidX**，
+所以用不了 `androidx.core.content.FileProvider`；而 Android 7.0 起
+禁止用 `file://` 跨应用传文件，必须给 `content://` URI。
+实现刻意收窄：只服务 `cacheDir/update` 目录、只支持读、
+文件名含 `/` `\` `..` 一律拒绝、再用 `getCanonicalPath()` 兜底比对 —— 
+ContentProvider 一旦授权出去，任何拿到 URI 的组件都能读，可见面必须压到最小。
+
+**为什么下载完先问再装**：弹安装器会盖住整个屏幕，是很强的打断；
+用户可能只想先下好等会儿再装。所以先弹「下载完成 → 去安装」的确认框。
+
+**Android 8.0+ 的「安装未知应用」权限**：这是敏感权限但**不是运行时权限**，
+系统不会弹框，由用户在设置列表里单独开关。代码用 `canRequestPackageInstalls()`
+检测，没开就跳转设置页并 toast 提示 —— 否则用户会觉得「点了没反应」。
+
+#### Windows / Linux
+
+桌面端**只做检查 + 打开下载页**，不代用户执行安装器：
+各平台安装方式差异太大（Windows 跑 `setup.exe`、Linux 换 AppImage 或用
+`dpkg` 装 deb），由网页安全唤起固定不现实。
+
+- 检查：`app.js` 检测到桌面桥没有 `checkUpdate` 时自动改走 `fetch` 直连
+  GitHub API（`tauri.conf.json` 的 `csp` 是 `null`，允许跨域）
+- 打开页面：新增 Rust 命令 `open_external`，按平台分别用
+  `xdg-open` / `cmd /C start` / `open`；**只接受 http(s) URL**，其余 scheme 拒绝
+
+#### CI 侧配套
+
+GitHub Release API **不提供 versionCode**（那只存在于 APK 内部），
+而「哪个版本更新」必须按整数比 —— 按版本名字符串比会在
+`1.3.10` vs `1.3.9` 上判错。所以 workflow 在 Release 正文里埋一行
+`<!-- ripple-version-code: 134 -->`，App 端解析它；找不到时退化成版本名比较。
+
+#### 这一块没做的事
+
+- **桌面端没有做「下载并安装」**：三个平台没有统一的可唤起安装机制，
+  强行做要么需要提权（Linux `pkexec`），要么体验更差。目前是打开下载页
+- **没有做增量更新**：每次都是完整 APK（0.6 MB，不值得做差分）
+
+### 七、这一版没做的事
+
+- **桌面端仍未在真实桌面环境跑过**（本机 aarch64 proot 无显示服务器；
+  本机 cargo 1.75 离线缓存缺 `adler2 v2.0.1`，`cargo check --offline --locked` 跑不通）。
+  本版桌面端改动只做了 `rustfmt --check` 语法/格式级验证 + 逐行静态核对，
+  **编译与运行行为需 CI / 用户实测确认**。这一条必须如实写出来。
+- 审查报告里「已修复」的 A-01（线程）与 E-01/E-02/E-05 等条目，本版未再改动。
+
+---
+
 ## 未发布 · 桌面端（Tauri）验证分支
 
 > 这一节对应 `feat/desktop-tauri` 分支，**不在任何 Release 里**。

@@ -240,7 +240,7 @@ app/                    ← 网页版，同时是 APK 里的 assets/www（三端
 │   └── app.js          ← 界面与业务
 └── sw.js               ← Service Worker
 
-android/                ← Java 外壳（11 个类，见 CONTRIBUTING.md 的「代码结构」）
+android/                ← Java 外壳（12 个类，见 CONTRIBUTING.md 的「代码结构」）
 desktop/                ← 桌面端（Tauri），见 desktop/README.md
 ├── bridge.js           ← 把 RippleNative 桥照原样造出来，前端零改动
 ├── lyric.html          ← 独立置顶歌词小窗

@@ -62,6 +62,13 @@
     sbShadow: true,
     sbFill: true,             // 跟随播放进度填充（1.3.3 起默认开：卡拉OK染色是本版主功能）
     /*
+     * 用户是否明确动过 sbFill 这个开关（E-06）。
+     *
+     * 存在的唯一意义就是让 v1→v2 迁移能区分「从没碰过」和「主动关掉」：
+     * 后者绝不能被升级逻辑重新打开。由设置项的开关回调写入。
+     */
+    sbFillUserSet: false,
+    /*
      * 填充色默认用**强调紫**而不是原来的浅青 #7DE3D0。
      *
      * 原因：文字默认色是纯白 #FFFFFF，而浅青和白色都是高明度色，
@@ -226,7 +233,21 @@
      * 优先照顾「升级后能看到新功能」，代价是极少数主动关过它的人要再关一次。
      */
     if (fromVersion < 2) {
-      if (saved.sbFill === false || saved.sbFill === undefined) {
+      /*
+       * E-06（审查报告，1.3.4）：不能再无条件重开。
+       *
+       * 以前只要 sbFill 是 false 或 undefined 就改成 true ——
+       * 1.3.2 里主动关掉填充的用户升级后会被偷偷打开
+       *（「我明明关了，怎么又开了」），而且注释自己也承认分不清两种情况。
+       *
+       * 现在的判据：看存档里有没有 sbFillUserSet 标记。
+       *   · 有标记 → 用户明确动过这个开关，绝对尊重，不迁移；
+       *   · 无标记 → 老存档（还没这个字段），视为没碰过，升级时开一次。
+       *
+       * 标记由 UI 层的开关 handler 写入（见 markSbFillUserSet），
+       * 所以新版本用户只要点过一次开关，之后任何迁移都不会再动它。
+       */
+      if (saved.sbFillUserSet !== true && saved.sbFill !== false) {
         out.sbFill = true;
       }
     }
@@ -395,6 +416,10 @@
     state: null,
     localTracks: [],
     _db: null,
+    /** 合帧写盘的句柄（rAF id 或 setTimeout id） */
+    _saveRaf: 0,
+    /** 上面那个句柄是不是 rAF（决定隐藏时要不要 cancelAnimationFrame） */
+    _saveRafIsRaf: false,
 
     /* ---------- 持久化 ---------- */
     load() {
@@ -533,13 +558,35 @@
      */
     set(key, val) {
       this.state.settings[key] = val;
-      if (this._saveRaf) return;
-      const run = () => { this._saveRaf = 0; this.save(); };
+      /*
+       * E-07（审查报告，1.3.4）：页面转隐藏时，要把**已经排进 rAF** 的那批
+       * 改成 setTimeout 立即补写。
+       *
+       * 以前只在「第一次 set」时判断一次 document.hidden：
+       *   · 第一批 set 排进 rAF 后用户立刻锁屏 → rAF 被暂停、回调永不执行；
+       *   · 此后再 set，因为 _saveRaf 非空直接 return，也不会改走 setTimeout。
+       * 结果这整批设置丢失（进程被回收时更彻底），最典型的是睡眠定时器 ——
+       * 用户设完立刻按 Home，重启后定时器不存在。
+       *
+       * 现在的做法：每次 set 都重新看一次可见性；
+       * 一旦发现已经隐藏、而队列里还挂着 rAF，就取消它并立刻用 setTimeout 补写。
+       */
       const hidden = typeof document !== 'undefined'
         && (document.hidden || document.visibilityState === 'hidden');
-      this._saveRaf = (!hidden && typeof requestAnimationFrame === 'function')
-        ? requestAnimationFrame(run)
-        : setTimeout(run, 0);
+      if (hidden && this._saveRaf && this._saveRafIsRaf) {
+        try { cancelAnimationFrame(this._saveRaf); } catch (e) {}
+        this._saveRaf = 0;
+        this._saveRafIsRaf = false;
+      }
+      if (this._saveRaf) return;
+      const run = () => { this._saveRaf = 0; this._saveRafIsRaf = false; this.save(); };
+      if (!hidden && typeof requestAnimationFrame === 'function') {
+        this._saveRaf = requestAnimationFrame(run);
+        this._saveRafIsRaf = true;
+      } else {
+        this._saveRaf = setTimeout(run, 0);
+        this._saveRafIsRaf = false;
+      }
     },
 
     /* ---------- IndexedDB ---------- */

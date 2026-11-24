@@ -38,6 +38,40 @@ pub struct Client {
     cookie_path: PathBuf,
 }
 
+/// 上游路径白名单（D-07，1.3.4）。
+///
+/// 为什么抽成独立函数：
+///   以前这段判据是**内联在 Client::post 里**的，而单元测试又自己重写了一遍
+///   同样逻辑 —— 两边口径还不一致：测试要求「全部小写、不许 ? = &」，
+///   而生产实现允许大写（`R_SO_4_` 这种接口名）和查询串。
+///   结果是：删掉生产里的 `..` 检查，测试照样全绿（它测的是自己那份副本），
+///   而合法请求在测试语境下反而被判成非法 —— 一个永远抓不到真 bug 的测试。
+///
+/// 现在两边共用这一份实现，测试才真正覆盖生产逻辑。
+///
+/// 允许的字符：A-Z a-z 0-9 / _ - . ? = &
+///   · 大写字母是刚需（`v1/resource/comments/R_SO_4_<id>`）
+///   · `. ? = &` 给带查询串的路径留口子（Java 侧本来就允许）
+///   拒绝 `..`：防路径穿越，这是这条白名单存在的真正原因。
+fn is_safe_upstream_path(path: &str) -> Result<(), String> {
+    if path.is_empty()
+        || path.contains("..")
+        || !path.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '/'
+                || c == '_'
+                || c == '-'
+                || c == '.'
+                || c == '?'
+                || c == '='
+                || c == '&'
+        })
+    {
+        return Err(format!("非法上游路径：{path}"));
+    }
+    Ok(())
+}
+
 impl Client {
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         fs::create_dir_all(data_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
@@ -105,20 +139,8 @@ impl Client {
          *   · . ? = & 给带查询串的路径留口子（Java 侧本来就允许）
          * 拒绝 `..`：防路径穿越，这是这条白名单存在的真正原因。
          */
-        if path.is_empty()
-            || path.contains("..")
-            || !path.chars().all(|c| {
-                c.is_ascii_alphanumeric()
-                    || c == '/'
-                    || c == '_'
-                    || c == '-'
-                    || c == '.'
-                    || c == '?'
-                    || c == '='
-                    || c == '&'
-            })
-        {
-            return Err(format!("非法上游路径：{path}"));
+        if let Err(e) = is_safe_upstream_path(path) {
+            return Err(e);
         }
 
         let form = weapi::form(&body.to_string());
@@ -142,14 +164,6 @@ impl Client {
 
         // 并发请求可能同时收到 Set-Cookie；这里按行合并进 jar，
         // 值形如 deleted/null 的按「删除」处理（与 server.js 一致）
-        if let Some(lines) = res
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .next()
-        {
-            let _ = lines;
-        }
         let set_cookies: Vec<String> = res
             .headers()
             .get_all(reqwest::header::SET_COOKIE)
@@ -514,32 +528,49 @@ mod tests {
 
     #[test]
     fn upstream_path_whitelist_rejects_traversal() {
-        // 这条白名单与 server-security.js 的 assertUpstreamPath 同口径：
-        // 小写字母 / 数字 / 斜杠 / 下划线 / 连字符之外一律拒
+        /*
+         * D-07（审查报告，1.3.4）：这个测试以前**自己重写了一套判据**，
+         * 不调用生产实现，而且口径与生产相反 ——
+         * 它要求「全部小写、不许 ? = &」，把合法的大写接口名和查询串判成非法。
+         * 后果：删掉生产里的 `..` 检查，这个测试照样绿。
+         *
+         * 现在直接调 `is_safe_upstream_path`（生产用的同一份实现），
+         * 这样改坏生产代码测试一定会红。
+         */
         let bad = [
+            "",
             "../user/level",
+            "v1/user/../../etc/passwd",
             "a%2e%2e/b",
             "a\\b",
-            "a?x=1",
             "a#frag",
-            "A/uppercase",
+            "a;drop",
+            "中文/路径",
+            "a b",
         ];
         for b in bad {
-            let ok = !b.is_empty()
-                && b.chars().all(|c| {
-                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
-                });
-            assert!(!ok, "路径 {b} 不该通过白名单");
+            assert!(
+                is_safe_upstream_path(b).is_err(),
+                "路径 {b:?} 不该通过白名单"
+            );
         }
-        for g in [
+
+        let good = [
             "w/nuser/account/get",
             "v3/song/detail",
             "song/enhance/player/url/v1",
-        ] {
-            let ok = g.chars().all(|c| {
-                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
-            });
-            assert!(ok, "合法路径 {g} 应通过");
+            /* 大写是刚需：评论接口的路径就是这个形状 */
+            "v1/resource/comments/R_SO_4_123456",
+            /* 查询串：Java 侧本来就允许 */
+            "v1/search/get?type=1&limit=30",
+            /* 点、等号、与号单独出现也要放行 */
+            "a.b/c=d&e",
+        ];
+        for g in good {
+            assert!(
+                is_safe_upstream_path(g).is_ok(),
+                "合法路径 {g:?} 应通过白名单"
+            );
         }
     }
 }

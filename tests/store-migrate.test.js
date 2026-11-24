@@ -71,21 +71,41 @@ test('空存储：拿到全套默认设置，新功能默认开启', () => {
 
 /* ---------------------------------------------------- 老用户迁移（v1 → v2） */
 
-test('老存档（无 schema、sbFill=false）：升级后自动补成 true', () => {
+test('E-06：老存档（无标记）升级后补成 true', () => {
   /*
    * 这是用户实测反馈的「状态栏歌词没有播放填充动画」的根本原因：
    * 1.3.2 及以前 DEFAULTS 里 sbFill 是 false，老用户的 localStorage
    * 存着 false；1.3.3 把默认值改成 true 只影响全新安装的人。
+   *
+   * E-06（审查报告，1.3.4）：迁移的判据从「值是 false 就改」收窄成
+   * 「存档里没有 sbFillUserSet 标记」。老存档没有这个字段，
+   * 视为「用户从没碰过这个开关」，仍然补成 true。
    */
   const { Store } = loadStore(makeStorage({
     [KEY]: JSON.stringify({
-      settings: { sbFill: false, theme: 'dark' },
+      settings: { theme: 'dark' },
     }),
   }));
   Store.load();
   const s = Store.state.settings;
-  assert.equal(s.sbFill, true, '老用户升级后应自动获得填充动画');
+  assert.equal(s.sbFill, true, '从没碰过开关的老用户升级后应获得填充动画');
   assert.equal(s.theme, 'dark', '其他设置不能被迁移动到');
+});
+
+test('E-06：主动关掉过的老用户（有标记）不会被重新打开', () => {
+  /*
+   * 1.3.2 里用户主动关掉填充，升级后被偷偷打开 ——「我明明关了，怎么又开了」。
+   * 现在靠 sbFillUserSet 标记区分「没碰过」和「主动关掉」：
+   * 有标记就绝对尊重用户的选择。
+   */
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({
+      settings: { sbFill: false, sbFillUserSet: true },
+    }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.sbFill, false,
+    '用户主动关掉过的开关，升级时绝不能被重新打开');
 });
 
 test('已经在 v2 的存档：不会再把 sbFill 改回 true（用户关掉就关掉了）', () => {
@@ -113,14 +133,28 @@ test('save() 会把 schema 版本一起写进去', () => {
 });
 
 test('迁移后立刻 save()，再 load() 一次不会重复迁移', () => {
+  /*
+   * 存档里**不带 sbFill**（模拟「用户从没碰过这个开关」的 1.3.2 老用户）——
+   * 这正是 v1→v2 迁移该处理的情形。
+   *
+   * ⚠️ 不能写成 { sbFill: false }：E-06 起那代表「用户主动关过」，
+   * 迁移会尊重它、不打开（见上面那条专门测它的用例）。
+   */
   const storage = makeStorage({
-    [KEY]: JSON.stringify({ settings: { sbFill: false } }),
+    [KEY]: JSON.stringify({ settings: {} }),
   });
   const first = loadStore(storage);
   first.Store.load();
   assert.equal(first.Store.state.settings.sbFill, true);
-  // 模拟：用户手动关掉，然后落盘
+  /*
+   * 模拟：用户手动关掉，然后落盘。
+   *
+   * E-06 起必须同时写 sbFillUserSet 标记 —— 真实 UI 里
+   * onSettingChange('sbFill') 会写它，这里手动设置要模拟同样的效果，
+   * 否则下一次启动时「无标记」会被判成「从没碰过」而重新打开。
+   */
   first.Store.state.settings.sbFill = false;
+  first.Store.state.settings.sbFillUserSet = true;
   first.Store.save();
 
   // 再启动一次（同一个 storage）

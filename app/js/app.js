@@ -5898,6 +5898,23 @@
     });
     $('#rowLog').addEventListener('click', showLog);
     $('#rowAbout').addEventListener('click', showAbout);
+    /*
+     * 检查更新（1.3.4）。
+     *
+     * 手动点击一定要真查 —— 用户主动表达了「我现在想知道」，
+     * 不能被 6 小时节流挡掉（那样用户点完会以为按钮坏了）。
+     */
+    const rowUpdate = $('#rowUpdate');
+    if (rowUpdate) {
+      rowUpdate.addEventListener('click', () => checkUpdate(true));
+      /* 键盘可访问：整个设置页的行都是 role=button + tabindex=0，
+         只绑 click 的话键盘用户按回车没反应。 */
+      rowUpdate.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); checkUpdate(true); }
+      });
+    }
+    /* 启动后自动检查一次（后台 + 节流，见 autoCheckUpdate 的注释） */
+    autoCheckUpdate();
 
     // 退出/切后台时保存进度（移动端点返回键、切 App 都会走这里）
     document.addEventListener('visibilitychange', () => {
@@ -6006,6 +6023,20 @@
    * `settled` 为真表示这次是「松手/确定」，可以做一些比较贵的操作（整体重排）。
    */
   function onSettingChange(k, v, settled) {
+    /*
+     * E-06（审查报告，1.3.4）：记录「用户明确动过 sbFill 这个开关」。
+     *
+     * v1→v2 迁移要区分「从没碰过」和「主动关掉」—— 前者升级时可以打开
+     * （让用户看到新功能），后者绝对不能被改回来（「我明明关了怎么又开了」）。
+     * 这个标记就是判据，由 store 的迁移逻辑读取。
+     *
+     * 放在函数最前面、任何分支之前：无论从设置页还是播放器面板改的，
+     * 只要走过统一的设置变更入口就一定会被记下。
+     */
+    if (k === 'sbFill') {
+      S().sbFillUserSet = true;
+      try { Store.save(); } catch (e) {}
+    }
     if (k === 'mediaSession') { Player._updateMediaSession(); if (v) Player.updatePositionState(); }
 
     /* ---- 播放 ---- */
@@ -6394,29 +6425,44 @@
     /*
      * 运行时兜底：填充色在深色背景上「等于看不见」时，换掉它。
      *
-     * 这是 2026-11-24 真机日志暴露的第二层问题：
+     * 真机日志暴露的问题：
      *   LYRIC: timing diag: … color=#FFFBFB fillColor=#000000
-     * 文字是近白的、填充是纯黑的。
+     * 文字近白、填充纯黑 —— 在深色壁纸上「已唱/未唱」亮度几乎相同，
+     * 用户看到的仍然是「没有填充」。
      *
      * ⚠️ 判据不能写成「填充色和文字色的亮度差」——
      *   白字黑填充的亮度差是 1.0（最大值），指标上「对比很强烈」，
-     *   但实际效果恰恰是最坏的：浮层盖在**深色壁纸/深色状态栏**上，
-     *   黑色填充和背景同色，已唱/未唱的分界完全消失。
-     *   我第一版就是这么写的，实测这个 case 的 gap=0.972 直接漏网。
+     *   但实际效果恰恰最坏：浮层盖在**深色壁纸/系统状态栏**上，
+     *   黑色填充和背景同色，分界完全消失。我第一版就是 gap 判据，
+     *   实测这个 case 的 gap=0.972 直接漏网。
      *
-     * 真正要问的是「**填充色自己**在深色背景上够不够亮」。
-     * 状态栏歌词浮层的背景几乎总是深色的（用户的壁纸/系统状态栏），
-     * 所以只要填充色的相对亮度低于 0.12，就当作不可见，换成默认强调紫。
-     * 默认紫 #b3a2ff 的相对亮度是 0.40，在深色背景上清晰可辨。
+     * 真正要问的是「**填充色自己**在深色背景上够不够亮」：
+     * 相对亮度 < 0.12 就当作不可见。默认紫 #b3a2ff 是 0.40，清晰可辨。
      *
-     * 这只影响「推给浮层的最终值」，不改用户的设置 ——
-     * 用户随时可以把颜色改回来，我们只是不让它变成「开了但看不见」。
+     * ===== E-03 / E-04（审查报告，1.3.4 修正）=====
+     * 兜底**只看用户自己选的原色**，不看反色后的结果，理由有两条：
+     *
+     * ① E-03：以前兜底写在反色**之后**，于是默认紫 #b3a2ff 反色得
+     *   #4C5D00（相对亮度 0.0937 < 0.12）又被兜底改回紫色 ——
+     *   「深色模式自动反色」对默认色**永远无效**，开关看着是坏的。
+     *   反色本来就是按用户意愿做的计算，它的结果不该再被「可见性」推翻。
+     *
+     * ② E-04：以前用户主动选了暗色填充（比如纯黑），也会被静默换成紫色 ——
+     *   而 store 的 v5 迁移明确写着「尊重用户主动选的 #000000」，
+     *   两套口径互相打架：设置面板显示黑色，浮层却是紫的。
+     *
+     * 现在的口径：
+     *   · 只有**没开反色**时才做兜底（开了反色说明用户在意主题联动，尊重它）；
+     *   · 兜底只对**已知的脏数据**生效（纯黑 / 旧暗橄榄），不是任意暗色；
+     *   · 用户真正手选的其它颜色一律不动。
      */
-    const fillLum = hexLuminance(pushFill);
-    if (fillLum < 0.12) {
-      Log.add('LYRIC', 'fill too dark for dark bg (lum='
-        + fillLum.toFixed(3) + '), fallback to ' + DEFAULTS_SB_FILL);
-      pushFill = DEFAULTS_SB_FILL;
+    if (!(darkNow && s.sbFillInvert)) {
+      const rawFill = String(s.sbFillColor || DEFAULTS_SB_FILL).toUpperCase();
+      const isDirty = rawFill === '#000000' || rawFill === '#4C5D00';
+      if (isDirty) {
+        Log.add('LYRIC', 'fill is known-bad value ' + rawFill + ', fallback to ' + DEFAULTS_SB_FILL);
+        pushFill = DEFAULTS_SB_FILL;
+      }
     }
     /*
      * sig 里必须含 karaokeLyric（E-02）：
@@ -7809,6 +7855,308 @@
       图标与示例音频为本项目原创，仅用于演示。</p>
       <div class="modal-btns"><button class="btn solid" data-ok>知道了</button></div>
     `, { confirm: true });
+  }
+
+  /* ================= 检查更新 ================= */
+  /*
+   * 与原生侧的协作方式（Android）：
+   *   网页 --checkUpdate(manual)--> HttpBridge --> GitHub API
+   *   GitHub --回调--> HttpBridge.runJs("window.__rippleUpdateChecked({...})")
+   *   网页收到后弹窗；用户点下载 -> downloadUpdate(url, size, ver)
+   *   下完回调 __rippleUpdateDownloaded -> 再点安装 -> installUpdate()
+   *
+   * 为什么整个流程都是异步 + 全局回调，而不是同步拿返回值：
+   *   检查更新要发 HTTPS 请求（弱网下可能几秒），同步做会把 JS 桥线程卡住，
+   *   而那条线程同时还在推送播放进度 —— 界面会明显卡顿。
+   *
+   * 桌面端（Tauri）走的是另一条路：bridge.js 里没有这套桥方法，
+   * 所以自动检查会静默跳过，用户手动点时改用 fetch 直接查 GitHub API
+   * 并打开浏览器下载页（桌面端的安装器无法由网页安全唤起）。
+   */
+
+  /** 上次自动检查的时间（localStorage），用于 6 小时节流 */
+  const UPDATE_LAST_KEY = 'ripple_update_last_check';
+  const AUTO_CHECK_MS = 6 * 60 * 60 * 1000;
+
+  function updateBridge() {
+    const N = window.RippleNative;
+    return !!(N && typeof N.checkUpdate === 'function');
+  }
+
+  /** 原生侧回调过来的「检查完成」 */
+  window.__rippleUpdateChecked = function (d) {
+    try {
+      _updateState.busy = false;
+      _updateVal('检查 ›');
+      if (!d) return;
+      if (d.error) {
+        /*
+         * throttled 是我们自己的节流，不是错误 —— 静默处理，
+         * 否则用户每次启动都会看到一条「检查更新失败」的红色提示。
+         */
+        if (String(d.error).indexOf('throttled') === 0) {
+          Log.add('UPDATE', 'auto check throttled: ' + d.error);
+          return;
+        }
+        Log.err('UPDATE', d.error, 'check failed');
+        if (_updateState.manual) toast('检查更新失败', String(d.error), 'warn');
+        return;
+      }
+      _updateState.remote = d;
+      if (d.hasNew) {
+        _updateVal('有新版本 ›');
+        const h = $('#updateHint');
+        if (h) h.textContent = '发现新版本 ' + (d.version || '');
+        showUpdateSheet(d);
+      } else {
+        const h = $('#updateHint');
+        if (h) h.textContent = '已是最新版本';
+        if (_updateState.manual) {
+          toast('已是最新版本', '当前 ' + ((RIPPLE_VERSION && RIPPLE_VERSION.name) || ''), 'check');
+        }
+      }
+    } catch (e) {
+      Log.err('UPDATE', e, 'callback error');
+    }
+  };
+
+  /** 原生侧回调过来的「下载完成」 */
+  window.__rippleUpdateDownloaded = function (d) {
+    try {
+      _updateState.busy = false;
+      if (!d || !d.ok) {
+        _updateVal('检查 ›');
+        toast('下载失败', (d && d.error) || '未知错误', 'warn');
+        closeUpdateSheet && closeUpdateSheet();
+        return;
+      }
+      _updateState.file = d.path;
+      Log.add('UPDATE', 'downloaded ' + d.path + ' ' + d.size + 'B sha256=' + d.sha256);
+      /* 下载完直接问「现在装吗」，避免用户以为没反应 */
+      updateSheetToInstall(d);
+    } catch (e) {
+      Log.err('UPDATE', e, 'download callback error');
+    }
+  };
+
+  /** 原生侧回调过来的「安装器拉起结果」 */
+  window.__rippleUpdateInstallResult = function (ok, msg) {
+    try {
+      if (!ok) toast('无法启动安装', String(msg || ''), 'warn');
+    } catch (e) {}
+  };
+
+  /** 原生侧回调过来的下载进度 */
+  window.__rippleUpdateProgress = function (pct) {
+    try {
+      const el = $('#updateProgressBar');
+      const tx = $('#updateProgressTx');
+      const p = Math.max(0, Math.min(100, Number(pct) || 0));
+      if (el) el.style.width = p + '%';
+      if (tx) tx.textContent = '正在下载 ' + p + '%';
+    } catch (e) {}
+  };
+
+  const _updateState = { busy: false, manual: false, remote: null, file: '' };
+
+  function _updateVal(t) {
+    const el = $('#updateVal');
+    if (el) el.textContent = t;
+  }
+
+  /**
+   * 触发检查。
+   * @param {boolean} manual 用户主动点的：不受 6 小时节流，失败也会提示
+   */
+  function checkUpdate(manual) {
+    if (_updateState.busy) return;
+    _updateState.manual = !!manual;
+    _updateState.busy = true;
+    _updateVal('检查中…');
+
+    if (updateBridge()) {
+      try {
+        window.RippleNative.checkUpdate(manual ? 'true' : 'false');
+      } catch (e) {
+        _updateState.busy = false;
+        _updateVal('检查 ›');
+        Log.err('UPDATE', e, 'bridge call failed');
+        if (manual) toast('检查更新失败', '原生接口不可用', 'warn');
+      }
+      return;
+    }
+
+    /*
+     * 桌面端：没有原生桥，改用 fetch 直接查 GitHub API。
+     *
+     * 为什么不复用原生那套：Tauri 的 Rust 侧没有提供更新命令，
+     * 而且桌面端的「安装」在三个平台上完全不一样（Windows 跑 setup.exe、
+     * Linux 换 AppImage 或 dpkg），由网页安全唤起并不现实。
+     * 所以桌面端只做「检查 + 提示」，下载交给系统浏览器。
+     */
+    desktopCheckUpdate(manual);
+  }
+
+  function desktopCheckUpdate(manual) {
+    const now = Date.now();
+    if (!manual) {
+      try {
+        const last = Number(localStorage.getItem(UPDATE_LAST_KEY) || 0);
+        if (last > 0 && now - last < AUTO_CHECK_MS) {
+          _updateState.busy = false;
+          _updateVal('检查 ›');
+          return;
+        }
+      } catch (e) {}
+    }
+    try { localStorage.setItem(UPDATE_LAST_KEY, String(now)); } catch (e) {}
+
+    fetch('https://api.github.com/repos/WuWuoooo/ripple/releases/latest', {
+      headers: { Accept: 'application/vnd.github+json' },
+    }).then((r) => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then((rel) => {
+      _updateState.busy = false;
+      _updateVal('检查 ›');
+      const tag = String(rel.tag_name || '');
+      const ver = tag.replace(/^v/, '');
+      const cur = (RIPPLE_VERSION && RIPPLE_VERSION.name) || '';
+      if (ver && ver !== cur) {
+        _updateState.remote = { hasNew: true, version: ver, notes: rel.body || '' };
+        _updateVal('有新版本 ›');
+        const h = $('#updateHint');
+        if (h) h.textContent = '发现新版本 ' + ver;
+        showUpdateSheet({ hasNew: true, version: ver, notes: rel.body || '', desktop: true });
+      } else {
+        const h = $('#updateHint');
+        if (h) h.textContent = '已是最新版本';
+        if (manual) toast('已是最新版本', cur, 'check');
+      }
+    }).catch((e) => {
+      _updateState.busy = false;
+      _updateVal('检查 ›');
+      Log.err('UPDATE', e, 'desktop check failed');
+      if (manual) toast('检查更新失败', String(e.message || e), 'warn');
+    });
+  }
+
+  /** 更新弹窗（移动端 / 桌面端共用，按钮行为不同） */
+  function showUpdateSheet(d) {
+    const cur = (RIPPLE_VERSION && RIPPLE_VERSION.name) || '?';
+    const notes = String(d.notes || '').trim();
+    const isDesktop = !!d.desktop;
+    /*
+     * 更新正文可能很长（整份 CHANGELOG），放进可滚动区域而不是直接撑开弹窗。
+     * 高度上限用 vh，保证小屏也不会把按钮顶出可视区。
+     */
+    modal(`
+      <h3>发现新版本</h3>
+      <p style="font-size:12px;opacity:.8;margin-bottom:8px">
+        当前 ${cur} → 最新 <b>${esc(d.version || '')}</b>
+      </p>
+      ${notes ? `<div style="max-height:34vh;overflow:auto;font-size:11px;line-height:1.7;
+        background:rgba(255,255,255,.04);border-radius:10px;padding:10px 12px;
+        white-space:pre-wrap;word-break:break-word">${esc(notes)}</div>` : ''}
+      <div id="updateProgress" style="display:none;margin-top:12px">
+        <div style="height:6px;border-radius:3px;background:rgba(255,255,255,.12);overflow:hidden">
+          <i id="updateProgressBar" style="display:block;height:100%;width:0;
+            background:var(--accent);transition:width .2s"></i>
+        </div>
+        <div id="updateProgressTx" style="font-size:11px;opacity:.7;margin-top:6px">准备下载…</div>
+      </div>
+      <div class="modal-btns">
+        <button class="btn ghost" data-cancel>以后再说</button>
+        <button class="btn solid" id="updateGo">${isDesktop ? '前往下载' : '下载并安装'}</button>
+      </div>
+    `, { confirm: true });
+
+    const go = $('#updateGo');
+    if (!go || go.dataset.bound) return;
+    go.dataset.bound = '1';
+    go.addEventListener('click', () => {
+      if (isDesktop) {
+        /* 桌面端：打开 Release 页面由用户自己下 —— 各平台安装方式差异太大，
+           网页里替用户执行安装器既不安全也做不好。 */
+        const url = 'https://github.com/WuWuoooo/ripple/releases/latest';
+        try { window.open(url, '_blank'); } catch (e) {}
+        const N = window.RippleNative;
+        if (N && typeof N.openExternal === 'function') { try { N.openExternal(url); } catch (e) {} }
+        closeModal && closeModal();
+        return;
+      }
+      const remote = _updateState.remote || d;
+      const N = window.RippleNative;
+      if (!N || typeof N.downloadUpdate !== 'function') {
+        toast('无法下载', '原生接口不可用', 'warn');
+        return;
+      }
+      if (!remote.apkUrl) {
+        toast('找不到安装包', 'Release 里没有 .apk 资产', 'warn');
+        return;
+      }
+      _updateState.busy = true;
+      const box = $('#updateProgress');
+      if (box) box.style.display = 'block';
+      go.disabled = true;
+      go.textContent = '下载中…';
+      try {
+        N.downloadUpdate(String(remote.apkUrl), String(remote.size || 0),
+          String(remote.version || 'new'));
+      } catch (e) {
+        Log.err('UPDATE', e, 'download call failed');
+        toast('下载失败', String(e), 'warn');
+      }
+    });
+  }
+
+  /** 下载完成后把弹窗切成「安装」态 */
+  function updateSheetToInstall(d) {
+    modal(`
+      <h3>下载完成</h3>
+      <p style="font-size:12px;opacity:.8;line-height:1.7">
+        安装包已就绪（${(d.size / 1024 / 1024).toFixed(1)} MB）。<br>
+        点击下面的按钮会打开系统安装界面，按提示完成即可；<br>
+        系统可能会先要求允许本应用「安装未知应用」。
+      </p>
+      <div class="modal-btns">
+        <button class="btn ghost" data-cancel>稍后</button>
+        <button class="btn solid" id="updateInstall">去安装</button>
+      </div>
+    `, { confirm: true });
+    const btn = $('#updateInstall');
+    if (!btn || btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', () => {
+      const N = window.RippleNative;
+      if (!N || typeof N.installUpdate !== 'function') {
+        toast('无法安装', '原生接口不可用', 'warn');
+        return;
+      }
+      try { N.installUpdate(); } catch (e) { toast('无法安装', String(e), 'warn'); }
+    });
+  }
+
+  /**
+   * 进入 App 时自动检查一次（后台线程 + 6 小时节流）。
+   *
+   * 为什么延后几秒再调用：启动阶段要做 cookie 恢复、在线内容拉取、
+   * 媒体服务创建，再塞一个 HTTPS 请求进去只会让首屏更慢。
+   * 延后到启动完成之后，用户完全感知不到，有更新才弹窗。
+   */
+  function autoCheckUpdate() {
+    const run = () => { try { checkUpdate(false); } catch (e) {} };
+    /*
+     * 桌面端也要查 —— 走 desktopCheckUpdate 那条 fetch 路径。
+     * 但桌面端的浏览器 fetch 会不会被 CORS 拦截？GitHub API 带
+     * Access-Control-Allow-Origin: *，Tauri 的 webview 也允许跨域，
+     * 所以能直接查。失败也只是静默，不影响使用。
+     */
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(() => setTimeout(run, 2500), { timeout: 6000 });
+    } else {
+      setTimeout(run, 4000);
+    }
   }
 
   /* ================= Toast ================= */

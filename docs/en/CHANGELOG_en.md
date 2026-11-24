@@ -6,6 +6,193 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.4 — Eleventh Version
+
+> **Basis**: the 1.3.3 code review report from Deepseek V4.1 Flash 1017 (Hy4 Flash).
+> All 18 remaining items are done here (3 high / 7 medium / 8 low).
+> **Implementation and docs by**: Deepseek V4.1 Flash 1017.
+>
+> No new features — this is a pure remediation release. The previous version got
+> lyric colouring right; this one clears the debt the review report pointed out.
+
+### 1. The three high items
+
+**S-01 Logout race: a slow request resurrects the login**
+
+`epochAtStart` used to be captured inside the `https.request` **response callback** —
+that is when the response *headers* arrive, by which time the user may long since
+have logged out (`cookieEpoch` already incremented). So the snapshot was taken from
+the *new* generation, the later `epochAtStart !== cookieEpoch` comparison always
+matched, and the generation guard did nothing. A slow request (`status` fires
+vip/level/like, or a large playlist) could merge `MUSIC_U` back into `cookieJar`,
+write it to disk, and **the next launch is logged in again**.
+
+This was an incomplete fix of review item S-03 from 1.2.2 — the mechanism was right,
+the sampling point was wrong. It now samples before the `https.request` call.
+
+**D-01 The lyric window's "draggable when unlocked" was never implemented**
+
+Tauri 2 finds drag regions via the `data-tauri-drag-region` attribute, and
+`lyric.html` had none — dragging the window with the mouse did nothing (only the
+window manager's Alt+drag worked), yet the README listed "draggable" as done.
+
+Added `data-tauri-drag-region="deep"` to `<div id="wrap">` (the `deep` variant is
+required: with the bare attribute, clicking the `<span id="t">` child fails because
+`el !== composedPath[0]`).
+
+**D-02 The desktop bridge lacked `setLyricTiming`, so background fill fell back to the broken path**
+
+`app.js` branches on `typeof N.setLyricTiming === 'function'` to choose
+"baseline + extrapolation" versus "per-frame push". The desktop bridge had no such
+method, so it always took the second path. But the lyric window exists precisely
+for **watching while you are in another program**, where the main window's rAF is
+paused and its ticker cleared — the per-frame stream stops and it degrades into
+"snaps full at the end of a line, jumps at the next one": exactly the symptom that
+took eleven rounds to fix on Android in 1.3.3.
+
+Completed across all three layers:
+- `bridge.js` gains `setLyricTiming(p, lineDur, rate, playing)`
+- Rust gains the `lyric_overlay_timing` command and four baseline fields on `LyricState`
+- `lyric.html` extrapolates with `performance.now()` (no extra timer — that window
+  stays visible, so its rAF keeps running)
+
+### 2. The seven medium items
+
+| ID | Problem | Fix |
+|---|---|---|
+| E-03 | The dark-fill guard ran *after* inversion, so the default purple inverted to `#4C5D00` (luminance 0.094) and was reverted — the "auto-invert in dark mode" switch could never work on the default colour | Guard runs before inversion and only inspects the user's own colour; when inversion is on it does not intervene at all |
+| E-04 | A user's deliberately chosen dark fill was silently replaced with purple, contradicting the store v5 migration ("respect `#000000`") | Guard only recognises known-bad values (`#000000` / `#4C5D00`); anything else is left alone |
+| E-06 | The v1→v2 migration unconditionally re-enabled `sbFill` for users who had turned it off | New `sbFillUserSet` flag written by the settings-change entry point; the migration skips when it is set |
+| E-07 | `Store.set()`'s rAF batching lost the batch if the screen locked right after queueing | Re-check visibility on every `set`; if hidden and an rAF is pending, `cancelAnimationFrame` and flush via `setTimeout` |
+| S-02 | The "token invalid after IP change" test was misnamed (`host` hardcoded to 127.0.0.1) and `tokenValid` had zero coverage | The helper now takes `localAddress`; the test really switches to 127.0.0.2 and asserts 401 |
+| D-03 | Position units mismatched (physical pixels stored, restored as logical), so HiDPI screens drift further with every drag | `lyric_save_pos` divides by `scale_factor()` before storing |
+| D-04 | "Reset to default position" did nothing for an existing window and never deleted `lyric-pos.json` | Detect x/y going from ≥0 to <0 → delete the file, clear state, and really `set_position` the live window |
+| D-05 | Single-instance had no real O_EXCL and never removed the lock, so PID reuse could permanently refuse to start | Real `OpenOptions.create_new(true)` (`O_CREAT|O_EXCL`); on exit, verify the PID before removing the lock |
+| D-06 | `can_draw_overlay` / `request_overlay_permission` were dead commands whose semantics contradicted the bridge | Both commands and their registrations removed; the JS bridge's hardcoded `true` was correct all along |
+
+### 3. The eight low items
+
+| ID | Fix |
+|---|---|
+| S-03 | workflow `paths`: `desktop.yml` → the real `desktop-build.yml` |
+| S-04 | `server.js` comment "3 slots" now references the `TOKEN_PER_IP` constant |
+| S-05 | `sw.js` comment "3" → "6 per IP (new + 5 old)" |
+| S-06 | `lyricfill.test.js` count 21 → 31 |
+| S-07 | README "11 classes" → 12 |
+| D-07 | The whitelist test rewrote its own criteria, opposite to production → extracted `is_safe_upstream_path` and shared it |
+| D-08 | Removed throwaway dead code in `netease.rs` |
+| D-09 | capabilities split into `default.json` (main) and `lyric.json` (lyric window), least privilege |
+| D-10 | `build-frontend.sh` now also syncs the Cargo.toml / Cargo.lock version (otherwise the installer and crash-log versions disagree) |
+| D-11 | Desktop README "shipped with 1.3.0" → 1.3.4; "nothing unimplemented" → an honest list (media controls / notifications / macOS) |
+| D-12 | A comment referenced a non-existent `lyric.rs` → now points at the comment block in `main.rs` |
+
+### 4. Also fixed
+
+- The desktop workflow header and the bundle job comment both claimed "macOS participates
+  by default", while the actual `matrix` is Linux + Windows only — two self-contradictory
+  stale comments, now consistent with reality (this project ships no macOS bundle:
+  an unsigned one is blocked by Gatekeeper, a double-clickable one needs an Apple
+  Developer account plus notarisation, and it cannot be verified on this machine)
+
+### 5. Regression tests: 169 → 170
+
+Six added or updated, each mapping to an item above:
+
+| Change | Item |
+|---|---|
+| `S-13-e2e token` renamed + a real IP-switch assertion expecting 401 | S-02 |
+| `E-06: a user who turned it off (flag set) is not re-enabled` (new) | E-06 |
+| `E-06: old save (no flag) is enabled on upgrade` (renamed/rewritten) | E-06 |
+| The "migrate then save then load" fixture now omits `sbFill` | E-06 |
+| `R-13 status-bar fill…` asserts the known-bad-value criteria | E-03 / E-04 |
+| Manifest consistency check bumped to 1.3.4 | version |
+
+### 6. Check for updates (user request)
+
+> User's words: "add a 'check for updates' under the settings, below the software log;
+> clicking it sends a request to GitHub to see whether a newer version exists; check on
+> every launch too; then the update button in the popup should be able to download the
+> new installer directly, and then install it. Windows and Linux need it too."
+
+**A rejected idea first**: the user originally suggested something bolder — hot-updating
+only the HTML/CSS/JS and restarting at runtime. That is technically entirely feasible
+(no Gradle, no bundler here, so `assets/www` is naturally replaceable, and `sw.js`
+already carries a version cache).
+
+But **the APK itself is only 0.6 MB**, so one download finishes it. Hot updating would
+require a writable directory, manifest signing, atomic switching and automatic rollback —
+far more complexity and risk than the 0.6 MB it saves. So the installer is shipped directly.
+
+#### Android
+
+A new "Check for updates" row in Settings → About, right below the software log:
+
+| Capability | Implementation |
+|---|---|
+| Check | `UpdateChecker.check()` requests the GitHub Release API on a **background single thread** |
+| Throttle | Automatic check at most once per 6 hours (timestamp in SharedPreferences); a manual tap is never throttled |
+| Download | Into `cacheDir/update/`, with a progress bar |
+| Verify | Compares against GitHub's `size`; deletes the file and reports an error on mismatch |
+| Install | A hand-written `ApkProvider` (ContentProvider) plus the system installer |
+
+**Why a hand-written ContentProvider**: this project's hard constraint is **no AndroidX**,
+so `androidx.core.content.FileProvider` is unavailable — and since Android 7.0 a
+`file://` URI cannot be passed across apps, so a `content://` URI is mandatory.
+The implementation is deliberately narrow: it only serves `cacheDir/update`, is read-only,
+rejects file names containing `/`, `\` or `..`, and additionally verifies the resolved
+`getCanonicalPath()`. Once a ContentProvider is granted out, any component holding the URI
+can read through it, so the exposed surface has to be minimal.
+
+**Why it asks before installing**: launching the installer takes over the whole screen,
+which is a strong interruption; the user may want to download now and install later.
+So a "download complete → go install" confirmation appears first.
+
+**The Android 8.0+ "install unknown apps" permission**: it is sensitive but **not a
+runtime permission** — the system never prompts for it; the user toggles it per app in
+Settings. The code checks `canRequestPackageInstalls()` and, when it is off, opens that
+Settings page and shows a toast — otherwise the user concludes "the button does nothing".
+
+#### Windows / Linux
+
+The desktop client **only checks and opens the download page**; it never runs the
+installer for the user: the three platforms differ too much (Windows runs `setup.exe`,
+Linux swaps the AppImage or needs `dpkg` for the deb), and safely launching that from a
+web page is not realistic.
+
+- Check: when `app.js` finds the desktop bridge has no `checkUpdate`, it falls back to
+  `fetch`ing the GitHub API directly (`csp` in `tauri.conf.json` is `null`, so cross-origin
+  is allowed)
+- Open page: a new Rust command `open_external` uses `xdg-open` / `cmd /C start` / `open`
+  per platform, and **only accepts http(s) URLs** — every other scheme is rejected
+
+#### CI support
+
+The GitHub Release API **does not expose versionCode** (it exists only inside the APK),
+while "which version is newer" must be compared as an integer — comparing version-name
+strings gets `1.3.10` vs `1.3.9` wrong. So the workflow embeds
+`<!-- ripple-version-code: 134 -->` in the release body; the app parses it and falls back
+to name comparison when absent.
+
+#### What this part did not do
+
+- **No "download and install" on desktop**: the three platforms have no unified way to
+  launch an installer; forcing it would need privilege escalation on Linux (`pkexec`) or
+  yield a worse experience. It opens the download page instead
+- **No incremental updates**: every update is the full APK (0.6 MB — a diff is not worth it)
+
+### 7. What this version did not do
+
+- **The desktop client still has not run on a real desktop environment** (this machine is
+  aarch64 proot with no display server; its local cargo 1.75 offline cache is missing
+  `adler2 v2.0.1`, so `cargo check --offline --locked` cannot run). The desktop changes
+  here were verified only at `rustfmt --check` level plus line-by-line static review;
+  **compilation and runtime behaviour still need CI / real-user verification.** This has
+  to be stated plainly.
+- Items the review report already marked fixed (A-01 threading, E-01/E-02/E-05) were not
+  touched again in this version.
+
+---
+
 ## 1.3.3 — Tenth Version
 
 > **Basis**: a user request — "add lyric scrolling to all three platforms (status-bar lyric /

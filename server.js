@@ -140,7 +140,7 @@ function weapiForm(obj) {
  *  · 每次页面请求 /ripple-token.js 就轮换一次：新令牌入列，只保留 TOKEN_KEEP_PREV
  *    个旧令牌当灰度窗口（正在飞的在途请求不至于立刻 401），更早的立即失效；
  *    窗口从 2 提到 5 是 S-02 的整改：令牌表是**全局**的，两台以上局域网设备
- *    先后刷新页面时，3 个槽位不够用 —— 第三台一加载，第一台正在听的令牌就被
+ *    先后刷新页面时，槽位不够用（见 TOKEN_PER_IP）—— 一台设备一加载，另一台正在听的令牌就被
  *    挤出窗口，成片 401。5 个旧令牌 = 最多约 6 台设备交替刷新还能共存
  *    （见 SECURITY.md「访问令牌」一节的多设备上限），TTL 不变，安全窗口没被拉长；
  *  · 令牌表落在 .ripple-token（0600，JSON），服务重启后已打开的页面还能继续用；
@@ -598,6 +598,18 @@ function ncmPost(path, body) {
     const form = weapiForm(body);
     url.searchParams.set('csrf_token', csrfToken());
 
+    /*
+     * 审查 S-01（1.3.4）：代际必须在**发出请求之前**采样。
+     *
+     * 以前这行写在 https.request 的响应回调里 —— 那是响应头到达的时刻，
+     * 而那时用户可能早就点过退出了（cookieEpoch 已自增）。
+     * 采到的是新代际，后面 `epochAtStart !== cookieEpoch` 永远相等，
+     * 保护完全失效：一个慢请求（status 串发的 vip/level/like、大歌单）
+     * 的 Set-Cookie 会在登出之后把 MUSIC_U 合并回 cookieJar 并写盘，
+     * 下次启动又处于登录态。这是 1.2.2 审查 S-03 的不完整修复 ——
+     * 代际机制建对了，采样点放错了。
+     */
+    const epochAtStart = cookieEpoch;
     const req = https.request({
       host: url.host,
       path: url.pathname + url.search,
@@ -614,10 +626,9 @@ function ncmPost(path, body) {
     }, (res) => {
       let data = '';
       /*
-       * 审查 S-03：发出请求时记下代际。
+       * 代际已在 **发出请求之前** 采样（见 const epochAtStart 的注释）。
        * 响应回来时若代际已变（期间用户登出过），Set-Cookie 一律丢弃。
        */
-      const epochAtStart = cookieEpoch;
       let settled = false;
       const done = (fn, arg) => { if (settled) return; settled = true; fn(arg); };
 

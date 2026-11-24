@@ -69,13 +69,25 @@ function startServer() {
 /** 发一个原始 HTTP 请求；返回 { status, headers, body } */
 function request(port, opts) {
   return new Promise((resolve, reject) => {
-    const req = http.request({
+    const o = {
       host: '127.0.0.1',
       port: port,
       method: opts.method || 'GET',
       path: opts.path || '/',
       headers: Object.assign({ Host: 'localhost:' + port }, opts.headers || {}),
-    }, (res) => {
+    };
+    /*
+     * 审查 S-02（1.3.4）：支持指定**源地址**，才能真正测「换 IP 后失效」。
+     *
+     * 以前 helper 把 host 写死 127.0.0.1，而所谓「换 IP」其实还是同一个 IP ——
+     * 那个 e2e 用例标题宣称的东西从来没有被测到，真正的 IP 绑定
+     * （server.js 的 tokenValid）在 e2e 层零覆盖。
+     *
+     * 现在可以用 localAddress: '127.0.0.2' 从另一个回环地址发请求，
+     * 服务端看到的 remoteAddress 就是 127.0.0.2，才构成真实的换 IP。
+     */
+    if (opts.localAddress) o.localAddress = opts.localAddress;
+    const req = http.request(o, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => (body += c));
@@ -119,7 +131,7 @@ test('S-13-e2e Host 白名单：本机地址放行、外部域名 421', async ()
 /* ---------------------------------------------------------------
  * 盲区 2：令牌签发 → 使用 → 换 IP
  * --------------------------------------------------------------- */
-test('S-13-e2e 令牌：签发可用、换 IP 后失效', async () => {
+test('S-13-e2e 令牌：签发可用、同 IP 有效、换 IP 401、无令牌 401', async () => {
   const tk = await request(port, {
     path: '/ripple-token.js',
     headers: { 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'no-cors' },
@@ -159,10 +171,18 @@ test('S-13-e2e 令牌：签发可用、换 IP 后失效', async () => {
     '鉴权通过后只可能是成功(200)或上游失败(502)，实际 ' + use.status
   );
 
-  /* 令牌本身有效，但换个 IP 来源就不该认（绑定来源 IP 是设计的一部分） */
+  /*
+   * 令牌本身有效，但换个 IP 来源就不该认（绑定来源 IP 是设计的一部分）。
+   *
+   * 审查 S-02（1.3.4）：以前这里没给 localAddress，所谓「换 IP」
+   * 实际上还是 127.0.0.1 —— 断言也只能写成「本机同 IP 仍有效」，
+   * 与用例标题宣称的「换 IP 后失效」完全相反，真正的 IP 绑定零覆盖。
+   * 现在从 127.0.0.2 发请求，服务端看到的 remoteAddress 真的变了。
+   */
   const useOtherIp = await request(port, {
     method: 'POST',
     path: '/ncm/status',
+    localAddress: '127.0.0.2',
     headers: {
       Origin: 'http://localhost:' + port,
       'X-Ripple-Token': token,
@@ -170,10 +190,8 @@ test('S-13-e2e 令牌：签发可用、换 IP 后失效', async () => {
     },
     body: '{}',
   });
-  assert.ok(
-    useOtherIp.status !== 401 && useOtherIp.status !== 403,
-    '（本机同 IP，令牌仍应有效），实际 ' + useOtherIp.status
-  );
+  assert.strictEqual(useOtherIp.status, 401,
+    '令牌绑定来源 IP，从另一个 IP 使用必须 401（实际 ' + useOtherIp.status + '）');
 
   const noToken = await request(port, {
     method: 'POST',

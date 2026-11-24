@@ -660,6 +660,20 @@
             <div class="tx"><b>软件日志</b><span id="logHint">记录播放/接口/状态栏的运行情况</span></div>
             <div class="val">查看 ›</div>
           </div>
+          <!--
+            检查更新（1.3.4）。
+
+            放在「软件日志」下方、「Ripple 涟漪」上方 —— 用户找版本相关的东西
+            会往这一块看，而日志本身就带版本信息，两者相邻很自然。
+
+            点击后向 GitHub Release 发请求查最新版本；有新版就弹窗展示更新内容，
+            用户可以一键下载并拉起系统安装器。
+          -->
+          <div class="set-row" role="button" tabindex="0" id="rowUpdate" aria-label="检查更新">
+            <div class="ic"><svg><use href="#i-download"/></svg></div>
+            <div class="tx"><b>检查更新</b><span id="updateHint">看看有没有新版本</span></div>
+            <div class="val" id="updateVal">检查 ›</div>
+          </div>
           <div class="set-row" role="button" tabindex="0" id="rowAbout" aria-label="Ripple 涟漪">
             <div class="ic"><svg><use href="#i-info"/></svg></div>
             <div class="tx"><b>Ripple 涟漪</b><span id="aboutVer">— · build —</span></div>

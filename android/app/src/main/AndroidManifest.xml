@@ -10,6 +10,17 @@
     <!-- 前台服务：退到后台继续播放 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!--
+        检查更新：下载完成后拉起系统安装器需要这条权限（Android 8.0+）。
+
+        ⚠️ 它是「敏感权限」，但**不是运行时权限** —— 系统不会弹授权框，
+        而是由用户在「安装未知应用」列表里对本应用单独开关。
+        代码里用 canRequestPackageInstalls() 检测，没开时跳转设置页，
+        不会出现「点了没反应」这种最难排查的体验。
+
+        只在用户主动点「下载并安装」时才会走到，不影响正常使用。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!--
         删掉的三条权限（声明了但整个工程从未使用，纯属扩大权限清单）：
@@ -80,6 +91,24 @@
             android:name=".PlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <!--
+            更新包的共享出口（见 ApkProvider 的类注释）。
+
+            为什么需要它：Android 7.0（API 24）起禁止用 file:// 跨应用传文件，
+            而拉起系统安装器必须给一个 content:// URI。
+            本项目不使用 AndroidX，所以自己实现了最小可用的 ContentProvider。
+
+            · authorities 必须与 ApkProvider.AUTHORITY 完全一致；
+            · exported=false + grantUriPermissions=true：
+              别的应用不能主动访问，只能通过我们显式授权的那一个 URI 读取；
+            · 只服务 cacheDir/update 目录，越界路径在代码里被拒绝。
+        -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.ripple.app.updates"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
     </application>
 

@@ -78,7 +78,7 @@
      *
      * Android 那边是盖在系统状态栏上的悬浮窗；桌面端没有系统状态栏，
      * 用一个独立的无边框置顶小窗口承担同一职责（见 src-tauri/src/main.rs
-     * 的 lyric.rs 段注释与 desktop/lyric.html）。
+     * 的「歌词窗」注释块与 desktop/lyric.html）。
      *
      * 六个方法与 Java 侧**同名同签名**，前端 app.js 里那套调用一行都不用改 ——
      * 它仍然以为自己在跟 Android 说话。
@@ -149,6 +149,52 @@
      */
     setLyricProgress: function (p) {
       invoke('lyric_overlay_progress', { progress: String(p == null ? '' : p) })
+        .catch(function () {});
+    },
+
+    /**
+     * 推送填充的「基准点」，由歌词窗自己按时间外推（D-02，1.3.4）。
+     *
+     * ⚠️ 这个方法以前**不存在**，导致前端 app.js 的
+     *     `typeof N.setLyricTiming === 'function'` 判定为 false，
+     *     整条链路回退到「逐帧推真值」的旧路径。
+     *
+     * 而歌词窗最主要的用法恰恰是「切到别的程序时看」—— 那时主窗口
+     * rAF 暂停、1 秒 ticker 被 clearInterval，逐帧推送断流，
+     * 于是退化成「一下填满、换句才动」：正是 1.3.3 在 Android 上
+     * 花十一轮才修掉的那个症状，在桌面端原封不动地留着。
+     *
+     * 参数与 Android 的 RippleNative.setLyricTiming 完全一致，
+     * 所以 app.js 里不需要任何平台分支。
+     *
+     * @param {string} progress 句内进度 0..1
+     * @param {string} lineDur  本句时长（秒），<=0 表示未知
+     * @param {string} rate     播放倍速
+     * @param {string} playing  'true' / 'false'
+     */
+    setLyricTiming: function (progress, lineDur, rate, playing) {
+      invoke('lyric_overlay_timing', {
+        progress: String(progress == null ? '' : progress),
+        lineDur: String(lineDur == null ? '' : lineDur),
+        rate: String(rate == null ? '' : rate),
+        playing: String(playing == null ? '' : playing)
+      }).catch(function () {});
+    },
+
+    /*
+     * ===== 检查更新（1.3.4）=====
+     *
+     * 桌面端没有「下载并安装」这套能力：各平台安装方式差异太大
+     * （Windows 跑 setup.exe、Linux 换 AppImage 或用 dpkg 装 deb），
+     * 由网页安全唤起固定不现实。所以桌面端只做两件事：
+     *   ① checkUpdate —— 由网页自己 fetch GitHub API（csp 为 null，可跨域）；
+     *   ② openExternal —— 打开 Release 页面，用户自己下载。
+     *
+     * 注意这里**不提供** checkUpdate/downloadUpdate/installUpdate ——
+     * app.js 会检测它们不存在，自动走桌面端的 fetch + 浏览器路径。
+     */
+    openExternal: function (url) {
+      invoke('open_external', { url: String(url == null ? '' : url) })
         .catch(function () {});
     },
 

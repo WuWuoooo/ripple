@@ -8,7 +8,7 @@ The desktop client for Ripple. It **reuses the entire 8200-line `app/` frontend
 without changing a single line**, adding only a native bridge and a NetEase client
 on the Rust side.
 
-> **Status: shipped with 1.3.0**
+> **Status: shipped with 1.3.4** (the desktop client and the lyric window go into the same public Release)
 >
 > Desktop artifacts (`.deb` / `.AppImage` / `.tar.gz` / `-setup.exe` / `.zip`)
 > are published **in the same public Release** as the Android APK; CI also uploads
@@ -143,9 +143,18 @@ Android.
 > on and retries next launch — rather than forcing it off (which would make the user
 > think the feature vanished).
 
-### Not implemented
+### Not implemented (honest list)
 
-Nothing at present that "should exist but doesn't".
+| Item | Status | Reason |
+|---|---|---|
+| System tray / SMTC / MPRIS media controls | Not done | Each platform needs its own native API; significant work |
+| System notifications | Not done | Same; `notify()` always returns `false`, so the frontend takes its fallback path |
+| macOS build | Not shipped | CI can build it, but an unsigned bundle is blocked by Gatekeeper; double-clickable needs an Apple Developer account ($99/yr) + notarisation, and it cannot be verified on this machine |
+
+> D-11 (review report, 1.3.4): this section used to say "nothing at present that
+> should exist but doesn't", while the same document listed "media controls (to do)"
+> and "system notifications unsupported" just above — self-contradictory.
+> Now it is an honest list so readers are not misled.
 
 > **QR login works** (since 1.3.0): `chooseLoginMode` goes through the QR flow on all
 > three platforms, and `login_qr_key` / `login_qr_check` are implemented on the Rust

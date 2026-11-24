@@ -97,4 +97,50 @@ else:
     print(f'tauri.conf.json 版本已是 {ver}')
 PY
 
+# 5. D-10（审查报告，1.3.4）：Cargo.toml / Cargo.lock 的版本也要同步。
+#
+# 以前这里只同步 tauri.conf.json，而 Tauri 打包时用的是 Cargo.toml 的 version ——
+# 于是发版后可能出现「安装包是 1.3.4、崩溃日志里写的却是 1.3.3」，
+# 排查问题时版本对不上，非常误导。
+#
+# 只改 [package] 段里的 version（不碰依赖的 version），
+# 并顺手更新 Cargo.lock 里本包那一条 —— 否则 cargo 会认为 lock 过期。
+python3 - "$HERE/src-tauri/Cargo.toml" "$HERE/src-tauri/Cargo.lock" "$VNAME" <<'PY'
+import re, sys
+toml, lock, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Cargo.toml：[package] 之后的第一处 version = "..."
+def sync_toml():
+    src = open(toml, encoding='utf-8').read()
+    m = re.search(r'^\[package\]([\s\S]*?)(?=^\[)', src, re.M)
+    if not m:
+        print('Cargo.toml 找不到 [package] 段，跳过')
+        return
+    seg = m.group(1)
+    new_seg, n = re.subn(r'(?m)^(version\s*=\s*)"[^"]*"', r'\1"%s"' % ver, seg, count=1)
+    if n and new_seg != seg:
+        src = src[:m.start(1)] + new_seg + src[m.end(1):]
+        open(toml, 'w', encoding='utf-8').write(src)
+        print(f'Cargo.toml 版本 → {ver}')
+    else:
+        print(f'Cargo.toml 版本已是 {ver}')
+
+def sync_lock():
+    try:
+        src = open(lock, encoding='utf-8').read()
+    except OSError:
+        return
+    # [[package]] 块里 name = "ripple-desktop" 紧跟的 version
+    pat = re.compile(r'(\[\[package\]\]\nname\s*=\s*"ripple-desktop"\nversion\s*=\s*)"[^"]*"')
+    new, n = pat.subn(r'\1"%s"' % ver, src, count=1)
+    if n and new != src:
+        open(lock, 'w', encoding='utf-8').write(new)
+        print(f'Cargo.lock 版本 → {ver}')
+    else:
+        print('Cargo.lock 无需改动（未找到本包条目或已是最新）')
+
+sync_toml()
+sync_lock()
+PY
+
 echo "[desktop] 完成：$(find "$DIST" -type f | wc -l) 个文件"

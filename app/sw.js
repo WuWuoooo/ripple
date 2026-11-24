@@ -1,4 +1,4 @@
-const CACHE = 'ripple-133';
+const CACHE = 'ripple-134';
 const SHELL = [
   './', './index.html', './manifest.webmanifest',
   './css/base.css', './css/layouts.css', './css/components.css', './css/responsive.css',
@@ -37,7 +37,7 @@ self.addEventListener('fetch', (e) => {
    * 令牌脚本：**完全不接管**（既不缓存，也不做离线回落）。
    *
    * /ripple-token.js 由 server.js 下发，响应带 Cache-Control: no-store ——
-   * 它是会轮换的短期令牌，服务端只保留最近 3 个（新 + 2 旧），刷新页面就换一个。
+   * 它是会轮换的短期令牌，服务端每 IP 保留 6 个（新 + 5 旧，见 server.js 的 TOKEN_PER_IP），刷新页面就换一个。
    * 但 SW 的 Cache.put 不看 HTTP 缓存语义，照存不误，于是：
    *   · 弱网 / server.js 重启窗口里 fetch 失败 → 回落缓存里的**旧令牌脚本**
    *     → 令牌早已被轮换出窗口 → 所有 /ncm/* 成片 401；

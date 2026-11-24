@@ -450,6 +450,13 @@ jobs:
             echo "**本版包含 / What's in this release**"
             echo ""
             echo "$ZH_TOC"
+            echo ""
+            # 机器可读的 versionCode（1.3.4）：
+            # GitHub Release API 不提供 versionCode（只存在于 APK 内部），
+            # 而 App 内「检查更新」必须按整数比版本 ——
+            # 按版本名字符串比会在 1.3.10 vs 1.3.9 上判错。
+            # 埋一行 HTML 注释给它解析；找不到时 App 端退化成版本名比较。
+            echo "<!-- ripple-version-code: $VC -->"
           } > "$OUT"
 
           # 安装包在最前（紧跟要点清单），用户不用展开折叠、也不用往下拉就能看到

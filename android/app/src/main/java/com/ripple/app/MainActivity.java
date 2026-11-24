@@ -1194,7 +1194,14 @@ public class MainActivity extends Activity {
         }
     };
 
-    private void runJs(final String code) {
+    /**
+     * 在网页里执行一段 JS。
+     *
+     * 包内可见（不是 private）：HttpBridge 的「检查更新」链路要从后台线程
+     * 把结果推回网页（window.__rippleUpdate* 回调），需要调它。
+     * 内部已经切到 UI 线程并吞掉异常，调用方不用担心线程问题。
+     */
+    void runJs(final String code) {
         runOnUiThread(() -> {
             try {
                 if (web != null) web.evaluateJavascript(code, null);
