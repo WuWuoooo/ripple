@@ -8,8 +8,8 @@ name: desktop
 #
 # 触发：
 #   · push 到 feat/desktop-tauri 等桌面分支 → 自动构建，产出 Artifacts
-#   · workflow_dispatch（手动）→ 可指定是否构建 macOS；在 main 上触发时
-#     会走 release job，把桌面端产物并进该版本的 Release
+#   · workflow_dispatch（手动）→ 在 main 上触发时会走 release job，
+#     把 Linux / Windows 产物并进该版本的 Release（本项目不产出 macOS 包）
 #   · push 到 main 时只跑检查与打包，不自动发 Release（发版走手动 dispatch）
 on:
   push:
@@ -179,8 +179,8 @@ jobs:
   # ------------------------------------------------------------------
   # 第 3 关：实际打包
   #
-  # 三个平台各打各的包。macOS 默认参与（按需求要求三端），
-  # 但可以在手动 dispatch 时关掉以省额度。
+  # 打两个平台：Linux 与 Windows（见下面 matrix 的 include 列表）。
+  # macOS **不参与** —— 原因见紧接 matrix 后的说明（签名/公证成本与无人能测）。
   #
   # 产物既是 Artifact（方便看日志与单包排查），也会被下面的 release job
   # 收集起来并进同一个公开 Release。分支上的日常构建只有 Artifact，
