@@ -424,6 +424,23 @@ public class HttpBridge {
         try { act.setLyricProgress(p); } catch (Throwable ignored) {}
     }
 
+    /**
+     * 推送「进度基准点」，由原生侧按时间外推进度。
+     *
+     * @param progress 当前这一句的进度 0..1
+     * @param lineDur  当前这一句的总时长（秒），<=0 表示未知（原生不退推）
+     * @param rate     播放倍速
+     * @param playing  是否正在播放（false 时原生冻结不推进）
+     *
+     * 与 setLyricProgress 的区别：那个是「一次性真值」，这个是「基准 + 自行外推」。
+     * 后者是状态栏歌词的正确做法 —— 它要在**别的 App 前台**时也顺滑，
+     * 而那时 WebView 的定时器基本停摆（见 LyricOverlay.setTiming 注释）。
+     */
+    @JavascriptInterface
+    public void setLyricTiming(String progress, String lineDur, String rate, String playing) {
+        try { act.setLyricTiming(progress, lineDur, rate, playing); } catch (Throwable ignored) {}
+    }
+
     @JavascriptInterface
     public void updateLyricOverlay(String text) {
         try { act.updateLyricOverlay(text); } catch (Throwable ignored) {}

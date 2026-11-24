@@ -74,9 +74,88 @@
     /** 是否提供通知能力（前端用 typeof 判断，这里给一个恒 false 的实现即可） */
     mediaState: function () { return false; },
 
-    /** 桌面端无悬浮窗概念 */
-    canDrawOverlay: function () { return false; },
-    requestOverlayPermission: function () { return false; },
+    /* ================= 歌词窗（状态栏歌词的桌面端对等物） =================
+     *
+     * Android 那边是盖在系统状态栏上的悬浮窗；桌面端没有系统状态栏，
+     * 用一个独立的无边框置顶小窗口承担同一职责（见 src-tauri/src/main.rs
+     * 的 lyric.rs 段注释与 desktop/lyric.html）。
+     *
+     * 六个方法与 Java 侧**同名同签名**，前端 app.js 里那套调用一行都不用改 ——
+     * 它仍然以为自己在跟 Android 说话。
+     *
+     * 与 Java 的唯一语义差别在这里说明白：
+     *   · Java 的 canDrawOverlay 要问系统有没有「显示在其他应用上层」权限；
+     *     桌面端没有这个概念，创建窗口不需要任何授权，所以恒 true。
+     *   · 但「恒 true」不代表一定成功：没有合成器 / 没有 DISPLAY 的环境里
+     *     窗口创建会失败，那时 showLyricOverlay 返回 false，
+     *     前端看到 sbNative() 为真、却显示不出来 —— 这是真实的降级路径，
+     *     不是 bug。日志里会有一条 LYRIC 记录说明原因。
+     */
+
+    /** 桌面端创建置顶窗口无需系统授权 */
+    canDrawOverlay: function () { return true; },
+    /** 同上：没有「去授权」这一步，直接返回 true 让前端继续 */
+    requestOverlayPermission: function () { return true; },
+
+    /**
+     * 显示 / 更新歌词窗配置。10 个参数与 Java 的
+     * `showLyricOverlay(locked, colorHex, sizeSp, alpha, x, y, bold, shadow, fill, fillHex)`
+     * 完全一致，且都是字符串（前端传的就是 String(...)）。
+     *
+     * 返回值是 async（Rust 命令是异步的），但**不要**把它改成 Promise 交给前端：
+     * app.js 那边是按 Android 的「同步调用、无返回值」写的，
+     * 这里保持「发了就不管」的形状最安全 —— 失败只在控制台留一条记录。
+     */
+    showLyricOverlay: function (locked, colorHex, sizeSp, alpha, x, y,
+                                 bold, shadow, fill, fillHex) {
+      invoke('lyric_overlay_show', {
+        locked: String(locked == null ? '' : locked),
+        color: String(colorHex == null ? '' : colorHex),
+        size: String(sizeSp == null ? '' : sizeSp),
+        alpha: String(alpha == null ? '' : alpha),
+        x: String(x == null ? '' : x),
+        y: String(y == null ? '' : y),
+        bold: String(bold == null ? '' : bold),
+        shadow: String(shadow == null ? '' : shadow),
+        fill: String(fill == null ? '' : fill),
+        fillHex: String(fillHex == null ? '' : fillHex),
+      }).then(function (ok) {
+        if (!ok) {
+          /*
+           * 窗口创建失败（最常见原因：Linux 没有合成器 / DISPLAY 不可用）。
+           * 这里**不改前端状态**，只在控制台说明 —— 前端的开关会保持打开，
+           * 用户下次启动还会再试一次；若把开关强制关掉，
+           * 用户会以为「这个功能没了」而不知道为什么。
+           */
+          console.warn('[ripple] 歌词窗口不可用（可能是没有桌面合成器）');
+        }
+      }).catch(function (e) {
+        console.warn('[ripple] lyric_overlay_show 失败：', e);
+      });
+    },
+
+    /** 更新当前这一句歌词 */
+    updateLyricOverlay: function (text) {
+      invoke('lyric_overlay_text', { text: String(text == null ? '' : text) })
+        .catch(function () {});
+    },
+
+    /**
+     * 推送「当前这一句」的进度 0..1。
+     *
+     * ⚠️ 语义是**句内**进度，不是整首进度。1.3.3 起前端 pushSbProgress()
+     * 已经改成句内进度，三端共用同一个值 —— 桌面端直接当 --p 用，
+     * 不做任何「除以时长」的换算。
+     */
+    setLyricProgress: function (p) {
+      invoke('lyric_overlay_progress', { progress: String(p == null ? '' : p) })
+        .catch(function () {});
+    },
+
+    /** 隐藏歌词窗（Rust 侧销毁窗口） */
+    hideLyricOverlay: function () {
+      invoke('lyric_overlay_hide').catch(function () {});
+    },
 
     /*
      * 登录：桌面端用**扫码登录**，纯 HTTP 实现，不需要内嵌 webview。

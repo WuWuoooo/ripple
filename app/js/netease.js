@@ -1,7 +1,7 @@
 /* ============================================================
    网易云客户端（真接口）
    · APK 内：window.RippleNative.netease(cmd, params, cbId)
-     —— Java 侧做 weapi 加密 + 带登录 cookie，和 Enji 走同一套协议
+     —— Java 侧做 weapi 加密 + 带登录 cookie
    · 浏览器内：POST 到本地 server.js 的 /ncm/<cmd>
      —— server.js 同样实现 weapi，行为一致
    老接口（/api/search/get 明文）已不再使用。
@@ -160,6 +160,15 @@
   const Netease = {
     base: '',
     _profile: null,
+    /*
+     * 当前登录用户的 uid 与「自己的第一个歌单 ID」缓存。
+     *
+     * uid 在登录/刷新账号时写入；歌单 ID 由 heartMode 懒加载并缓存 5 分钟
+     *（心动模式需要一个**真实**歌单 ID，传 0 上游会回「歌单不存在」）。
+     */
+    _uid: '',
+    _ownPlId: '',
+    _ownPlAt: 0,
 
     get nativeOn() {
       const N = g.RippleNative;
@@ -301,6 +310,12 @@
       const p = r.profile;
       const extra = r._extra || {};
       const vip = extra.vip && extra.vip.data ? extra.vip.data : null;
+      /*
+       * 顺手把 uid 缓存下来：心动模式需要一个真实歌单 ID，
+       * 而取歌单要 uid。登录态变化时这个值要跟着更新/清空，
+       * 所以写在同一个地方（status 是账号状态的唯一刷新入口）。
+       */
+      this._uid = p && p.userId ? String(p.userId) : '';
       this._profile = p
         ? {
             userId: p.userId,
@@ -341,6 +356,10 @@
     async logout() {
       try { await this.call('logout', {}); } catch (e) {}
       this._profile = null;
+      /* uid 与歌单缓存属于上一个账号，必须一起清掉 */
+      this._uid = '';
+      this._ownPlId = '';
+      this._ownPlAt = 0;
     },
 
     /* ================= 音乐数据 ================= */
@@ -514,15 +533,94 @@
     },
 
     /** 心动模式：以当前歌曲 + 歌单为种子，生成同口味的队列（需登录） */
+    /**
+     * 心动模式：以当前歌曲 + 一个**真实歌单**为种子，生成同口味的队列。
+     *
+     * ⚠️ playlistId 不能传 0 / 省略 —— 实测（真实登录态，2026-11-23）：
+     *     playlistId='0'    → {"code":400,"message":"歌单不存在"}
+     *     不传 playlistId   → {"code":500}
+     *     真实歌单 ID       → {"code":200, data:[146 项]}
+     * 而旧代码在拿不到当前歌单上下文时传的就是 '0'，
+     * 于是**每次都会失败**，前端再退到 simi_song 兜底 ——
+     * 用户看到的就是「心动模式一直取不到列表」。
+     *
+     * 现在：调用方没给歌单时，自动去用户自己的歌单里取第一个
+     *（「我喜欢的音乐」通常在列表最前，且一定有内容），
+     * 这样在任何入口切心动模式都能真的生成队列。
+     *
+     * 返回结构实测为 { code:200, data:[ { songInfo:{...} } ] } —— 
+     * data 是**一层数组**，每项用 songInfo 包着歌曲。仍保留逐层探测，
+     * 因为上游随时可能调整，且这个函数错在结构上的表现极难排查
+     *（列表永远为空，异常被外层吞掉）。
+     */
     async heartMode(songId, playlistId, count = 20) {
+      let plId = String(playlistId || '').trim();
+      if (!plId || plId === '0' || plId === 'undefined' || plId === 'null') {
+        plId = await this._firstOwnPlaylistId();
+      }
       const r = await this.call('heart_mode', {
         songId: String(songId),
-        playlistId: String(playlistId || 0),
+        // 拿不到歌单 ID 时也只能传 0（接口会 400），但至少上层会走到兜底
+        playlistId: plId || '0',
         startMusicId: String(songId),
         count,
       });
-      const list = r.data || [];
-      return list.map((x) => this.mapSong(x.songInfo || x.song || x)).filter((t) => t.neId);
+      let list = [];
+      if (Array.isArray(r && r.data)) {
+        list = r.data;                                   // 实测结构：一层数组
+      } else if (r && r.data && Array.isArray(r.data.data)) {
+        list = r.data.data;                              // 防御：万一上游改成两层
+      } else if (Array.isArray(r && r.songs)) {
+        list = r.songs;
+      }
+      if (!list.length) {
+        Log.add('NCM', 'heartMode empty: code=' + (r && r.code)
+          + ' msg=' + (r && r.message) + ' plId=' + (plId || '0'));
+      }
+      return list
+        .map((x) => this.mapSong(x.songInfo || x.song || x))
+        .filter((t) => t && t.neId);
+    },
+
+    /**
+     * 取「当前登录用户自己的第一个歌单 ID」。
+     *
+     * 用途：心动模式必须带一个真实歌单 ID（见 heartMode 的注释）。
+     * 缓存 5 分钟：这个值几乎不变，而心动模式可能被反复切换。
+     */
+    async _firstOwnPlaylistId() {
+      const now = Date.now();
+      if (this._ownPlId && now - (this._ownPlAt || 0) < 300000) return this._ownPlId;
+      try {
+        const uid = this._uid || (await this._myUid());
+        if (!uid) return '';
+        const r = await this.call('user_playlist', { uid: String(uid), limit: 10, offset: 0 });
+        const arr = (r && r.playlist) || (r && r.data && r.data.playlist) || [];
+        const first = arr.find((p) => p && p.id);
+        if (first) {
+          this._ownPlId = String(first.id);
+          this._ownPlAt = now;
+          Log.add('NCM', 'heartMode 用歌单 ' + first.name + ' (' + first.id + ')');
+          return this._ownPlId;
+        }
+      } catch (e) {
+        Log.err('NCM', e, '_firstOwnPlaylistId');
+      }
+      return '';
+    },
+
+    /** 当前登录用户的 uid（登录后由 status/profile 写入，没有就现查一次） */
+    async _myUid() {
+      if (this._uid) return this._uid;
+      try {
+        const r = await this.call('status', {});
+        const uid = (r && r.profile && r.profile.userId)
+          || (r && r.account && r.account.id) || '';
+        if (uid) this._uid = String(uid);
+        return this._uid || '';
+      } catch (e) {
+        return '';
+      }
     },
 
     /** 无限漫游：拿相似歌曲不断续队列（未登录也能用） */

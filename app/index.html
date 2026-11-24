@@ -463,6 +463,32 @@
             <div class="tx"><b>歌词偏移</b><span id="lyricOffsetHint">0.0s</span></div>
             <div class="sld"><input type="range" min="-2" max="2" step="0.1" data-set="lyricOffset" aria-label="歌词偏移（秒）"></div>
           </div>
+          <!--
+            卡拉OK染色：四个歌词表面共用这一对开关
+            （状态栏浮层 / 展开的整篇 / 收起的三行 / 桌面端独立歌词窗）。
+            和下面「状态栏歌词」那个 Android 专属开关是两件事：
+            那个管「浮层显不显示」，这个管「歌词要不要跟着进度染色」。
+          -->
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-play"/></svg></div>
+            <div class="tx"><b>卡拉OK染色</b><span>唱到哪就把那句染到哪，随进度覆盖颜色</span></div>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="karaokeLyric" aria-label="卡拉OK染色"></button>
+          </div>
+          <div class="set-row">
+            <div class="ic"><svg><use href="#i-check"/></svg></div>
+            <div class="tx"><b>标记已唱完</b><span>唱过的整句用高亮色，便于扫读</span></div>
+            <button type="button" class="sw on" role="switch" aria-checked="true" data-set="karaokeDone" aria-label="标记已唱完的歌词"></button>
+          </div>
+          <!--
+            染色颜色：默认跟随主题（深色紫 / 浅色深紫，两套各自算过对比度），
+            点进去可以自定义。用和「状态栏歌词样式」一样的 .val 入口，
+            点击由 bindKaraokeColorRow 接住。
+          -->
+          <div class="set-row" role="button" tabindex="0" id="rowKaraokeColor" aria-label="歌词染色颜色">
+            <div class="ic"><svg><use href="#i-eq"/></svg></div>
+            <div class="tx"><b>染色颜色</b><span>已播放部分用的颜色</span></div>
+            <div class="val" id="karaokeColorVal">默认 ›</div>
+          </div>
           <!-- D-06：这两行同样是 Android 专属（依赖 LyricOverlay 悬浮窗 + SYSTEM_ALERT_WINDOW），
                桌面端没有这个权限可给 —— 用 data-desktop-hide 标记，由 JS 按名单统一隐藏，
                以后再加这类行只要标一下，不会又忘一处。 -->
@@ -833,6 +859,7 @@
 <script src="js/perf.js"></script>
 <script src="js/log.js"></script>
 <script src="js/lrc.js"></script>
+<script src="js/lyricfill.js"></script>
 <script src="js/netease.js"></script>
 <script src="js/store.js"></script>
 <script src="js/player.js"></script>

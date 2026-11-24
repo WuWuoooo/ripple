@@ -178,13 +178,48 @@ fi
 # tauri.conf.json 的 version（desktop/build-frontend.sh 会写，没问题）
 # 和 Cargo.toml 的 [package] version（**没有任何脚本写它**，停在 1.2.3）。
 #
-# Cargo.toml 的 version 会进二进制元数据（CARGO_PKG_VERSION）。当前 Rust
-# 源码没读它，所以用户可见版本暂时是对的；但这是潜伏漂移 —— 哪天有人按
-# cargo 惯例加 env!("CARGO_PKG_VERSION")，桌面窗口就会显示旧版本。
-#
-# 注意 Cargo.toml 里 [dependencies] 也有大量 version =，必须限定到
-# [package] 段。`0,/re/s//x/` 只替换第一处匹配，而 [package] 段永远在文件
-# 最前面，所以第一处 `version = "x.y.z"` 恰好就是 [package] 的那行。
+# ⚠️ 上面那句「build-frontend.sh 会写，没问题」是**错的**，1.3.3 实测抓到：
+#   build-frontend.sh 只在**桌面端构建**时运行（desktop-build.yml），
+#   而 Android 构建只跑本脚本。于是发版流程是「先改 version.json →
+#   跑 build-apk.sh → 再 dispatch 两个 workflow」时，tauri.conf.json
+#   会一直停在上一版，直到有人手动跑一次桌面端构建。
+#   症状很隐蔽：本地 APK 是对的、网页版是对的，只有桌面安装包
+#   的「关于」里版本号是旧的；而 CI 的版本断言（D-03）会因此在
+#   桌面端 workflow 里报红 —— 也就是「改完版本号，Android 绿、
+#   桌面红」，看起来像桌面端 workflow 本身坏了。
+#   现在这里一并同步，让三个构建入口（Android / Gradle / 桌面）
+#   都以 version.json 为唯一来源。
+TauriConf="$ROOT/desktop/src-tauri/tauri.conf.json"
+if [ -f "$TauriConf" ]; then
+  python3 -c "
+import json, sys
+path, ver = sys.argv[1], sys.argv[2]
+raw = open(path, encoding='utf-8').read()
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print('PARSE_ERROR: %s' % e)
+    sys.exit(1)
+if data.get('version') == ver:
+    print('      tauri.conf.json: 已是最新，未改动')
+    sys.exit(0)
+data['version'] = ver
+# 保留 2 空格缩进和 UTF-8，与手写格式一致
+open(path, 'w', encoding='utf-8').write(
+    json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+print('      tauri.conf.json: 已同步')
+" "$TauriConf" "$VN"
+  # 替换后断言：读回来必须真的等于 $VN（防 json 结构变动导致写丢了）
+  _tv="$(python3 -c "
+import json,sys
+print(json.load(open(sys.argv[1],encoding='utf-8')).get('version',''))
+" "$TauriConf")"
+  if [ "$_tv" != "$VN" ]; then
+    echo "❌ tauri.conf.json 的 version 同步失败（得到 '${_tv:-空}'，期望 '$VN'）" >&2
+    exit 1
+  fi
+fi
+
 if [ -f "$ROOT/desktop/src-tauri/Cargo.toml" ]; then
   CT="$ROOT/desktop/src-tauri/Cargo.toml"
   _old="$(cat "$CT")"

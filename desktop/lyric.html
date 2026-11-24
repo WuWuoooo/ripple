@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ripple 歌词</title>
+<!--
+  ============================================================
+  Ripple · 桌面端独立歌词窗
+  ============================================================
+
+  这是「状态栏歌词」在桌面端的对等物。Android 那边是盖在系统状态栏上的
+  悬浮窗（LyricOverlay.java），桌面端没有状态栏，所以用一个独立的
+  无边框置顶小窗口来承担同一职责。
+
+  为什么单独一个页面、不引用 app/ 下的任何 CSS/JS：
+    app/ 那套样式是给「手机播放页」写的，依赖主题变量、安全区、
+    玻璃拟态这一整套上下文。歌词窗只有一条透明背景上的文字，
+    引进来 3000 行样式反而要为了「别被父级样式影响」写一堆覆盖。
+    这里自包含，只有几十行，改起来也不会牵动主界面。
+
+  卡拉OK染色的原理与 app/css/base.css 里那套完全一致：
+    background-clip:text + 一条硬边渐变，硬边位置由 --p 控制。
+    桌面端不需要为「性能」做取舍（窗口就一行字），所以这里
+    连「只有当前行才染色」那类优化都不需要 —— 本来就只有一行。
+
+  与 Rust 的通信：
+    · 收：event 'lyric-state'，payload 是**整份状态**（见 push_lyric_state）
+    · 发：invoke('lyric_save_pos', {x, y}) 拖动结束后回报位置
+    · 首帧：页面加载完主动 invoke('lyric_overlay_sync') 拉一次 ——
+      窗口创建和页面加载是异步的，Rust 推首帧时 webview 可能还没起来，
+      事件会被丢掉，靠页面自己来要最稳。
+  ============================================================
+-->
+<style>
+  /*
+   * 全部元素透明：窗口本身是 transparent 的，页面再铺底色就白做了。
+   * 用 html,body 双选择器是因为某些环境里 body 的默认背景会盖住 html。
+   */
+  html,body{margin:0;padding:0;background:transparent;overflow:hidden;
+    width:100%;height:100%;}
+  body{
+    display:flex;align-items:center;justify-content:center;
+    /*
+     * 字体跟主程序保持同一族。桌面端拿不到 app/ 的 --font，
+     * 这里列一份等价的候选：中文优先系统黑体，英文优先无衬线。
+     */
+    font-family:"PingFang SC","HarmonyOS Sans SC","Microsoft YaHei",
+      system-ui,-apple-system,"Segoe UI",sans-serif;
+    /*
+     * 窗口可以拖动。tauri 的 drag-region 脚本要求属性写在**真正被点到的
+     * 那个元素**上（bare 空值只认 composedPath[0]），所以这里写 "deep"，
+     * 让子节点上的按下也能触发拖动。
+     * 锁定态时 Rust 侧已经把整个窗口设成鼠标穿透了，拖动自然不会发生，
+     * 所以不需要在 JS 里再判断锁定。
+     */
+    -webkit-user-select:none;user-select:none;
+    cursor:default;
+  }
+  #wrap{
+    /* 内边距让文字不贴窗口边缘，视觉上更像一条「药丸」 */
+    padding:4px 10px;max-width:100%;box-sizing:border-box;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    /*
+     * 左右淡出：长歌词在窄窗口里被裁切时，硬切边很难看。
+     * 用 mask 做一个 8px 的渐隐，比 text-overflow 的省略号更干净
+     * （省略号在透明背景上像个突兀的点）。
+     */
+    -webkit-mask:linear-gradient(90deg,transparent 0,#000 8px,
+      #000 calc(100% - 8px),transparent 100%);
+    mask:linear-gradient(90deg,transparent 0,#000 8px,
+      #000 calc(100% - 8px),transparent 100%);
+  }
+  #t{
+    font-size:15px;           /* 由 JS 按 size 覆盖 */
+    font-weight:600;
+    line-height:1.35;
+    /*
+     * 兜底颜色。真正的颜色由 JS 从 payload 写进 style。
+     * 默认白色是因为「浮层盖在任意桌面背景上」这个场景里，
+     * 白字 + 深色描边的可读性最稳。
+     */
+    color:#fff;
+    /*
+     * 文字描边（阴影）兜底：桌面背景可能是纯白文档、也可能是深色壁纸，
+     * 光靠字色无法保证可读。用一圈黑色模糊阴影在任何背景上都能看清。
+     * 由 JS 按 shadow 开关控制强度。
+     */
+    text-shadow:0 0 6px rgba(0,0,0,.85),0 1px 2px rgba(0,0,0,.75);
+  }
+  /*
+   * 卡拉OK：已播放部分是 --fill，未播放部分是 --base。
+   *
+   * ⚠️ 必须同时写 -webkit-text-fill-color 和 color 为 transparent，
+   * 否则渐变透不出来（文字仍是实心色，盖在渐变上面）。
+   * 这也意味着关掉染色时必须把这两个都还原 —— 见下面的 .plain 类。
+   */
+  #t.kf{
+    background-image:linear-gradient(90deg,
+      var(--fill,#b3a2ff) calc(var(--p,0) * 100%),
+      var(--base,#fff) 0);
+    -webkit-background-clip:text;
+    background-clip:text;
+    -webkit-text-fill-color:transparent;
+    color:transparent;
+  }
+  /* 没有正在播放的歌词时显示这一行，弱化处理 */
+  #t.idle{
+    color:rgba(255,255,255,.62);
+    font-weight:500;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><span id="t" class="idle">Ripple</span></div>
+
+<script>
+(function () {
+  'use strict';
+  var TAURI = window.__TAURI__;
+  /* 没有 Tauri 全局对象时（直接用浏览器打开这个文件）不做任何事，
+     静态展示「Ripple」即可 —— 不伪造桥，避免出现「看起来能用其实没用」。 */
+  if (!TAURI || !TAURI.core || typeof TAURI.core.invoke !== 'function') return;
+
+  var invoke = TAURI.core.invoke;
+  var el = document.getElementById('t');
+
+  /* 当前状态。初值与 Rust 侧 LyricState::default() 对齐。 */
+  var st = {
+    locked: false,
+    text: '',
+    progress: 0,
+    color: '#FFFFFF',
+    size: 15,
+    alpha: 0.95,
+    bold: true,
+    shadow: true,
+    fill: true,
+    fillHex: '#b3a2ff'
+  };
+
+  /**
+   * 按当前状态重画。
+   *
+   * 每次收到事件都整份重画，不做「哪个字段变了」的差量判断 ——
+   * 状态总共十来个字段，重画一次的成本比维护差量逻辑低得多，
+   * 而且不会出现「某个字段忘了同步」这一类 bug。
+   */
+  function render() {
+    var text = st.text || '';
+    if (text) {
+      el.classList.remove('idle');
+      el.textContent = text;
+    } else {
+      /* 没有歌词时显示占位而不是空窗口 —— 空窗口在桌面上看起来像
+         「有个东西坏了」，显示 Ripple 至少能说明它是活着的。 */
+      el.classList.add('idle');
+      el.textContent = 'Ripple';
+      el.classList.remove('kf');
+    }
+
+    /* 尺寸与颜色 */
+    var size = Number(st.size);
+    el.style.fontSize = (isFinite(size) && size > 0 ? size : 15) + 'px';
+    el.style.fontWeight = st.bold ? '600' : '400';
+    el.style.opacity = String(Number(st.alpha) || 1);
+    el.style.textShadow = st.shadow
+      ? '0 0 6px rgba(0,0,0,.85),0 1px 2px rgba(0,0,0,.75)'
+      : 'none';
+
+    /*
+     * 染色开关。
+     *
+     * 关掉时必须把 .kf 一起摘掉 —— 那个类会把文字填充色设成 transparent，
+     * 只改变量不摘类的话，文字会「透明但也没有渐变」，看起来整行消失。
+     */
+    var canFill = st.fill && !!text;
+    if (canFill) {
+      var p = Number(st.progress);
+      if (!isFinite(p)) p = 0;
+      p = Math.max(0, Math.min(1, p));
+      el.style.setProperty('--base', st.color || '#FFFFFF');
+      el.style.setProperty('--fill', st.fillHex || '#b3a2ff');
+      el.style.setProperty('--p', String(Math.round(p * 1000) / 1000));
+      el.classList.add('kf');
+    } else {
+      el.classList.remove('kf');
+      el.style.color = st.color || '#FFFFFF';
+    }
+  }
+
+  /* ---------- 收 Rust 推来的状态 ---------- */
+  if (TAURI.event && typeof TAURI.event.listen === 'function') {
+    TAURI.event.listen('lyric-state', function (e) {
+      var d = e && e.payload;
+      if (!d || typeof d !== 'object') return;
+      /*
+       * 逐字段判断存在性再合并，而不是 Object.assign(st, d)。
+       * 理由：Rust 那边将来可能只推变化的部分（现在是全量），
+       * 用 assign 会把缺失字段盖成 undefined，尺寸/颜色直接回默认值 ——
+       * 表现为「歌词偶尔闪一下变成 15px 白字」。
+       */
+      if (typeof d.locked === 'boolean') st.locked = d.locked;
+      if (typeof d.text === 'string') st.text = d.text;
+      if (typeof d.progress === 'number') st.progress = d.progress;
+      if (typeof d.color === 'string' && d.color) st.color = d.color;
+      if (typeof d.size === 'number') st.size = d.size;
+      if (typeof d.alpha === 'number') st.alpha = d.alpha;
+      if (typeof d.bold === 'boolean') st.bold = d.bold;
+      if (typeof d.shadow === 'boolean') st.shadow = d.shadow;
+      if (typeof d.fill === 'boolean') st.fill = d.fill;
+      if (typeof d.fillHex === 'string' && d.fillHex) st.fillHex = d.fillHex;
+      render();
+    }).catch(function () { /* 事件系统不可用时静默降级 */ });
+  }
+
+  /* ---------- 首帧：主动拉一次状态 ---------- */
+  /*
+   * 见文件头注释：Rust 推首帧时 webview 可能还没跑起来，事件会被丢掉。
+   * 这里在加载完成后自己 invoke 一次，保证第一帧就有内容。
+   */
+  invoke('lyric_overlay_sync').then(function (d) {
+    if (!d || typeof d !== 'object') return;
+    Object.keys(st).forEach(function (k) {
+      if (d[k] !== undefined && d[k] !== null) st[k] = d[k];
+    });
+    render();
+  }).catch(function () { render(); });
+
+  /* ---------- 拖动结束后回报位置 ---------- */
+  /*
+   * 用 window 的 move 事件而不是 tauri 的 onMoved：
+   * onMoved 是窗口自己发的事件，而这里要的是「拖动结束」这个时机。
+   * 实际做法是：拖动过程中节流记录位置，松手 300ms 后落盘一次。
+   * 这样既不会每移动一像素就写一次磁盘，也不会丢掉最后的位置。
+   */
+  var posTimer = null;
+  function reportPos() {
+    var w = TAURI.window;
+    if (!w || typeof w.getCurrentWindow !== 'function') return;
+    var win = w.getCurrentWindow();
+    if (typeof win.outerPosition !== 'function') return;
+    win.outerPosition().then(function (p) {
+      if (!p) return;
+      /* 坐标必须有限，否则会把窗口位置写坏到下次启动看不见 */
+      var x = Number(p.x), y = Number(p.y);
+      if (!isFinite(x) || !isFinite(y)) return;
+      invoke('lyric_save_pos', { x: Math.round(x), y: Math.round(y) })
+        .catch(function () {});
+    }).catch(function () {});
+  }
+
+  /*
+   * 监听窗口移动：Tauri 2 里窗口拖动会触发 tauri://move 事件。
+   * 不用 mousemove —— 拖动期间鼠标事件是窗口管理器消费的，
+   * 页面这边收不到可靠的 mouseup。
+   * 节流：300ms 内只落盘一次，拖动停下来之后才真正写。
+   */
+  if (TAURI.event && typeof TAURI.event.listen === 'function') {
+    TAURI.event.listen('tauri://move', function () {
+      if (posTimer) clearTimeout(posTimer);
+      posTimer = setTimeout(reportPos, 300);
+    }).catch(function () {});
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

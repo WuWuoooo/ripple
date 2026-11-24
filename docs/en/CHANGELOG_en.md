@@ -6,6 +6,354 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.3 — Tenth Version
+
+> **Basis**: a user request — "add lyric scrolling to all three platforms (status-bar lyric /
+> the normal expanded view / the collapsed view), with the already-played part covered in
+> colour in real time as playback progresses."
+> **Implementation and docs by**: Deepseek V4.1 Flash 1017.
+>
+> This is a **feature release**: it makes "lyrics colouring along with the music" actually
+> correct on all four lyric surfaces — the status-bar overlay, the expanded full lyric on the
+> playback page, the collapsed three lines, and the desktop standalone lyric window.
+>
+> Regression tests went from 160 to **169** (`lyricfill.test.js` 21 → 31,
+> `store-migrate.test.js` 18 → 22), and the three-platform manifest check passes.
+
+### 1. What it looked like before (otherwise the change is invisible)
+
+The "cover colour with progress" capability **nominally existed**, but all three places were
+wrong:
+
+1. **The fill ratio used the whole-song progress**, not the current line's.
+   `pushSbProgress()` pushed `Player.time() / duration` — on a 4-minute song, 10 seconds in,
+   the overlay tinted the current line by 4%. So the colour edge and the word actually being
+   sung never lined up; worse, whole-song progress **never resets** at a line change, so a new
+   line starts out pre-tinted.
+
+2. **Long lyrics did not scroll in the status-bar overlay.**
+   `TruncateAt.MARQUEE` only scrolls while the TextView is `selected`, but the overlay window
+   carries `FLAG_NOT_FOCUSABLE` (and `FLAG_NOT_TOUCHABLE` when locked), so it never gets focus
+   → never becomes selected. Long lines were truncated by `maxWidth` and **sat still**; the
+   second half was never visible. This is the real cause of "the status-bar lyric only shows
+   half a line".
+
+3. **The expanded full lyric had no colouring at all** — only a static bright/dim split.
+
+### 2. Extracted "how far into this line" into a pure, unit-tested module
+
+New **`app/js/lyricfill.js`** (260 lines) — pure math, no DOM, no Store:
+
+- `lineProgress(lines, idx, now, dur)` — 0..1 within the current line
+- `estimateLineDur(...)` — duration estimate for the final line
+- `toneFor(cur, rel, count)` — `done` / `now` / `todo` per row
+
+**Why a separate module**: `app.js` is over 7000 lines and touches the DOM directly, so it cannot be
+unit-tested in Node — and this conversion is exactly what most needs pinning down. Boundary,
+line change, final line, offset: get any one wrong and the symptom is "colour out of sync with
+the voice".
+
+New **`tests/lyricfill.test.js` (21 cases)**:
+
+| Case | Why it must exist |
+|---|---|
+| Exactly at the start time → 0 | One missing `=` and it tints before the line starts |
+| Next line's start → previous line is exactly 1 | Otherwise a gap, or it never fills |
+| Final line just begins → far below 1 | No next line as endpoint; most likely to jump to full |
+| Final line after a while → near 1 | And it must not stay forever-partial |
+| Estimate uses the median | Not dragged by 10s+ instrumental gaps (the mean is) |
+| NaN / string timestamps | Dirty data must not crash the page |
+| Monotonic within a line | A regression makes the edge jitter |
+
+> Writing these tests **caught a real bug**: the first `toneFor` was "`abs < c` means done,
+> else now"; with `rel=+1`, `abs = c+1` is neither below `c` nor out of range, so it fell into
+> `now` — the next line and the current line tinted simultaneously, both moving. The test went
+> red immediately.
+
+### 3. The three surfaces
+
+**① Status-bar overlay (Android)**
+- `setLyricProgress(p)` changed from whole-song progress to **the current line's** progress
+- **No Java interface change needed** — the native side already clips a gradient by ratio
+- `LyricOverlay.setText()` resets `progress` on a line change: the front end pushes new text
+  then new progress across two bridge calls with a frame in between; without the reset the new
+  line renders once at the previous line's 0.99
+- `hide()` resets it too (reopening no longer flashes "already half sung")
+- **Added `view.setSelected(true)`** — fixes the "long line does not scroll" bug above
+- `applyProgressFill()` short-circuits to a flat colour at `p <= 0`, avoiding a 1–2px bright
+  edge that looks like a bite taken out of the text
+
+**② Expanded full lyric**
+- The current line is coloured word-by-word; finished lines get a flat `.done` colour
+- **Translations are not hollowed out**: `background-clip:text` requires
+  `-webkit-text-fill-color:transparent`, which is inherited by the `.tr` child — the
+  translation has no gradient of its own, so without rescuing it the **entire translation
+  vanishes**. CSS explicitly restores fill colour and clip box on `.tr`
+
+**③ Collapsed three lines**
+- Current line coloured word-by-word; previous line `.done`; next line force-cleared
+- The three lines are **fixed DOM nodes** (`lyrPrev`/`lyrCur`/`lyrNext`), so on a line change
+  the identities shift — the previous `--kp` travels with the node into "next line", hence the
+  explicit clear every frame
+
+**④ Desktop standalone lyric window**
+- Borderless, always-on-top, skipped from the taskbar, draggable; mouse-transparent when locked
+- Same six bridge methods with the same signatures as Android, so the front end needs no change
+
+### 4. The colouring colours are **computed**, not picked
+
+The "played" colour cannot be `--accent`: that is a decorative colour, not a carrier for
+readable text. Measured against `#F1EEEA`:
+
+| Colour | Contrast | Verdict |
+|---|---|---|
+| `--accent #b3a2ff` (light theme) | **1.91:1** | ✗ lyric text is body-level; needs 4.5:1 |
+| `#5833ff` (same hue, darkened) | **5.45:1** | ✓ passes AA |
+
+So a new pair of tokens, `--karaoke-played` / `--karaoke-togo`, per theme:
+dark `#b3a2ff` (9.13:1), light `#5833ff` (5.45:1). Only lightness changes, not hue (251°), so
+it stays the same colour family in the light theme.
+
+### 5. Two switches (both genuinely turn it off)
+
+Settings → Lyrics: **Karaoke colouring**, **Mark finished lines**.
+
+> Turning it off cannot merely "stop updating" — at that moment the current line is usually
+> half-coloured (`transparent` text plus a gradient background); stopping updates alone leaves
+> it **permanently half-coloured** and looking truncated. CSS therefore forces the fill colour
+> and clip box back via `html.no-karaoke`.
+
+### 6. Fixed a **false red** test
+
+The "token works" assertion in `server-http.test.js` was `=== 200`, but `/ncm/status` **really
+calls the NetEase upstream** — a night-time network blip returns 502, and a re-run goes green.
+That kind of false red is the hardest to diagnose (it looks like you broke something; it is the
+external network).
+
+Now it asserts "**not 401/403/421** (auth did not block it) and only 200 or 502 may appear":
+the test cares about the token, not about NetEase being reachable.
+
+### 7. Fixed a **real** gap: nothing owned `tauri.conf.json`'s version
+
+The new `scripts/check-manifest-consistency.js` (added in 1.3.2) reported this directly:
+
+```
+✗ desktop/src-tauri/tauri.conf.json version 1.3.2 ≠ version.json 1.3.3
+```
+
+Because that file was written by `desktop/build-frontend.sh`, which only runs **during a
+desktop build**. Along the release path "edit version.json → run build-apk.sh → dispatch both
+workflows" it stayed on the previous version until someone manually ran a desktop build.
+
+The symptom is subtle: the local APK and the web version are right, only the desktop installer
+shows a stale version — and the CI version assertion then goes red in the desktop workflow,
+which looks like the workflow itself broke.
+
+`android/sync-version.sh` now syncs it too, with a read-back assertion.
+
+### 8. Six issues reported after real testing (fixed in the same version)
+
+> This section records what came back after the first 1.3.3 APK test round.
+> Every item was traced to a **root cause** before changing anything —
+> no cosmetic "looks fixed now" patches.
+
+**① Repeat-one restart left the coloured progress uncleared**
+
+Root cause: `syncLyric()` only recomputed the colouring when "the line index
+changed". On a repeat-one restart from 0:00 the first line is still the first
+line → index unchanged → treated as "no line change" → update skipped, so the new
+pass continued from wherever the previous one had filled.
+
+Fix: remember the previous playback position (`lyricLastT`); a **backward jump of
+more than 0.5 s** forces a recompute. The 0.5 s threshold separates a "real jump"
+from "100 ms sampling jitter" — using "any backward movement" would clear the
+colouring on every timeupdate and turn it into flicker. This also fixed
+"colouring not reset after seeking" and "not reset after tapping a lyric line".
+
+**② Only the current line should be coloured in the expanded view**
+
+Now only the current row carries colouring, and the previous round's node is
+explicitly cleared (`_lyricFocusNode`). Finished lines use the static `.done`
+highlight and keep no gradient — out of dozens of rows only one is moving, so the
+eye is drawn there naturally.
+
+**③ No fill animation in the status-bar lyric**
+
+Not "the code did not run": **existing users' settings still held the old default.**
+`sbFill` defaulted to `false` through 1.3.2; changing the default to `true` in
+1.3.3 only affects fresh installs — everyone upgrading still had `false` stored.
+
+Fix: a `schema` version number plus a one-shot migration (v1 → v2 sets
+`sbFill=true`). This is the most valuable insight of the round: **changing a
+default does nothing for existing users**, so every default change needs a
+migration.
+
+> The migration itself was caught by my own test: `schema` lives at the top level
+> of the saved blob, while `coerceSettings` receives `saved.settings`, so
+> `saved.schema` always read undefined → the migration ran on every launch → a
+> switch the user had turned off came back on after every restart and could never
+> be turned off. Now the whole blob is passed explicitly, with 8 tests
+> (`tests/store-migrate.test.js`).
+
+**④ Colouring colour must be customisable; currently it is the default colour**
+
+New setting `karaokeColor` (empty string = follow the theme) plus a colour-picker
+entry. The default is deliberately empty rather than a hard-coded hex: with two
+themes the same colour has very different readability on each (`#b3a2ff` measures
+1.91:1 on the light background and must be darkened to `#5833ff` for 5.45:1) —
+hard-coding necessarily makes one theme wrong.
+
+**⑤ New playback settings must also appear in the in-player panel**
+
+The "Playback settings" sheet (`renderOptSheet`) gained three rows: Karaoke
+colouring, Mark finished lines, Colouring colour. They use the same `karaoke*`
+keys as Settings → Lyrics, so changing either place syncs both.
+
+**⑥ Lyric progress lags, and the gap grows over time**
+
+The most substantive bug of the round; the root cause is **timeline conversion**:
+
+An LRC timestamp is "when the **next** line starts singing", and between that and
+"when **this** line finishes singing" there can be a long intro / interlude /
+instrumental section. The old logic used "time until the next line" as this line's
+singing duration, so a line that takes 3 s to sing was spread over 15 s — the
+colour crawled at 1/5 speed. And since interludes get denser later in a song, the
+error **grows as the song goes on**.
+
+Fix: `estimateLineDur()` now **prefers a character-count estimate** (Chinese
+articulation is steady at ~4.6 chars/s), falling back through "median of adjacent
+gaps" and "total duration / 12", clamped to [1.0, 9] s; and the gap to the next
+line is capped at 1.6× the estimate so a long interlude cannot stretch it.
+
+Measured (4 lines, a 15 s interlude after the third):
+
+| Time | Old colouring | New colouring | What you hear |
+|---|---|---|---|
+| 9 s | 20% | **100%** | third line already sung |
+| 21 s | 0% (switched early) | 0% (correct switch) | fourth just started |
+| 23 s | 13% | **100%** | fourth already sung |
+
+Five targeted tests added, including "two lines with the same character count must
+estimate the same duration" (the exact opposite of "grows over time") and a
+regression case for "an interlude must not slow the colouring down".
+
+### 9. Status-bar lyrics "only fill when the line changes": the full eleven-round record
+
+> This gets its own section because it is the longest and most mis-diagnosed
+> investigation in this project. Recording every hypothesis and how each was
+> falsified is more useful to a future reader than just the conclusion.
+
+**The user's description never changed**: "it only fills when the line changes" /
+"the line snaps to full at the end of a line, then jumps to the next one".
+
+#### Five hypotheses that were falsified (all real bugs, none the root cause)
+
+| Round | Hypothesis | Verdict |
+|---|---|---|
+| 1 | Progress used whole-song position instead of per-line | Real bug, fixed, not this one |
+| 2 | Old users still had `sbFill=false` stored | Real bug, fixed (v1→v2 migration), not this one |
+| 3 | Web timers stall in the background | Real bug, fixed (baseline + extrapolation), not this one |
+| 4 | `invalidate()` gets merged by WMS | **Wrong**. Added a 3-tier drawMode ladder, no effect |
+| 5 | Colour duration disagreed with native extrapolation | Real bug, fixed (exported `lineSpan`), not this one |
+| 6 | No vsync in the background stalls extrapolation | Real bug (Choreographer really does stop), not this one |
+| 7 | The compositor never picks up the frame | **Wrong**. Added a `translationX(0.01px)` nudge, no effect |
+
+#### The actual root causes (both required to reproduce)
+
+**① The frame callback was bound to the JavaBridge thread**
+(decisive evidence: `Ripple-crash-*-lyric-redraw.txt`)
+
+```
+CalledFromWrongThreadException: Expected: main  Calling: JavaBridge
+    at LyricOverlay.forceRedraw(LyricOverlay.java:643)
+    at LyricOverlay.pushFrame(LyricOverlay.java:616)
+    at Choreographer$FrameDisplayEventReceiver.run(...)
+```
+
+`Choreographer.getInstance()` is **thread-bound**. `setTiming` is a
+`@JavascriptInterface`, so it runs on WebView's JavaBridge thread, and the
+callback was bound there too — `view.requestLayout()` threw every frame and
+the exception was swallowed by `catch (Throwable)`. Worse, `dTicks++` sat
+*before* `forceRedraw`, so the log showed "frames are running (ticks up) but
+nothing is drawn (draws flat)" — an illusion that sent two whole rounds of
+investigation toward "WMS merging / compositor", both dead ends.
+
+**② This overlay ignores changes to *how* it is drawn; only *content* changes land**
+
+The comparison that finally located it:
+
+| Draw path | API used | Visible to the user |
+|---|---|---|
+| `p<=0` flat colour | `setTextColor` | Yes |
+| `0<p<1` gradient | `getPaint().setShader` | **No** |
+| `p>=1` flat colour | `setTextColor` | **Yes (snaps to full)** |
+| `0<p<1` clip + double draw | `canvas.clipRect` (inside TextView) | **No** |
+
+A `TYPE_APPLICATION_OVERLAY` + `FLAG_NOT_FOCUSABLE` window has its Canvas
+output cached as a "static window" on vivo OriginOS; only **content / layout**
+changes invalidate it.
+
+#### The fix
+
+`FillTextView` moved from `TextView` to a **self-drawing `View`**, taking all
+three concerns out of the layout system:
+
+| Need | Implementation | Triggers layout? |
+|---|---|---|
+| Colouring | `canvas.clipRect` + second `drawText` | No |
+| Long-line scrolling | draw-origin offset `offX` | No |
+| Progress update | change one `float` + `invalidate` | No |
+
+All three are pure draw parameters — measure/layout never participates, so the
+jitter is impossible by construction. The colour boundary also moved from
+"character" (the smallest unit of `ForegroundColorSpan`) to **pixel**,
+advancing continuously every frame.
+
+The two-round mis-diagnosis patch tower was removed with it: the `drawMode`
+ladder, the `translationX` nudge, `probeDrawRate` and the `Choreographer`
+branch are all gone. `forceRedraw()` went from thirty-odd lines to one `invalidate()`.
+
+#### One lesson for whoever comes next
+
+**Read the crash log before you read the counters.** The `draws` counter —
+which *looked* informative — misled two rounds straight: it counts "how many
+times the code ran", not "how many times the picture changed". The real
+evidence was sitting in `/sdcard/Download/Ripple-crash-*-lyric-redraw.txt`
+the whole time.
+
+### 10. Release notes support expand / collapse
+
+Once the notes get long (1.3.x has ~9 subsections per release, and the bilingual
+body runs 400+ lines), the GitHub Release page means scrolling forever — and
+scrolling back to find something again is easy to overshoot.
+
+Now a three-layer structure built on GitHub's native `<details>` support:
+
+1. **A permanent "What's in this release" block at the top** — every `###`
+   subheading is extracted automatically and listed, never collapsed. Users see
+   what the release covers without expanding anything;
+2. **Chinese body** in `<details open>` (expanded by default — Chinese is the
+   primary audience);
+3. **English body** in `<details>` (collapsed by default — non-Chinese readers
+   open it themselves).
+
+Default page height drops from 400+ lines to a few dozen, putting
+"Artifacts / SHA-256" within a screen or two. Nothing is deleted — expand to
+review any detail.
+
+### 11. What this version did not do
+
+- **Desktop window behaviour is only code-level verified**, never run on a real desktop
+  environment (this machine is aarch64 proot with no usable display server or compositor;
+  `cargo check` / `cargo fmt` pass, but whether the window really goes transparent and
+  always-on-top needs the user to test it)
+- **No word-level karaoke** (that needs a format beyond `.lrc`, such as a per-word KRC
+  timeline); this version is **per line**, linearly interpolated within the line
+- **No horizontal auto-scroll to the current word**. Long lines in portrait fall back to
+  ellipsis / marquee
+
+---
+
 ## 1.3.2 — Ninth Version
 
 > **Basis**: the "what this version did not do" list from 1.3.1 — that is, batch 3
@@ -307,7 +655,7 @@ share the same timing defect.
   point at their own `_en.md` counterparts, with only the language-switch line at the
   top pointing at Chinese (and vice versa). Verified by a two-way static check:
   **zero cross-language references in either direction**.
-- **`desktop/README` now has an English version**: added `desktop/README_en.md` (386 lines)
+- **`desktop/README` now has an English version**: added `desktop/README_en.md` (386 lines then, 415 since 1.3.3)
   matching the Chinese one section by section — architecture, bridge method mapping,
   feature comparison, three pitfalls, five CI pitfalls, artifact formats, and the
   ARM64 verification log.
@@ -360,7 +708,7 @@ The theme of this version is **"taking the desktop build from *runs* to *usable*
 
 ### 1. New Desktop Build (Windows / Linux, Tauri 2)
 
-The 13000-line frontend in `app/` is moved to the desktop as-is, with **not a single line of frontend logic changed**.
+The frontend in `app/` (over 7000 lines) is moved to the desktop as-is, with **not a single line of frontend logic changed**.
 
 The approach is to reproduce Android's `@JavascriptInterface` bridge verbatim inside the page: the desktop `bridge.js` provides `window.RippleNative`, forwarding internally to Tauri's Rust commands. The frontend cannot tell the difference — it believes it is talking to Java.
 

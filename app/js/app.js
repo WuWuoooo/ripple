@@ -7,6 +7,23 @@
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
   const S = () => Store.state.settings;
+  /*
+   * 卡拉OK填充的核心数学在 js/lyricfill.js（纯函数、可单测）。
+   * 这里只取一层别名，免得一万三千行里到处写 LyricFill。
+   * 取不到时（脚本加载失败 / 老壳缓存了旧 index.html）降级成 null，
+   * 所有调用点都先判空 —— 宁可没有染色，也不能整页崩掉。
+   */
+  const LF = window.LyricFill || null;
+  /*
+   * 状态栏填充色的兜底值。
+   *
+   * 必须定义在 IIFE 顶部（而不是用到它的函数旁边）——
+   * applySbOverlay 会在模块初始化后的第一次推送就用到它，
+   * 而 const 有 TDZ：写在后面会直接抛 ReferenceError，
+   * 表现是整个状态栏歌词链路静默失效。
+   * 值与 store.js 的 DEFAULTS.sbFillColor 保持同步。
+   */
+  const DEFAULTS_SB_FILL = '#b3a2ff';
 
   const App = {
     page: 'home',
@@ -156,6 +173,7 @@
         rememberProgress(false);
         if (Player.track) pushMediaState(false);   // 通知栏进度条
         pushSbProgress();                          // 状态栏歌词的填充进度
+        reportSbDiag();                            // 每 30 秒汇总一次填充诊断
       }, 1000);
     }
     /*
@@ -240,6 +258,23 @@
      * 统一走 refreshSystemBars（同一帧内合并、值没变不重复跨桥）。
      */
     refreshSystemBars();
+    /*
+     * 主题切了要重算染色颜色 —— 因为「深色模式自动反色」是**按当前主题**
+     * 决定用原色还是反色的。以前这里没调，于是切换主题后染色颜色不变，
+     * 用户勾了反色也看不到效果（必须重启或动一下别的设置才生效）。
+     */
+    applyKaraokeSwitches();
+    /*
+     * E-01（1.3.3 审查报告）：切主题后状态栏浮层的颜色也要重算。
+     *
+     * 「深色模式自动反色」对浮层是**在推送前现算**的（见 applySbOverlay），
+     * 所以主题一变就必须重新推一次，否则浮层继续用上一个主题算出的颜色 ——
+     * 网页歌词反色了，状态栏那条不变，用户以为开关坏了。
+     *
+     * 用 syncSbOverlay() 而不是 applySbOverlay()：
+     * 前者尊重「浮层已关闭」这个状态，后者会把关掉的浮层重新拉起来。
+     */
+    syncSbOverlay();
     const themeIcon = theme === 'light'
       ? '<svg><use href="#i-moon"/></svg>' : '<svg><use href="#i-sun"/></svg>';
     $('#btnTheme').innerHTML = themeIcon;
@@ -380,6 +415,13 @@
      * 这不只是省性能 —— 强度 0 时还保留模糊会显得参数没生效。
      */
     document.documentElement.classList.toggle('lg-off', gs <= 0.02);
+    /*
+     * 卡拉OK两个开关也在这里同步。
+     * applyVars() 是「所有设置生效」的统一入口（boot 与每次设置变更都会走到），
+     * 顺手挂在这里最省事，也保证「拷進来的旧 localStorage / 恢复默认设置」
+     * 这两条路径一样能把根元素 class 对齐，不会出现「设置是关的、界面还在染」。
+     */
+    applyKaraokeSwitches();
     r.setProperty('--anim', k);
     /* 动画速度拆成三档时长，CSS 里按用途取用：
        --dur    普通过渡（背景、颜色、悬停）
@@ -391,7 +433,7 @@
     r.setProperty('--dur-l', (0.52 / k).toFixed(2) + 's');
     /*
      * 展开/收回（封面 + 歌词）单独一档：基准 .3s，随速度倍率缩放，
-     * 但**上限 0.3s** —— 主人要求这段动画不超过 0.3 秒，
+     * 但**上限 0.3s** —— 按需求约定这段动画不超过 0.3 秒，
      * 以前速度调到 0.5× 会变成 0.6s。
      */
     r.setProperty('--dur-ani', Math.min(0.3, 0.3 / k).toFixed(2) + 's');
@@ -2191,8 +2233,22 @@
        * 整条跳过，于是通知栏再也回不到播放态。这里用 force 绕过幂等。
        */
       pushMediaState(true);
+      /*
+       * E-05（1.3.3 审查报告）：播放/暂停状态变化时必须推一次浮层。
+       *
+       * 以前只有 Player.on('time') 和前台 ticker 会调 pushSbProgress，
+       * 而暂停后：
+       *   · player.js 的 _loop 在 !playing 时直接 return，不再发 time 事件；
+       *   · 切到后台时 ticker 被 clearInterval。
+       * 于是「在通知栏暂停」时 playing=false 永远推不到原生，
+       * 原生 timingPlaying 仍是 true，继续外推到 1 ——
+       * 用户暂停后看到歌词已经染满。
+       *
+       * 这里清一次去重签名，保证这一帧必定下发。
+       */
+      pushSbProgressNow();
     });
-    Player.on('time', () => { updateTimes(); syncLyric(); });
+    Player.on('time', () => { updateTimes(); syncLyric(); pushSbProgress(); });
     // 曲目变化 → 立刻把新歌推给通知栏（封面/标题/时长）
     Player.on('track', () => { _mediaPushedKey = ''; pushMediaState(true); });
     Player.on('needmore', (t) => {
@@ -2432,6 +2488,20 @@
 
   /* ---------- 三行歌词（播放页常驻） ---------- */
   let lyricIdx = -1;
+  /*
+   * 上一次算歌词时用的播放时刻。
+   *
+   * 用途：检测「播放位置倒退」—— 单曲循环重播、拖动进度条、点某一句跳转，
+   * 都会让 Player.time() 突然变小。此时当前句下标可能**恰好还是同一个**
+   * （比如从 0:00 重播，第一句还是第一句），于是 `i !== lyricIdx` 不成立，
+   * 下面的染色更新就被当成「没换句」跳过 —— 表现为**已涂的进度没被清掉**，
+   * 新的一轮播放从上一轮染到的位置继续，越听越不对。
+   *
+   * 实测症状就是用户反馈的「单曲循环重新开始播放，但已涂色的进度没有清除」。
+   */
+  let lyricLastT = -1;
+  /* 展开层里「上一轮被染色的那个节点」，换句时用它清掉旧染色（见 syncLyric） */
+  let _lyricFocusNode = null;
 
   /*
    * H-3：renderLyric() 被 renderNP() 无条件调用，每次都把 40~80 个歌词节点
@@ -2599,6 +2669,176 @@
     return ans;
   }
 
+  /**
+   * 把「这一句唱到哪」写成 CSS 变量 --kp（0..1）。
+   *
+   * 为什么要走 CSS 变量而不是直接改颜色：
+   *   · 染色是 CSS 的 background-clip:text + 渐变硬边，浏览器只重绘合成层，
+   *     不触发 layout —— 每秒十几次的高频更新必须走这条快路径；
+   *   · 若改成 JS 算两层 <span> 再裁切，就要额外节点 + 每帧量宽度，
+   *     长歌词滚动时会明显掉帧。
+   * 值是字符串，且只有真的变了才写（10Hz 下同一句内每次都会变，
+   * 所以这里的去重只挡住「同一句里进度没动」的重复调用）。
+   */
+  function setKaraoke(el, p) {
+    if (!el) return;
+    /*
+     * 总开关在这里统一挡：所有染色入口都经过 setKaraoke，
+     * 挡住这一处就等于挡住了全部（含桌面端桥）。
+     */
+    if (!S().karaokeLyric) { clearKaraoke(el); return; }
+    const v = Math.round(Math.max(0, Math.min(1, p)) * 1000) / 1000;
+    if (el._kp === v) return;
+    el._kp = v;
+    el.style.setProperty('--kp', String(v));
+    /*
+     * 类名的维护只有一处：写 --kp 的同时打上 .kf。
+     * CSS 靠 .kf 掏空文字填充色（渐变才能透出来），
+     * 而清除时必须把 --kp 和 .kf 一起清 —— 只清变量会留下
+     * 「文字仍是透明、但没有渐变」的行，表现为整行字彻底消失。
+     */
+    el.classList.add('kf');
+  }
+
+  /** 把一个元素的染色彻底撤掉（清变量 + 清类，两者必须成对） */
+  function clearKaraoke(el) {
+    if (!el) return;
+    el._kp = null;
+    el.style.removeProperty('--kp');
+    el.classList.remove('kf');
+  }
+
+  /**
+   * 把「卡拉OK染色」的两个开关同步到 <html> 上。
+   *
+   * 为什么用根元素 class 而不是逐个元素判断：
+   *   · 上千行歌词在展开态只有几十个节点，但「关掉」这个动作需要对
+   *     所有已存在的节点生效，逐个遍历既慢又容易漏（重渲染后新节点会忘）；
+   *   · 挂在 <html> 上，CSS 一条规则就能兜住全部，
+   *     而且 JS 侧只需要在一处维护开关状态。
+   * 具体表现见 base.css 里 html.no-karaoke / html.no-kdone 两条规则。
+   */
+  function applyKaraokeSwitches() {
+    const r = document.documentElement;
+    r.classList.toggle('no-karaoke', !S().karaokeLyric);
+    r.classList.toggle('no-kdone', !S().karaokeDone);
+    /*
+     * 自定义「已播放」色。
+     *
+     * 空串 = 用主题默认（CSS 里的 --karaoke-played，两套主题各自算过对比度）。
+     * 用户选了颜色才写行内变量覆盖 —— 注意这里是写在 :root 上的
+     * --karaoke-played，而不是逐个元素写，这样两套主题的默认值
+     * 仍然由 CSS 决定，只有用户主动选择时才被统一覆盖。
+     *
+     * 行内样式优先级高于样式表，所以浅色/深色两条规则都会被这个值压过 ——
+     * 这正是「用户自定义」该有的语义：我选的颜色就是我要的。
+     */
+    const custom = String(S().karaokeColor || '').trim();
+    if (/^#[0-9a-fA-F]{6}$/.test(custom)) {
+      /*
+       * 用户在取色器里勾了「深色模式自动反色」时，
+       * 深色主题下用这个颜色的反色。
+       *
+       * 典型场景：用户在浅色主题下选了纯黑 #000000，
+       * 切到深色主题后黑色完全看不见 —— 反色成 #FFFFFF 就正常了。
+       * 只反转 RGB，不改 alpha（这里是 6 位 hex，没有 alpha）。
+       */
+      let use = custom;
+      if (S().karaokeInvert && resolvedTheme() === 'dark') use = invertHex(custom);
+      r.style.setProperty('--karaoke-played', use);
+    } else {
+      r.style.removeProperty('--karaoke-played');
+    }
+  }
+
+  /**
+   * 取一个十六进制颜色的反色（#RRGGBB → #FFFFFF - RGB）。
+   *
+   * 只做 RGB 反转，不转 HSL 补色 —— 补色会改变色相（紫变黄绿），
+   * 那是「另一个颜色」而不是「同色的反相」，用户认不出来是自己选的那个。
+   * 纯反相在深浅两套背景上恰好互补，这才是这个开关想要的效果。
+   *
+   * 非法输入原样返回，绝不抛错（染色是核心功能，不能因为一个坏 hex 就中断）。
+   */
+  function invertHex(hex) {
+    const m = /^#([0-9a-fA-F]{6})$/.exec(String(hex || '').trim());
+    if (!m) return hex;
+    const v = m[1];
+    let out = '#';
+    for (let i = 0; i < 6; i += 2) {
+      const b = 255 - parseInt(v.slice(i, i + 2), 16);
+      out += b.toString(16).padStart(2, '0');
+    }
+    return out.toUpperCase();
+  }
+
+  /**
+   * 把 #RRGGBB 解析成相对亮度，复用的还是上面那套 WCAG 实现。
+   *
+   * ⚠️ 不能直接把上面的 relativeLuminance 改成接受 hex ——
+   *   它被 inkForAccent / contrastRatio 那条链路用着（签名是 r,g,b），
+   *   同名覆盖会让「按封面主色挑墨色」整体算错。这里只做一层适配。
+   *
+   * 用途：状态栏浮层推送前挡一道 —— 浮层盖在深色壁纸/状态栏上，
+   * 填充色本身太暗（如 #000000）就和背景同色，已唱/未唱的分界消失，
+   * 用户看到的是「填充开关开着但画面毫无变化」。
+   */
+  function hexLuminance(hex) {
+    const m = /^#([0-9a-fA-F]{6})$/.exec(String(hex || '').trim());
+    if (!m) return 1;          // 解析不了就当它是亮的，不要因兜底而改用户颜色
+    const v = m[1];
+    return relativeLuminance(
+      parseInt(v.slice(0, 2), 16),
+      parseInt(v.slice(2, 4), 16),
+      parseInt(v.slice(4, 6), 16));
+  }
+
+
+  /**
+   * 收起态三行（上一句 / 当前 / 下一句）的卡拉OK染色。
+   *
+   * 三行的处理不一样，因为「已播放」对它们的含义不同：
+   *   · 上一句：一定唱完了 → 整行已播放色（--k-done），不需要 --kp；
+   *   · 当前句：按本句进度局部染色（--kp）；
+   *   · 下一句：还没到 → 保持原样，但**清掉**可能残留的 --kp 与 done 类。
+   * 最后这条容易漏：换句时「当前句」会变成「上一句」的身份，
+   * 若不清 --kp，它就会保持上一次染到一半的位置，看起来像卡住。
+   */
+  function applyMiniKaraoke(i, t) {
+    const prev = $('#lyrPrev');
+    const cur = $('#lyrCur');
+    const next = $('#lyrNext');
+    if (!LF) return;
+    const dur = Player.duration();
+    const tonePrev = LF.toneFor(i, -1, lyricLines.length);
+    const toneCur = LF.toneFor(i, 0, lyricLines.length);
+
+    if (prev) {
+      prev.classList.toggle('done', tonePrev === 'done' && !!S().karaokeDone);
+      clearKaraoke(prev);
+    }
+    if (cur) {
+      /*
+       * i < 0（还没到第一句）时 toneCur 是 todo：此时 UI 显示的是「♪」，
+       * 不该染色，也把 --kp 归零，避免上一首的残留带过来。
+       */
+      if (toneCur === 'now') setKaraoke(cur, LF.lineProgress(lyricLines, i, t, dur));
+      else clearKaraoke(cur);
+      // 换句后「当前句」不再有 done 语义（它正在唱）
+      cur.classList.remove('done');
+    }
+    /*
+     * 下一句只需清掉可能残留的状态（它永远是 todo），不需要算语气。
+     * 这一步不能省：换句时三行的身份整体平移，上一轮「当前句」上
+     * 留下的 --kp 会跟着这个 DOM 节点一起变成「下一句」，
+     * 不清就会出现「还没唱的那一行带着半句颜色」。
+     */
+    if (next) {
+      next.classList.remove('done');
+      clearKaraoke(next);
+    }
+  }
+
   /** force=true 时即使还在同一句也会重新计算（改歌词偏移后需要用） */
   function syncLyric(force) {
     if (!lyricLines.length) {
@@ -2607,18 +2847,38 @@
         $('#lyrPrev').textContent = '';
         $('#lyrCur').textContent = '♪';
         $('#lyrNext').textContent = '';
+        /*
+         * 没有歌词时也要把染色清干净。
+         * 否则「上一首有歌词（最后一行染到 60%）→ 切到一首无歌词的歌」
+         * 时，那 60% 的颜色会一直留在「♪」这一行上，看起来像卡住了。
+         */
+        clearKaraoke($('#lyrPrev'));
+        clearKaraoke($('#lyrCur'));
+        clearKaraoke($('#lyrNext'));
       }
       return;
     }
     const t = Player.time() + (S().lyricOffset || 0);
     const i = lyricIndexAt(t);
     /*
+     * 播放位置倒退（单曲循环重播 / 拖进度条 / 点歌词跳转）时，
+     * 必须当成「换句」来重算，哪怕下标没变。
+     *
+     * 判据：这次时刻比上次小了 0.5 秒以上。
+     * 为什么不是「任何变小」：进度事件本身有抖动（100ms 采样、
+     * 元素 seek 后 time() 可能短暂读到旧值），1ms 级的回退不该触发重算，
+     * 否则每次 timeupdate 都可能清一次染色，反而变成闪烁。
+     * 0.5 秒足以区分「真实的跳转」和「采样抖动」。
+     */
+    const wentBack = lyricLastT >= 0 && t < lyricLastT - 0.5;
+    lyricLastT = t;
+    /*
      * 三行歌词只在「当前句变了」时才写 DOM。
      * 这个函数被 Player 的 time 事件每 100ms 调一次，
      * 而一句歌词通常持续两三秒 —— 旧代码每次都在重写同样三个字符串，
      * 白白产生每秒十几次文本节点变更（平板上的合成开销很实在）。
      */
-    const lineChanged = force || i !== lyricIdx;
+    const lineChanged = force || wentBack || i !== lyricIdx;
     if (lineChanged) {
       const prevTx = i - 1 >= 0 ? lyricLines[i - 1].text : '';
       const curTx = i >= 0 ? lyricLines[i].text : '♪';
@@ -2630,7 +2890,28 @@
       $('#lyrNext').classList.toggle('blank', !nextTx);
       // 状态栏浮层跟着走（内部有去重，同一行不会重复发）
       if (S().sbLyric) pushSbText(false);
+      /*
+       * 换句时把浮层的进度缓存归零。
+       *
+       * pushSbProgress 有 0.4% 的去重，而它是按「句内进度」判断的 ——
+       * 换句后进度从接近 1 掉回 0，差值很大，本身不会被挡住。
+       * 但换**歌**时（尤其前奏很长、新歌第一句的进度几秒内都是 0）
+       * 上一首留下的 _sbProgLast 如果是 0.003，新句的 0 就会因为
+       * 「差 0.003 < 0.004」被吞掉 —— 浮层的填充停在上一首唱满的位置。
+       * 归成 -1 保证下一帧必定推一次，把新句从 0 开始画。
+       */
+      _sbProgLast = -1;
     }
+
+    /*
+     * 卡拉OK染色：三行（上一句 / 当前 / 下一句）各自算自己的语气。
+     *
+     * 这里**不能**只在 lineChanged 时才更新 —— 染色是逐帧变化的，
+     * 而换句几秒才一次。旧结构把「写文本」和「写颜色」绑在一起，
+     * 一旦绑上就只能在换句时染一帧，看起来像幻灯片。
+     * 所以拆成两层：文本按 lineChanged 惰性更新，染色每帧都算（但内部去重）。
+     */
+    applyMiniKaraoke(i, t);
 
     // 展开层：高亮 + 居中
     const box = $('#npLyric');
@@ -2644,7 +2925,33 @@
         // 还没到第一句（i<0）时把第一句当当前句显示，避免展开后一片空白没有焦点
         rows[k].classList.toggle('on', k === focus);
         rows[k].classList.toggle('near', false);
+        /*
+         * done 标记：整篇里「已经唱过去」的行。
+         * 只标不染色 —— 展开态有几十行，逐行都去算渐变会拖慢滚动；
+         * 「已唱完」是静态事实（只看时间戳），换句时更新一次就够。
+         */
+        rows[k].classList.toggle('done', k < focus && !!S().karaokeDone);
       }
+    }
+    /*
+     * 当前句的逐字填充（每帧更新，内部去重）。
+     *
+     * ⚠️ 展开层**只让当前这一句带染色**，离开就清空。
+     *
+     * 这是按用户反馈定的行为，而且它确实是更好的观感：整篇几十行里
+     * 只有一行在动，视线天然被吸到那一行；已唱完的行用 .done 的静态
+     * 高亮色标记即可（见上面 k < focus 那段），不需要保留渐变。
+     *
+     * 所以这里除了给当前行上色，还要把「上一轮是当前行、这一轮不是」的
+     * 那个节点清掉 —— 否则换句后旧染色会永久留在那一行上（节点还在，
+     * 只是不再是 focus）。这一步以前靠「每帧都覆盖所有行」蒙混过去，
+     * 量小的时候看不出来，行数一多就是明显的残留。
+     */
+    if (rows[focus]) {
+      const prevFocus = _lyricFocusNode;
+      if (prevFocus && prevFocus !== rows[focus]) clearKaraoke(prevFocus);
+      _lyricFocusNode = rows[focus];
+      setKaraoke(rows[focus], LF.lineProgress(lyricLines, i, t, Player.duration()));
     }
     /* 展开且可见时才滚动。
        两个前置条件缺一不可：
@@ -2837,6 +3144,20 @@
             `<div class="sld"><input type="range" min="11" max="19" step="1" data-opt="lyricSize"></div>`)}
           ${optRow('i-lyric', '歌词偏移', (s.lyricOffset > 0 ? '+' : '') + (+s.lyricOffset).toFixed(1) + 's',
             `<div class="sld"><input type="range" min="-2" max="2" step="0.1" data-opt="lyricOffset"></div>`)}
+          <!--
+            卡拉OK染色：和「我的 → 设置」里同一组开关。
+            按用户反馈「新增加的设置有关于播放的，不单只放进设置页，
+            播放器内部右上角的播放设置里面也要增加」—— 这三个正是
+            播放时最常想调的东西，放在播放页就地可改最顺手。
+          -->
+          ${optRow('i-play', '卡拉OK染色', '唱到哪就把那句染到哪',
+            optSwitch('karaokeLyric'))}
+          ${optRow('i-check', '标记已唱完', '唱过的整句用高亮色',
+            optSwitch('karaokeDone'))}
+          ${optRow('i-eq', '染色颜色',
+            /^#[0-9a-fA-F]{6}$/.test(String(s.karaokeColor || ''))
+              ? String(s.karaokeColor).toUpperCase() : '跟随主题',
+            '<div class="val">选择 ›</div>').replace('class="opt-row"', 'class="opt-row" data-optact="kcolor"')}
         </div>
       </div>
 
@@ -3110,6 +3431,23 @@
     if (what === 'eq') {
       closeOptSheet();
       setTimeout(() => openEQ(), 260);
+      return;
+    }
+    if (what === 'kcolor') {
+      /*
+       * 染色颜色：直接开取色器，不用先收起面板 ——
+       * 取色器本身是盖在最上层的模态（z-index 比播放设置 sheet 高），
+       * 而用户选完颜色后回到播放设置里还能继续调别的，
+       * 收起再打开反而多一次动画、也丢掉滚动位置。
+       */
+      const cur = String(S().karaokeColor || '').trim();
+      let start = cur;
+      if (!/^#[0-9a-fA-F]{6}$/.test(start)) {
+        const cs = getComputedStyle(document.documentElement)
+          .getPropertyValue('--karaoke-played').trim();
+        start = /^#[0-9a-fA-F]{6}$/.test(cs) ? cs : '#b3a2ff';
+      }
+      openColorPicker('karaokeColor', start);
       return;
     }
     if (what === 'sbtune') {
@@ -3705,7 +4043,16 @@
     }
     toast('正在生成心动队列…', t.title, 'cloud');
     try {
-      const pl = App._plCurrent && App._plCurrent.plId ? App._plCurrent.plId : 0;
+      /*
+       * playlistId 的取值（1.3.3 真实登录态实测）：
+       *   · 正在看某个歌单 → 用那个歌单 ID（最贴合"在这个歌单里心动"的语义）；
+       *   · 否则传**空**，让 Netease.heartMode 自己去取用户自己的第一个歌单。
+       *
+       * ⚠️ 千万不要传 0：上游对 playlistId=0 直接回
+       *   {"code":400,"message":"歌单不存在"}，而这就是
+       *   「心动模式一直取不到列表」的真正原因。旧代码在这里写的正是 `: 0`。
+       */
+      const pl = (App._plCurrent && App._plCurrent.plId) ? String(App._plCurrent.plId) : '';
       let list = await Netease.heartMode(t.neId, pl, 30);
       if (!list.length) list = await Netease.roamSongs(t.neId, 30);
       if (!list.length) throw new Error('没有拿到推荐');
@@ -3719,26 +4066,109 @@
       syncModeButtons();
       toast('心动模式已开启', queue.length + ' 首 · 按口味生成', 'heart');
     } catch (e) {
-      S().playMode = 'list';
-      Store.save();
-      syncModeButtons();
-      toast('心动模式取不到队列', e.message, 'warn');
+      /*
+       * 失败时**不能**硬把 playMode 改成 'list'。
+       *
+       * 用户反馈：「切到心动模式停了一秒想继续切换，它会显示心动模式取不到
+       * 列表然后跳过心动模式和漫游模式，导致用户找不到漫游模式」。
+       *
+       * 根因就是这两行：异步拉队列失败时无条件把 playMode 重置成 list。
+       * 而用户此时可能已经点到了「漫游」，这次重置把他的选择**覆盖**掉；
+       * 更糟的是紧接着 syncModeButtons 把标签刷回「列表」，
+       * 用户看到的是「我明明点了漫游，怎么变成列表了」，
+       * 之后每次循环都要重新路过心动那一档，永远绕不开。
+       *
+       * 正确做法：只提示失败，**不动用户当前的模式选择**。
+       * 队列没换成心动队列就已经是「没生效」了，再改模式等于雪上加霜。
+       */
+      toast('心动模式取不到队列', (e && e.message) || '稍后再试', 'warn');
+      Log.err('HEART', e, 'applyHeartMode failed');
     }
   }
 
   /* ================= 无限漫游 ================= */
   let _roamBusy = false;
+  /*
+   * 进入漫游/心动前保存的原队列快照（见 bindEvents 里 #npMode 的点击处理）。
+   *
+   * 为什么放在模块作用域而不是点击处理的闭包里：
+   * 进入漫游有**两条入口** —— 播放页的模式按钮，以及首页 hero 卡片的
+   * 「无限漫游」按钮。后者直接写 S().playMode = 'roam'，不经过点击处理，
+   * 所以快照必须能被两边共享，否则从 hero 进的漫游就恢复不了。
+   */
+  let _queueBeforeSpecial = null;
+  /**
+   * 进入漫游/心动**之前**的 playMode。
+   *
+   * 用途：这两个模式要异步拉队列，失败时得把开关退回到原来那一档。
+   * 不记的话只能硬编码回 'list'，而用户可能是从「单曲循环」切过去的。
+   */
+  let _playModeBeforeSpecial = '';
+
+  /** 进入漫游/心动前，把当前队列与上下文存一份（幂等：已在特殊模式时不覆盖） */
+  function saveQueueBeforeSpecial() {
+    if (_queueBeforeSpecial) return;
+    _playModeBeforeSpecial = Store.state.settings.playMode || 'list';
+    if (!Player.queue || !Player.queue.length) return;
+    _queueBeforeSpecial = {
+      queue: Player.queue.slice(),
+      index: Player.index,
+      context: Array.isArray(App.context) ? App.context.slice() : null,
+    };
+    Log.add('MODE', 'saved queue before special mode: ' + Player.queue.length + ' 首');
+  }
+
+  /**
+   * 从漫游/心动恢复到原队列。返回是否真的恢复了。
+   *
+   * index 按「当前在播的歌」重新定位，而不是照搬旧 index ——
+   * 漫游期间用户可能已经切过好几首，旧 index 早就指不到同一首了。
+   */
+  function restoreQueueFromSpecial() {
+    const snap = _queueBeforeSpecial;
+    if (!snap || !snap.queue.length) return false;
+    _queueBeforeSpecial = null;
+    const cur = Player.track;
+    let idx = snap.index;
+    if (cur) {
+      const found = snap.queue.findIndex((x) => x && x.id === cur.id);
+      idx = found >= 0 ? found : Math.max(0, Math.min(snap.queue.length - 1, idx));
+    }
+    Player.queueSet(snap.queue, idx);
+    if (snap.context) App.context = snap.context;
+    renderQueue();
+    Log.add('MODE', 'restored queue: ' + snap.queue.length + ' 首');
+    return true;
+  }
   /* 漫游队列上限：漫游是常开的，续下去不封顶会让队列与渲染无限膨胀 */
   const ROAM_QUEUE_MAX = 300;
   /* 审查 3.1：心动模式的续队列互斥锁（漫游那边的 _roamBusy 已有） */
   let _heartBusy = false;
   async function applyRoamMode() {
     const t = Player.track;
+    /*
+     * 失败时必须回滚 playMode，否则「切不回漫游」的那种感觉会更糟：
+     * 用户看到标签已经写着「漫游」，但队列根本没被换成漫游队列，
+     * 而且再也点不出任何反应（再点一次又回到别的档）。
+     *
+     * 这里把「回滚」抽成一个内层函数，保证三条失败路径都走到 ——
+     * 以前只在「心动模式」那条分支里做了回滚，漫游这条完全没有。
+     */
+    const rollback = (msg, sub) => {
+      S().playMode = _playModeBeforeSpecial || 'list';
+      Store.save();
+      syncModeButtons();
+      toast(msg, sub, 'warn');
+    };
     if (!t || t.source !== 'online' || !t.neId) {
-      toast('漫游需要一首在线歌曲', '先播一首网易云的歌', 'warn');
+      rollback('漫游需要一首在线歌曲', '先播一首网易云的歌');
       return;
     }
-    await extendRoam(t.neId, t);
+    try {
+      await extendRoam(t.neId, t);
+    } catch (e) {
+      rollback('漫游开启失败', e && e.message ? e.message : '稍后再试');
+    }
   }
 
   /**
@@ -4280,6 +4710,14 @@
   }
 
   /* ================= 设置 UI ================= */
+  /** 「染色颜色」那一行右侧的字：默认 / 具体色值 */
+  function syncKaraokeColorRow() {
+    const el = $('#karaokeColorVal');
+    if (!el) return;
+    const c = String(S().karaokeColor || '').trim();
+    el.textContent = /^#[0-9a-fA-F]{6}$/.test(c) ? c.toUpperCase() + ' ›' : '默认 ›';
+  }
+
   function syncSettingsUI() {
     const s = S();
     /*
@@ -4588,6 +5026,8 @@
         const startTrack = App._roamHero && App._roamHero.neId ? App._roamHero : seed;
         const rest = list.filter((x) => x && x.neId !== startTrack.neId);
         const queue = [startTrack].concat(rest);
+        /* hero 卡片是进入漫游的第二条入口，同样要先存快照（见 saveQueueBeforeSpecial）*/
+        saveQueueBeforeSpecial();
         S().playMode = 'roam'; Store.save(); syncModeButtons();
         App.context = queue;
         playTrack(queue[0], queue);
@@ -5016,26 +5456,104 @@
      * 因为歌单页的「播放全部/随机」也会改 playMode，那条路径不经过这里）。
      */
     let _modeSettleTimer = 0;
+    /* 模式切换的代数戳：只有最新一次点击的异步副作用有效（见下面注释） */
+    let _modeGen = 0;
+    /*
+     * 漫游 / 心动会把 Player.queue **整体替换**成一批生成的歌。
+     * 「切回列表循环」时如果不把队列也换回来，用户看到的仍然是那批漫游歌 ——
+     * 表现就是「切不回原来的模式」，其实是队列已经不属于原来的上下文了。
+     *
+     * 所以进入这两个模式前，先把原来的队列与上下文存一份；
+     * 切到其它任何一档时，如果刚从漫游/心动出来，就把它恢复回去。
+     * 只在「真的有东西可恢复」时替换，避免把用户后来手动加的队列冲掉
+     * （所以恢复成功后立刻清空快照，保证只恢复一次）。
+     */
     $('#npMode').addEventListener('click', () => {
-      let next = (currentModeIndex() + 1) % MODES.length;
-      const m = MODES[next];
-      if (m.need === 'login' && !Netease.loggedIn) {
-        toast('心动模式需要登录', '在「我的」里登录网易云账号后再试', 'warn');
-        // 跳过这一档，继续找下一个可用模式
-        next = (next + 1) % MODES.length;
+      /*
+       * 找到「下一个真正可用的档位」。
+       *
+       * ⚠️ 这里以前是一个典型的死锁：
+       *   当前在「随机」时点一下 → next 是「心动」→ 未登录跳过 → 变成「漫游」
+       *   → 漫游的前置条件也不满足（没在播在线歌）→ 直接 return。
+       *   playMode 一个字都没改，于是**再点永远走同一条路、永远卡在同一个档**。
+       *   用户看到的就是「从这个模式再也切不出去」。
+       *
+       * 正确做法：把「不可用的档」当作要跳过的（和未登录时跳过心动一样），
+       * 最多绕一圈；一圈都不可用才放弃并提示。
+       * 这样保证一次点击必然落到一个真正能用的档位上。
+       */
+      const start = currentModeIndex();
+      let blockedByLogin = false;
+      let blockedByRoam = false;
+      let mode = null;
+      for (let step = 1; step <= MODES.length; step++) {
+        const cand = MODES[(start + step) % MODES.length];
+        /*
+         * 心动模式的可用性判据要更细：
+         *   · 没登录 → 跳过（老逻辑）；
+         *   · 登录了但**当前不是在线歌** → 也跳过。
+         *     心动模式是拿当前这首歌的 neId 去生成队列的，
+         *     播本地导入的歌时它必然失败，让用户白等一次 toast
+         *     再看到「取不到队列」，比直接跳过更困惑。
+         *     跳过时仍然记一笔，最后统一告诉用户原因。
+         */
+        if (cand.key === 'heart') {
+          if (!Netease.loggedIn) { blockedByLogin = true; continue; }
+          const ht = Player.track;
+          if (!ht || ht.source !== 'online' || !ht.neId) { blockedByRoam = true; continue; }
+        }
+        if (cand.key === 'roam') {
+          /*
+           * 漫游必须有正在播的**在线**歌（它拿那首的 neId 去搜相似）。
+           * 不满足就跳过这一档 —— 但**不是**整个点击作废（见上面的死锁说明）。
+           */
+          const t = Player.track;
+          if (!t || t.source !== 'online' || !t.neId) { blockedByRoam = true; continue; }
+        }
+        mode = cand;
+        break;
       }
-      const mode = MODES[next];
+      if (!mode) {
+        // 一圈下来没有任何可用档位：说明真的一首在线歌都没有，这时才提示
+        if (blockedByRoam) toast('漫游需要一首在线歌曲', '先播一首网易云的歌再切漫游', 'warn');
+        else if (blockedByLogin) toast('心动模式需要登录', '在「我的」里登录网易云账号后再试', 'warn');
+        return;
+      }
+      /*
+       * 离开漫游/心动时恢复原队列。
+       *
+       * ⚠️ 顺序很重要：必须在改 playMode **之前**判断「当前是不是特殊模式」，
+       * 因为判断依据就是旧的 playMode。以前根本没有这段，
+       * 所以从漫游切到列表循环后，队列还是漫游那批歌，
+       * 用户连按「下一首」走的全是相似推荐，感觉像切不回来。
+       */
+      const wasSpecial = S().playMode === 'roam' || S().playMode === 'heart';
+      const goingSpecial = mode.key === 'roam' || mode.key === 'heart';
+      if (goingSpecial && !wasSpecial) saveQueueBeforeSpecial();
+      const restored = (wasSpecial && !goingSpecial) ? restoreQueueFromSpecial() : false;
+
       S().playMode = mode.key;
       Store.save();
       syncModeButtons();
-      toast('播放模式', mode.name, 'repeat');
+      toast('播放模式', mode.name + (restored ? ' · 已恢复原队列' : ''), 'repeat');
 
       clearTimeout(_modeSettleTimer);
       if (mode.key !== 'heart' && mode.key !== 'roam') return;
-      const wantKey = mode.key;
+      /*
+       * 用「代数戳」判断这次异步是否还有效，而不是比较 playMode 的值。
+       *
+       * 为什么不能用 `S().playMode !== wantKey`：
+       *   用户 A→心动（等 420ms）→漫游（又等）→心动，最后落回同一个 key，
+       *   旧定时器看到「值还是 heart」就以为自己仍然有效，于是两个
+       *   applyHeartMode 都会跑 —— 两次拉队列、队列被换两次，
+       *   用户看到的是队列闪一下又变回去。
+       * 代数戳每次点击 +1，定时器只认自己那一代，天然免疫这种往返。
+       */
+      const myGen = ++_modeGen;
       _modeSettleTimer = setTimeout(() => {
-        if (S().playMode !== wantKey) return;      // 停留期间又换档了：作废
-        if (wantKey === 'heart') applyHeartMode();
+        if (_modeGen !== myGen) return;            // 又点过别的档：这次作废
+        if (S().playMode !== mode.key) return;     // 兜底：状态已被别处改过
+        if (mode.key === 'heart') applyHeartMode();
         else applyRoamMode();
       }, 420);
     });
@@ -5262,6 +5780,27 @@
         el.addEventListener('pointerdown', () => paintSlider(el, true));
       }
     });
+    // 歌词染色颜色：点一下打开取色器（默认色时给一个合适的起始点）
+    (function bindKaraokeColorRow() {
+      const row = $('#rowKaraokeColor');
+      if (!row) return;
+      row.addEventListener('click', () => {
+        const cur = String(S().karaokeColor || '').trim();
+        /*
+         * 没设过自定义色时，取色器从「当前主题的默认色」起步，
+         * 而不是固定给一个 #FFFFFF —— 否则用户点进去看到的起点
+         * 和自己屏幕上正在用的颜色完全不同，很困惑。
+         * 默认值取自计算样式里的 --karaoke-played（CSS 里算过对比度的那两个）。
+         */
+        let start = cur;
+        if (!/^#[0-9a-fA-F]{6}$/.test(start)) {
+          const cs = getComputedStyle(document.documentElement)
+            .getPropertyValue('--karaoke-played').trim();
+          start = /^#[0-9a-fA-F]{6}$/.test(cs) ? cs : '#b3a2ff';
+        }
+        openColorPicker('karaokeColor', start);
+      });
+    })();
     // 「我的 → 均衡器」不再就地循环取值，改成打开和播放页同一个面板
     (function bindEqEntry() {
       const el = $('#eqVal');
@@ -5510,6 +6049,33 @@
       syncLyric(true);
     }
     if (k === 'showTrans') renderLyric();
+    /*
+     * 卡拉OK染色开关。
+     *
+     * 关掉时必须**真的**把已上的染色撤干净，而不是只让后续不再染：
+     * 关掉那一刻当前句往往正染到一半（文字是 transparent + 渐变背景），
+     * 若只是不再更新，那一行就永久停在半染色状态，而且
+     * -webkit-text-fill-color:transparent 会让它「看起来像被截断」。
+     * 所以这里走一遍 syncLyric(true) —— 它内部按开关重新决定要不要染。
+     */
+    if (k === 'karaokeLyric' || k === 'karaokeDone' || k === 'karaokeColor') {
+      applyKaraokeSwitches();
+      syncKaraokeColorRow();
+      renderNPOpt();          // 播放器面板里的同款开关也要跟着变
+      syncLyric(true);
+      /*
+       * E-02（1.3.3 审查报告）：状态栏浮层也要一起收干净。
+       *
+       * 上面那段只解决了网页三行，浮层没管：关掉总开关时
+       * 跨桥签名 sig 里不含 karaokeLyric，于是不会重推；
+       * 原生那边 fillProgress 仍是 true、progress 停在关闭那一刻，
+       * 浮层就定格在半染色状态，直到换句/切歌才被覆盖 ——
+       * 用户看到「网页的染色没了，状态栏那条关不掉」。
+       *
+       * syncSbOverlay 内部按 sig 幂等，重复调零成本。
+       */
+      syncSbOverlay();
+    }
 
     /* ---- 界面 ---- */
     if (k === 'compactList') document.body.classList.toggle('compact', v);
@@ -5816,17 +6382,59 @@
      * 而这里的参数（颜色/位置/字号/填充）九成没变。
      * 参数签名没变且浮层已经在显示，就不再跨桥，省一次主线程 JNI 往返。
      */
-    const sig = [!!s.sbLocked, s.sbColor, s.sbSize, s.sbAlpha, s.sbX, s.sbY,
-      !!s.sbBold, !!s.sbShadow, !!s.sbFill, s.sbFillColor].join('|');
+    /*
+     * 深色主题下按各自的开关决定要不要用反色。
+     *
+     * 浮层本身不知道 App 主题，所以这件事必须在推送前算好 ——
+     * 直接把「已经算好的最终颜色」交给原生侧，原生只管画。
+     */
+    const darkNow = resolvedTheme() === 'dark';
+    const pushColor = (darkNow && s.sbInvert) ? invertHex(s.sbColor || '#FFFFFF') : (s.sbColor || '#FFFFFF');
+    let pushFill = (darkNow && s.sbFillInvert) ? invertHex(s.sbFillColor || '#b3a2ff') : (s.sbFillColor || '#b3a2ff');
+    /*
+     * 运行时兜底：填充色在深色背景上「等于看不见」时，换掉它。
+     *
+     * 这是 2026-11-24 真机日志暴露的第二层问题：
+     *   LYRIC: timing diag: … color=#FFFBFB fillColor=#000000
+     * 文字是近白的、填充是纯黑的。
+     *
+     * ⚠️ 判据不能写成「填充色和文字色的亮度差」——
+     *   白字黑填充的亮度差是 1.0（最大值），指标上「对比很强烈」，
+     *   但实际效果恰恰是最坏的：浮层盖在**深色壁纸/深色状态栏**上，
+     *   黑色填充和背景同色，已唱/未唱的分界完全消失。
+     *   我第一版就是这么写的，实测这个 case 的 gap=0.972 直接漏网。
+     *
+     * 真正要问的是「**填充色自己**在深色背景上够不够亮」。
+     * 状态栏歌词浮层的背景几乎总是深色的（用户的壁纸/系统状态栏），
+     * 所以只要填充色的相对亮度低于 0.12，就当作不可见，换成默认强调紫。
+     * 默认紫 #b3a2ff 的相对亮度是 0.40，在深色背景上清晰可辨。
+     *
+     * 这只影响「推给浮层的最终值」，不改用户的设置 ——
+     * 用户随时可以把颜色改回来，我们只是不让它变成「开了但看不见」。
+     */
+    const fillLum = hexLuminance(pushFill);
+    if (fillLum < 0.12) {
+      Log.add('LYRIC', 'fill too dark for dark bg (lum='
+        + fillLum.toFixed(3) + '), fallback to ' + DEFAULTS_SB_FILL);
+      pushFill = DEFAULTS_SB_FILL;
+    }
+    /*
+     * sig 里必须含 karaokeLyric（E-02）：
+     * 它是填充的总开关，变了一次就该重推一次，
+     * 否则关掉总开关不会触发跨桥，浮层停在半染色。
+     */
+    const sbFillOn = !!(s.sbFill && s.karaokeLyric);
+    const sig = [!!s.sbLocked, pushColor, s.sbSize, s.sbAlpha, s.sbX, s.sbY,
+      !!s.sbBold, !!s.sbShadow, sbFillOn, pushFill].join('|');
     if (!force && _sbNativeReady && sig === _sbApplySig) return;
     _sbApplySig = sig;
     try {
       N.showLyricOverlay(
-        String(!!s.sbLocked), s.sbColor || '#FFFFFF', String(s.sbSize || 12),
+        String(!!s.sbLocked), pushColor, String(s.sbSize || 12),
         String(s.sbAlpha == null ? 0.92 : s.sbAlpha),
         String(s.sbX == null ? -1 : s.sbX), String(s.sbY == null ? -1 : s.sbY),
         String(!!s.sbBold), String(!!s.sbShadow),
-        String(!!s.sbFill), s.sbFillColor || '#7DE3D0'
+        String(sbFillOn), pushFill
       );
       _sbNativeReady = true;
       _sbHidden = false;
@@ -5867,22 +6475,200 @@
     if (!force && line === _lastSbText) return;
     _lastSbText = line;
     try { N.updateLyricOverlay(line); } catch (e) {}
+    /*
+     * 换句时顺带推一次进度 0（让新句子从左边开始染）。
+     *
+     * ⚠️ 这里**不能**当成「主推送路径」：同一句内这个函数会早早 return，
+     * 一条歌词两三秒才换一次，靠它推进度就变成「一句只染一次」——
+     * 那正是用户看到的「一句播完瞬间填满然后下一句」。
+     * 真正的高频推送在 Player.on('time') 与 1 秒 ticker 里，
+     * 这里只是给换句瞬间补一个明确的 0，减少一帧的错位。
+     */
+    _sbProgLast = -1;
     pushSbProgress();
   }
 
-  /** 把播放进度（0..1）推给浮层，用于文字填充效果 */
+  /**
+   * 把「当前这一句的进度」（0..1）推给浮层，用于卡拉OK填充。
+   *
+   * ⚠️ 这里以前推的是**整首歌曲**的进度（Player.time() / duration），
+   * 而浮层拿到它就会把「这一行文字」从左到右铺满 —— 唱到 4 分钟歌的第 10 秒，
+   * 当前这句只唱了一半，文字却已经染了 4%。
+   * 于是填充位置和嘴里唱到的字永远对不上，而且**换句时进度会突然归零重来**
+   * （整首进度是单调的，不会归零，所以表现为「新句子一上来就带着旧颜色」）。
+   * 换成句内进度后：每句从头染到尾，换句归零，才是卡拉OK该有的样子。
+   */
   let _sbProgLast = -1;
   function pushSbProgress() {
+    /*
+     * 入口计数：区分「pushSbProgress 根本没被调用」和
+     * 「调用了但被后面的门禁挡住」。
+     *
+     * 真机日志里出现过 send=0/dedup=0/skip=2 —— 20 秒只进了 2 次，
+     * 这说明问题在**调用方**（ticker 在后台被 clearInterval、
+     * Player.on('time') 在后台被节流），而不是这里的门禁。
+     * 没有这个计数就只能靠猜。
+     */
+    _sbDiag.enter++;
     const N = window.RippleNative;
-    if (!N || typeof N.setLyricProgress !== 'function') return;
-    if (!sbEnabled() || !_sbNativeReady || !S().sbFill) return;
-    const d = Player.duration();
-    if (!d || !isFinite(d)) return;
-    const p = Math.max(0, Math.min(1, (Player.time() || 0) / d));
-    // 每 1% 才推一次：进度填充肉眼看不出更细的差别，没必要每秒跨桥
-    if (Math.abs(p - _sbProgLast) < 0.01) return;
+    if (!N || typeof N.setLyricProgress !== 'function') { _sbDiag.noBridge++; return; }
+    if (!sbEnabled() || !_sbNativeReady) { _sbDiag.notReady++; return; }
+    /*
+     * 两个开关的与关系：总开关（karaokeLyric）关掉时整条链路都不该动；
+     * 浮层自己的 sbFill 关掉时只是浮层不染（其余三个表面照常）。
+     * 以前这里只判断 sbFill —— 于是 1.3.3 新增的总开关对状态栏浮层无效，
+     * 用户把「卡拉OK染色」关掉之后状态栏那条依然在染，看着像开关坏了。
+     */
+    if (!S().karaokeLyric || !S().sbFill) {
+      /*
+       * 诊断打点（1.3.3 第二轮排查「状态栏没有实时填充」时加的）：
+       * 用户反馈「一句播完会瞬间填满，然后下一句」——
+       * 这只有两种可能：进度只在换句时推一次，或者跨桥调用没生效。
+       * 这两个计数器能直接区分：
+       *   · progSkip 一直涨、progSend 不涨 → 门禁挡住了
+       *   · progSend 在涨但画面不动 → 是原生侧的问题
+       * 只在 30 秒内打一条汇总，避免刷屏。
+       */
+      _sbDiag.skip++;
+      return;
+    }
+    if (!lyricLines || !lyricLines.length || !LF) { _sbDiag.skip++; return; }
+    const t = Player.time() + (S().lyricOffset || 0);
+    const i = lyricIndexAt(t);
+    const p = LF.lineProgress(lyricLines, i, t, Player.duration());
+
+    /*
+     * 1.3.3 第三轮：改成推「基准点」，由原生自己按时间外推。
+     *
+     * 为什么不再每 100ms 推一次真值：
+     *   状态栏歌词的场景就是「切到别的 App 时看」——网页必然在后台，
+     *   那时 rAF 暂停、1 秒 ticker 被 clearInterval、timeupdate 被节流到
+     *   1 次/秒左右。实测日志 `send=0 dedup=30`（30 秒 30 次调用全被去重），
+     *   结果整句只在换句那一刻推进一次 →「一句播完瞬间填满」。
+     *
+     * 现在语义变成：
+     *   · 句内进度有变化时照旧推（前台时最准）；
+     *   · 同时带上「本句时长 / 倍速 / 是否在播」，
+     *     原生用这些在后台自行外推，不依赖网页的定时器。
+     */
+    const hasTiming = typeof N.setLyricTiming === 'function';
+    if (hasTiming) {
+      /*
+       * 基准点的推送条件比原来宽：只要「换句 / 播放状态变化 / 倍速变化」
+       * 就必须推，因为原生要靠这些重新锚定。句内进度变化也推，作为平滑校正。
+       */
+      /*
+       * 本句「实际会染多久」—— 必须和 lineProgress 内部算出的 end 完全一致。
+       *
+       * ⚠️ 这里以前推的是 LF.estimateLineDur()（纯字数估计），
+       * 而网页自己用的是 lineProgress 里「字数估计与句间隔折中」的结果，
+       * 两者在英文歌里能差一倍以上：
+       *   一行 35 个英文字符 → 字数估计 7.6s
+       *   但真实句间隔只有 3.2s
+       * 原生按 7.6s 外推，唱完这句时才 42%，接下来间奏继续爬，
+       * 等它爬到满格网页早换句了 ——
+       * 用户看到的正是「颜色一直满格、看不到从左往右推进」
+       *（真机日志 p1=1136，占全部帧的 65%）。
+       *
+       * 现在改成 LF.lineSpan()：它就是 lineProgress 用的那套计算的导出，
+       * 保证两边时长严格一致，原生外推才能跟得上网页。
+       */
+      const lineDur = LF.lineSpan
+        ? LF.lineSpan(lyricLines, i, Player.duration())
+        : (i >= 0 ? LF.estimateLineDur(lyricLines, i, Player.duration()) : 0);
+      const playing = Player.playing ? 'true' : 'false';
+      /* 播放倍速：原生外推时要按倍速缩放，否则 1.5x 时染色会跟不上 */
+      const rate = String((Number(S().speed) || 1));
+      const sig = [i, p.toFixed(3), lineDur.toFixed(1), rate, playing].join('|');
+      if (sig === _sbTimingSig) { _sbDiag.dedup++; return; }
+      _sbTimingSig = sig;
+      try {
+        N.setLyricTiming(String(p), String(lineDur), rate, playing);
+        _sbDiag.send++;
+        /*
+         * 记录最近一次真正推送的时刻。
+         *
+         * 用途：区分「网页没在推」和「原生没在画」这两类完全不同的故障。
+         * 真机日志里出现过 send=0 —— 那说明跨桥一次都没发生，
+         * 问题必然在网页这一侧的门禁/ticker，而不是原生的绘制链路。
+         */
+        _sbDiag.lastSendAt = Date.now();
+      } catch (e) {}
+      return;
+    }
+
+    // 旧路径（没有 setLyricTiming 的壳）：保持原来的逐帧推送
+    if (Math.abs(p - _sbProgLast) < 0.004) { _sbDiag.dedup++; return; }
     _sbProgLast = p;
-    try { N.setLyricProgress(String(p)); } catch (e) {}
+    try { N.setLyricProgress(String(p)); _sbDiag.send++; } catch (e) {}
+  }
+
+  /** 上一次推给原生的「基准点签名」，用于去重 */
+  let _sbTimingSig = '';
+
+  /**
+   * 强制下一次 pushSbProgress 一定下发（清去重签名）。
+   *
+   * ⚠️ 为什么要有这个包装函数，而不是在调用处直接写 `_sbTimingSig = ''`：
+   *   `_sbTimingSig` 是 `let` 声明、位置在本文件很靠后的地方，
+   *   而 boot() 里 Player.on('state') 的回调远在它之前就可能执行 ——
+   *   直接赋值会撞上「暂时性死区」（TDZ），抛 ReferenceError。
+   *   包成函数后，真正求值发生在调用那一刻，那时声明早已完成。
+   *
+   * 用途（E-05）：播放/暂停切换时必须把最新的 playing 状态推给浮层，
+   * 否则在通知栏暂停后原生仍以为在播，填充会一路爬到满格。
+   */
+  function pushSbProgressNow() {
+    try { _sbTimingSig = ''; } catch (e) { /* 极早期调用，忽略 */ }
+    pushSbProgress();
+  }
+
+  /*
+   * 状态栏填充的诊断计数器。
+   *
+   * 为什么需要它：这个功能「看起来没生效」有一堆可能原因，
+   * 而它们在界面上的表现完全相同（都不动）。靠猜要来回好几轮，
+   * 不如把每个环节的计数记下来，用户看一眼日志就能定位是哪一环断了。
+   * 每 30 秒汇总打一条，正常使用不会刷屏。
+   */
+  const _sbDiag = { skip: 0, dedup: 0, send: 0, lastReport: 0, first: false, lastSendAt: 0,
+    enter: 0, noBridge: 0, notReady: 0 };
+  function reportSbDiag() {
+    const now = Date.now();
+    /*
+     * 首个窗口缩到 8 秒。
+     *
+     * 2026-11-24 的用户日志只有 13 秒，而 30 秒窗口意味着整份日志里
+     * 一条 fill diag 都看不到（只有启动时那条 send=2）——
+     * 复现问题时用户很少录满 30 秒，诊断窗口必须跟着缩短。
+     */
+    const win = _sbDiag.first ? 30000 : 8000;
+    if (now - _sbDiag.lastReport < win) return;
+    _sbDiag.first = true;
+    /*
+     * E-08（审查报告）：判断要含 enter —— 否则「每次都被 noBridge/notReady
+     * 挡住」这种最该诊断的故障反而永远不打日志。
+     */
+    if (!_sbDiag.enter && !_sbDiag.skip && !_sbDiag.dedup && !_sbDiag.send) return;
+    _sbDiag.lastReport = now;
+    Log.add('LYRIC',
+      'fill diag: send=' + _sbDiag.send
+      + ' dedup=' + _sbDiag.dedup
+      + ' skip=' + _sbDiag.skip
+      + ' ready=' + (_sbNativeReady ? 1 : 0)
+      + ' enabled=' + (sbEnabled() ? 1 : 0)
+      + ' karaoke=' + (S().karaokeLyric ? 1 : 0)
+      + ' sbFill=' + (S().sbFill ? 1 : 0)
+      + ' hidden=' + (document.hidden ? 1 : 0)
+      + ' age=' + (_sbDiag.lastSendAt ? Math.round((now - _sbDiag.lastSendAt) / 1000) : -1)
+      + 's'
+      + ' track=' + (Player.track ? 1 : 0)
+      + ' lines=' + (lyricLines ? lyricLines.length : 0)
+      + ' enter=' + _sbDiag.enter
+      + ' noBridge=' + _sbDiag.noBridge
+      + ' notReady=' + _sbDiag.notReady);
+    _sbDiag.skip = 0; _sbDiag.dedup = 0; _sbDiag.send = 0;
+    _sbDiag.enter = 0; _sbDiag.noBridge = 0; _sbDiag.notReady = 0;
   }
 
   /** 开关状态变化时的统一入口 */
@@ -5982,8 +6768,8 @@
             `<label class="sw${s.sbFill ? ' on' : ''}" data-sbsw="sbFill"></label>`)}
           ${s.sbFill ? `<div class="sb-custom-row">
             <span>填充色</span>
-            <button class="sb-swatch" id="sbFillPickBtn" style="--c:${s.sbFillColor || '#7DE3D0'}"></button>
-            <code id="sbFillHex">${(s.sbFillColor || '#7DE3D0').toUpperCase()}</code>
+            <button class="sb-swatch" id="sbFillPickBtn" style="--c:${s.sbFillColor || DEFAULTS_SB_FILL}"></button>
+            <code id="sbFillHex">${(s.sbFillColor || DEFAULTS_SB_FILL).toUpperCase()}</code>
             <button class="sb-pick-btn" data-pickfill>自定义 ›</button>
           </div>` : ''}
         </div>
@@ -6076,7 +6862,7 @@
         return;
       }
       if (e.target.closest('#sbFillPickBtn') || e.target.closest('[data-pickfill]')) {
-        openColorPicker('sbFillColor', S().sbFillColor || '#7DE3D0');
+        openColorPicker('sbFillColor', S().sbFillColor || DEFAULTS_SB_FILL);
         return;
       }
       const sw = e.target.closest('[data-sbsw]');
@@ -6152,6 +6938,24 @@
     return '#' + to(f(5)) + to(f(3)) + to(f(1));
   }
 
+  /**
+   * 取色目标 → 它对应的「反色开关」设置名。
+   *
+   * 每个取色目标单独一个开关，互不干扰：
+   * 用户可能希望歌词染色跟随主题反色，但状态栏填充色保持固定
+   * （那个浮层盖在系统状态栏上，本来就跟 App 主题无关）。
+   */
+  function invertKeyOf(target) {
+    if (target === 'sbColor') return 'sbInvert';
+    if (target === 'sbFillColor') return 'sbFillInvert';
+    return 'karaokeInvert';
+  }
+
+  /** 当前取色目标的反色开关状态 */
+  function invertOn() {
+    return !!S()[invertKeyOf(_pickTarget)];
+  }
+
   function openColorPicker(key, current) {
     _pickTarget = key;
     const hsv = hexToHsv(current);
@@ -6173,7 +6977,8 @@
         <div class="pick-preview" id="pickPreview"></div>
         <div class="pick-info">
           <code id="pickHex">#FFFFFF</code>
-          <span>${_pickTarget === 'sbFillColor' ? '进度填充色' : '歌词颜色'}</span>
+          <span>${_pickTarget === 'sbFillColor' ? '进度填充色'
+            : _pickTarget === 'karaokeColor' ? '歌词染色（已播放）' : '歌词颜色'}</span>
         </div>
       </div>
       <div class="pick-main">
@@ -6188,6 +6993,35 @@
         ${['#FFFFFF', '#FFD166', '#8FD8FF', '#B3A2FF', '#FF9EC4', '#7DE3D0',
            '#FF6B6B', '#FFA94D', '#51CF66', '#339AF0', '#845EF7', '#F06595']
           .map((h) => `<button data-q="${h}" style="--c:${h}"></button>`).join('')}
+      </div>
+      <!--
+        「深色模式自动反色」开关。
+        只对歌词染色的颜色显示 —— 状态栏歌词的填充色/文字色没有
+        「两套主题各自一个」这种需求（那个浮层本来就是盖在系统状态栏上的，
+        颜色由用户对着自己的壁纸调，不需要跟 App 主题联动）。
+      -->
+      <!--
+        深色模式自动反色：**所有取色菜单**都有（用户要求）。
+
+        每个取色目标都有自己的「反色开关」字段（见 invertKeyOf），
+        因为它们服务于不同的东西：
+          karaokeColor → 歌词染色（跟随 App 主题，最需要反色）
+          sbColor      → 状态栏歌词文字色（浮层盖在系统状态栏上，
+                         其实不跟随 App 主题，但用户可能希望一起变）
+          sbFillColor  → 状态栏填充色（同上）
+        按键名分开存，互不影响。
+      -->
+      <div class="pick-invert">
+        <div class="tx">
+          <b>深色模式自动反色</b>
+          <span>${invertOn()
+            ? '深色主题下用 ' + invertHex(hsvToHex(_pickH, _pickS, _pickV)) + '（当前所选的反色）'
+            : '关闭时两套主题都用这一个颜色'}</span>
+        </div>
+        <button type="button" class="sw${invertOn() ? ' on' : ''}"
+          id="pickInvertSw" role="switch"
+          aria-checked="${invertOn() ? 'true' : 'false'}"
+          aria-label="深色模式自动反色"></button>
       </div>
       <div class="modal-btns" style="margin-top:14px">
         <button class="btn ghost" id="pickCancel">取消</button>
@@ -6296,10 +7130,44 @@
         const hex = hsvToHex(_pickH, _pickS, _pickV);
         S()[_pickTarget] = hex;
         Store.save();
-        applySbOverlay();
-        renderSbTune();      // 让面板里的圆点/hex 跟着变
+        /*
+         * 取色器有三类使用场景，保存后要做的事不一样。
+         *
+         * 以前这里无条件调 applySbOverlay() + renderSbTune() ——
+         * 那两件事只对「状态栏浮层的颜色」有意义。新增「歌词染色颜色」后
+         * 再这么写就会出问题：渲染一个根本没打开的状态栏面板，
+         * 而且卡拉OK的颜色**不会立即生效**（它走的是 applyVars → CSS 变量那条路）。
+         */
+        /*
+         * 反色开关在取色器里可能被改过，但那时故意没落盘
+         * （见 bindPicker 里的注释：用户点「取消」不该改设置）。
+         * 走到这里说明用户点了「使用这个颜色」，此时才确认它。
+         */
+        Store.save();
+        if (_pickTarget === 'karaokeColor') {
+          applyKaraokeSwitches();
+          syncLyric(true);          // 让当前句立刻按新颜色重画
+        } else {
+          applySbOverlay();
+          renderSbTune();           // 让面板里的圆点/hex 跟着变
+        }
         closeColorPicker();
         toast('颜色已保存', hex.toUpperCase(), 'check');
+      });
+    }
+    /*
+     * 反色开关：只改设置并立刻重画取色器（预览里那一行说明要跟着变）。
+     * 不在这里落盘——用户在取色器里可能还会点「取消」，
+     * 那个开关的最终状态应该在点「使用这个颜色」时才确认，
+     * 否则「取消」之后设置已经被改了，与取消的语义矛盾。
+     */
+    const invSw = $('#pickInvertSw');
+    if (invSw && !invSw.dataset.bound) {
+      invSw.dataset.bound = '1';
+      invSw.addEventListener('click', () => {
+        const k = invertKeyOf(_pickTarget);
+        S()[k] = !S()[k];
+        renderPicker();          // 重画，让说明文字和开关状态同步
       });
     }
     const cancel = $('#pickCancel');

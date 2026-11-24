@@ -594,3 +594,29 @@ test('[报障] transition window：_onEnded 置位、load 成功解除', () => {
   assert.ok(loadFn, '找不到 load()');
   assert.match(loadFn[0], /this\._advancing = false/, 'load() 成功后要解除过渡窗口');
 });
+
+/* ============ 1.3.3 第四轮：状态栏填充的「黑填充」防护 ============ */
+
+test('R-13 状态栏填充推送前会挡掉过暗的颜色', () => {
+  const src = read('app/js/app.js');
+  /* 必须有按 hex 算亮度的适配层，且不能覆盖掉 inkForAccent 用的那个 */
+  assert.match(src, /function hexLuminance\(hex\)/, '必须有 hex → 相对亮度的适配函数');
+  assert.match(src, /function relativeLuminance\(r, g, b\)/,
+    '原来的 (r,g,b) 版本必须保留 —— inkForAccent 那条链路依赖它');
+  assert.ok(!/function relativeLuminance\(hex\)/.test(src),
+    '不能用 hex 签名覆盖 (r,g,b) 版本，否则按封面主色挑墨色会整体算错');
+
+  /* 推送路径上必须真的有这道检查 */
+  assert.match(src, /hexLuminance\(pushFill\)/,
+    'applySbOverlay 推送前必须检查填充色亮度');
+  assert.match(src, /DEFAULTS_SB_FILL/, '必须有兜底色常量');
+});
+
+test('R-13 兜底色常量定义在 IIFE 顶部（避免 TDZ 静默失效）', () => {
+  const src = read('app/js/app.js');
+  const decl = src.indexOf("const DEFAULTS_SB_FILL =");
+  const use = src.indexOf('pushFill = DEFAULTS_SB_FILL');
+  assert.ok(decl > 0, '必须定义 DEFAULTS_SB_FILL');
+  assert.ok(use > decl, '定义必须在首次使用之前 —— const 有 TDZ，'
+    + '写在后面会让整个状态栏推送链路抛 ReferenceError 且被 catch 吞掉');
+});

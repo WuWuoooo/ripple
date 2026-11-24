@@ -2,7 +2,7 @@
 
 [简体中文](./README.md) | **English**
 
-The desktop client for Ripple. It **reuses all 13,000 lines of the `app/` frontend
+The desktop client for Ripple. It **reuses the entire 8200-line `app/` frontend
 without changing a single line**, adding only a native bridge and a NetEase client
 on the Rust side.
 
@@ -53,7 +53,7 @@ to Tauri's Rust commands:
 ```
 app/js/netease.js
       |  window.RippleNative.netease(cmd, json, cbId)
-desktop/bridge.js          <- these ~86 lines are the entire adaptation cost
+desktop/bridge.js          <- these 377 lines are the entire adaptation cost
       |  __TAURI__.core.invoke('netease', {...})
 desktop/src-tauri/src/main.rs
       |
@@ -82,7 +82,11 @@ on that pending table plus a timeout. Switching to Promises would mean touching
 | `RippleNative.netease(cmd,json,id)` | Java weapi | Yes, Rust weapi |
 | `RippleNative.notify(title,body)` | Notification bar | No, always false (degrades) |
 | `RippleNative.mediaState(json)` | MediaSession | No, always false |
-| `RippleNative.canDrawOverlay()` | Overlay permission | No, always false |
+| `RippleNative.canDrawOverlay()` | Overlay permission | Yes, always true (no permission needed for an app-owned window) |
+| `RippleNative.showLyricOverlay(...)` | Status-bar overlay window | Yes — standalone always-on-top mini window (below) |
+| `RippleNative.updateLyricOverlay` | Change the current line | Yes |
+| `RippleNative.setLyricProgress` | Per-line progress 0..1 | Yes |
+| `RippleNative.hideLyricOverlay` | Hide the overlay | Yes |
 | `RippleNative.login(mode,id)` | Embedded login page | Not needed (login uses QR, see below) |
 
 Every native call site in the frontend is guarded with
@@ -97,8 +101,9 @@ essential `netease` and leave the rest empty.
 ### Fully working
 
 Playback engine (three-`<audio>` architecture), equalizer (WebAudio), lyrics
-(including translations), playlists, daily recommendations, heart mode, infinite
-roam, comments, search, local import, liquid-glass visuals, dark/light themes,
+(including translations), **per-line karaoke colouring**, **standalone always-on-top
+lyric window**, playlists, daily recommendations, heart mode, infinite roam,
+comments, search, local import, liquid-glass visuals, dark/light themes,
 cover-based color extraction, responsive layout at multiple sizes.
 
 ### Different shape
@@ -106,8 +111,35 @@ cover-based color extraction, responsive layout at multiple sizes.
 | Feature | Android | Desktop |
 |---|---|---|
 | Media control | Notification + MediaSession + headset keys | None (tray / SMTC / MPRIS pending) |
-| Lyric overlay | Status-bar overlay window | None (always-on-top mini window pending) |
+| Lyric overlay | Status-bar overlay window | **Standalone borderless always-on-top mini window** (since 1.3.3) |
 | edge-to-edge | Transparent status bar | Not applicable |
+
+### Lyric overlay: how the desktop does it
+
+Android exposes no public API for "write into the status bar", so a status-bar lyric is
+really a system-level overlay window covering the status-bar area — hence the
+"display over other apps" permission. Desktop has no such concept, so it uses a
+**standalone borderless always-on-top mini window** (`desktop/lyric.html` plus the
+`lyric_overlay_*` commands in `main.rs`):
+
+| Behaviour | Android | Desktop |
+|---|---|---|
+| Carrier | `TYPE_APPLICATION_OVERLAY` window | Standalone `WebviewWindow` (lazy-created) |
+| Always on top | System overlay is inherently on top | `always_on_top` + `skip_taskbar` |
+| Locked | `FLAG_NOT_TOUCHABLE` (click-through) | `set_ignore_cursor_events(true)` |
+| Unlocked | Draggable; tap calls back to the web UI | `data-tauri-drag-region` drag |
+| Position persistence | `settings.sbX / sbY` | `lyric-pos.json` in the config dir |
+| Progress | `setProgress(0..1)` | Same 0..1, **meaning "the current line"** |
+
+The six bridge methods are **same-named and same-shaped** as the Java side, so not a
+single line of the `app/` front end had to change — it still believes it is talking to
+Android.
+
+> **Known limitation**: on Linux a transparent window needs a desktop compositor.
+> Without one it degrades to an opaque background (the text stays readable); if window
+> creation fails, `showLyricOverlay` returns `false` and the front end keeps the switch
+> on and retries next launch — rather than forcing it off (which would make the user
+> think the feature vanished).
 
 ### Not implemented
 
@@ -171,7 +203,7 @@ The correct approach is `pub mod` in lib and `use ripple_desktop::netease` in ma
 
 ### 3. Command parameter shapes must match the other two platforms byte for byte
 
-All three platforms (Java / Node / Rust) implement the same 20 commands; any drift
+All three platforms (Java / Node / Rust) implement the same 22 commands (the front end calls 20 of them); any drift
 shows up as hard-to-diagnose differences like "plays in the APK but not on desktop".
 Easy ones to get wrong:
 

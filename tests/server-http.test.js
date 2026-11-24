@@ -139,7 +139,25 @@ test('S-13-e2e 令牌：签发可用、换 IP 后失效', async () => {
     },
     body: '{}',
   });
-  assert.strictEqual(use.status, 200, '同 IP + 同源 + 正确令牌 → 200');
+  /*
+   * 这一条断言的是「鉴权通过」，**不能**写成 === 200。
+   *
+   * /ncm/status 会真的去请求网易云上游，上游抖动 / 本机没网 / 被限流时
+   * 服务端会回 502（这是正确行为：上游失败就是上游失败）。
+   * 而这条测试关心的是「令牌对不对」，不是「网易云通不通」——
+   * 写成 200 就让整个测试套件依赖外网，实测在夜里抖动时会红一次，
+   * 重新跑又绿，属于最难排查的那类假红。
+   *
+   * 正确的判据：只要不是 401/403（鉴权失败），就说明令牌通过了。
+   */
+  assert.ok(
+    use.status !== 401 && use.status !== 403 && use.status !== 421,
+    '同 IP + 同源 + 正确令牌不应被鉴权拦住，实际 ' + use.status
+  );
+  assert.ok(
+    use.status === 200 || use.status === 502,
+    '鉴权通过后只可能是成功(200)或上游失败(502)，实际 ' + use.status
+  );
 
   /* 令牌本身有效，但换个 IP 来源就不该认（绑定来源 IP 是设计的一部分） */
   const useOtherIp = await request(port, {
@@ -151,9 +169,11 @@ test('S-13-e2e 令牌：签发可用、换 IP 后失效', async () => {
       'Content-Type': 'application/json',
     },
     body: '{}',
-    // 注意：没法在纯 node http 里伪造源 IP，这里改为断言「不带令牌必须 401」
   });
-  assert.strictEqual(useOtherIp.status, 200, '（本机同 IP，仍应 200）');
+  assert.ok(
+    useOtherIp.status !== 401 && useOtherIp.status !== 403,
+    '（本机同 IP，令牌仍应有效），实际 ' + useOtherIp.status
+  );
 
   const noToken = await request(port, {
     method: 'POST',

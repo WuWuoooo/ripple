@@ -79,7 +79,7 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
 const ROOT = path.join(__dirname, 'app');
 const HOST = 'https://music.163.com';
 
-/* ================= weapi 加密（与 Enji / NeteaseCloudMusicApi 一致） ================= */
+/* ================= weapi 加密 ================= */
 
 const IV = Buffer.from('0102030405060708');
 const PRESET_KEY = Buffer.from('0CoJUm6Qyw8W8jud');

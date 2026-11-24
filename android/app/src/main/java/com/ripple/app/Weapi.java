@@ -13,8 +13,7 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * 网易云 weapi 加密 —— 与 Enji（ncm-api-rs）以及 NeteaseCloudMusicApi 的
- * util/crypto.js 完全一致，不是「老 /api/search/get 明文接口」那一套。
+ * 网易云 weapi 加密
  *
  *   params    = Base64( AES-CBC( Base64( AES-CBC(明文 JSON, presetKey) ), randomKey ) )
  *   encSecKey = RSA_noPadding( reverse(randomKey) ) 的 hex

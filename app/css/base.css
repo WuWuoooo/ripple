@@ -57,7 +57,7 @@
   /* 用于「内容回来」这类要看得清的过渡：起手平缓，不会一闪而过 */
   --ease-soft:cubic-bezier(.25,.46,.45,.94);
   /*
-   * 主人用内置调参器绘制定稿的曲线：起手快、后段收缓（ease-out 手感）。
+   * 由内置调参器绘制定稿的曲线：起手快、后段收缓（ease-out 手感）。
    * 控制点（x,y）：(0,0) (0.043,0.118) (0.063,0.198) (0.099,0.292)
    *   (0.144,0.415) (0.185,0.493) (0.221,0.578) (0.277,0.648) (0.329,0.721)
    *   (0.41,0.787) (0.509,0.858) (0.63,0.915) (0.747,0.95) (1,1)
@@ -85,6 +85,25 @@
              --accent2 .5s var(--ease-soft),
              --accent3 .5s var(--ease-soft);
   --accent-ink:#17102b;
+  /*
+   * ---------- 卡拉OK染色专用色（两套主题各自给值） ----------
+   *
+   * 为什么不直接用 --accent：
+   *   --accent 是「装饰色」—— 它只需要好看、能和背景产生区分，
+   *   不需要承载可读的文字。实测它在浅色主题背景 #F1EEEA 上只有
+   *   1.91:1（#b3a2ff），而染色后的歌词是**正文级文字**，要 4.5:1。
+   *   直接用 accent 的后果是「浅色主题下唱过的歌词几乎看不见」。
+   *
+   * 所以单独给一对令牌：
+   *   --karaoke-played  已唱部分的文字色（必须过 AA）
+   *   --karaoke-togo    未唱部分的文字色
+   *
+   * 深色主题用 --accent 本身的色相（9.13:1，很充裕）；
+   * 浅色主题压暗到同色相的 #5833ff（5.45:1，过 AA）。
+   * 这两个值都是实算出来的，不是拍脑袋：见提交说明里的对比度表。
+   */
+  --karaoke-played:#b3a2ff;   /* 深色：9.13:1 */
+  --karaoke-togo:rgba(255,255,255,.55);
 }
 /*
  * 注意：必须写 :root[data-theme=...]，不能只写 [data-theme=...]。
@@ -107,6 +126,9 @@
      2.29:1（浅色），11.5px 的小字根本读不清。这里改成一个独立令牌、不叠 opacity，
      实测 5.32:1（深色）。层次靠「比 --lyric-dim 再暗一点」体现。 */
   --lyric-tr:rgba(255,255,255,.50);
+  /* 卡拉OK染色：深色主题直接用强调色的色相，9.13:1，很充裕 */
+  --karaoke-played:#b3a2ff;
+  --karaoke-togo:rgba(255,255,255,.55);
   --line:rgba(255,255,255,.10);--line2:rgba(255,255,255,.16);
   /* ---------- 语义色（两套主题各自给值，任何一处都不要硬编码） ----------
    * --warn：警告文案（如均衡器面板里「悬浮窗权限没给」那类要去处理的提示）。
@@ -135,6 +157,16 @@
   /* 投影：深色主题用浓黑才压得住；浅色主题必须换成很淡的暖灰，
      否则黑投影溢到浅底上就是一条「抹不掉的黑色带子」 */
   --cover-shadow:0 34px 64px -28px rgba(0,0,0,.95);
+  /*
+   * 横向卡片（推荐歌单 / 排行榜 / 每日推荐）的投影。
+   *
+   * 以前这个值写死在 layouts.css 的 .c-card 里：rgba(0,0,0,.9)。
+   * 深色主题下没问题，但浅色主题背景是 #F1EEEA —— 0.9 不透明度的黑
+   * 在上面是一圈非常明显的「黑雾」，卡片像浮在墨水里。
+   * 这跟 --cover-shadow 是同一类错误（写死一个只在深色下验过的值），
+   * 所以同样拆成两套主题各给一个令牌。
+   */
+  --card-shadow:0 18px 36px -22px rgba(0,0,0,.9);
   --sheet-shadow:0 -22px 50px -24px rgba(0,0,0,.95);
 }
 :root[data-theme="light"]{
@@ -162,6 +194,26 @@
   --gold-line:rgba(138,92,8,.45);
   --gold-bg:rgba(138,92,8,.10);
   /*
+   * 卡拉OK染色：浅色主题不能直接用 --accent。
+   *
+   * 实算（背景 #F1EEEA）：
+   *   --accent #b3a2ff        → 1.91:1   ✗（染色歌词是正文级，要 4.5:1）
+   *   #5833ff（同色相压暗）    → 5.45:1   ✓
+   * 压暗只改明度、不改色相（hue 251°），「已播放」和强调色仍是同一族，
+   * 不会在浅色主题里变成另一种颜色。
+   * 未唱部分用 --lyric-dim（.68 → 5.95:1），已过 AA，无须另给。
+   */
+  /*
+   * 浅色主题默认用**纯黑**而不是压暗的紫。
+   *
+   * 用户反馈「默认浅色填充歌词颜色为 #000000」——
+   * 浅色底色 #F1EEEA 上纯黑是 18.9:1，对比度极高，卡拉OK的
+   * 「已唱/未唱」分界最清楚。而原来的 #5833ff 虽然过 AA（5.45:1），
+   * 但在这个界面里偏「装饰色」，不如纯黑像「内容被覆盖」。
+   */
+  --karaoke-played:#000000;
+  --karaoke-togo:rgba(23,19,27,.42);
+  /*
    * 液态玻璃需要「能看见背后」才有折射感。
    * 原来 .72/.42/.56 的白太重，玻璃几乎不透明，折射全被盖住 ——
    * 看起来只是一块白板。降到 .46/.24/.34 并保留渐变走向。
@@ -185,6 +237,9 @@
      另外投影必须在 .cover-wrap 内部（底部还有约 20px 余量）就淡完，
      否则会被 overflow:hidden 一刀切出一条硬边灰带。 */
   --cover-shadow:0 9px 20px -16px rgba(72,56,40,.42);
+  /* 浅色主题：同 --cover-shadow 的思路 —— 用暖褐色代替纯黑，且大幅减淡。
+     实测原来的 rgba(0,0,0,.9) 在 #F1EEEA 上像一圈黑雾。 */
+  --card-shadow:0 14px 28px -20px rgba(72,56,40,.42);
   --sheet-shadow:0 -14px 30px -26px rgba(72,56,40,.30);
 }
 
@@ -689,9 +744,65 @@ body.no-cover .np-bg{opacity:0}
   color:var(--lyric-dim);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   transition:color .3s var(--ease),opacity .3s var(--ease)}
+/*
+ * ============================================================
+ * 收起态三行歌词的卡拉OK染色
+ * ============================================================
+ *
+ * 原理：background-clip:text 把一段渐变「裁」进文字笔画里，
+ * 渐变的硬边位置由 --kp（0..1，当前这一句唱到的比例）控制。
+ * 这样已唱部分一种颜色、未唱部分另一种颜色，边界就在「正唱到的那个字」上。
+ *
+ * 为什么不用两个 <span> 叠起来裁切：
+ *   · 要多一倍节点，三行 × 每句几十字，低端机上合成开销肉眼可见；
+ *   · 裁切需要每帧量文字宽度（getBoundingClientRect），会触发 layout。
+ *     background-clip 的渐变位置只改背景绘制，不触发 layout，
+ *     而且浏览器可以把它交给合成层 —— 这正是高频染色需要的性质。
+ *
+ * 颜色分工：
+ *   --k-base 未唱部分 = --lyric-dim（和非当前行同一档，层次不突变）
+ *   --k-done 已唱部分 = --text（和 .cur 高亮同色，唱到哪看到哪）
+ * 两个都写死在类里，不吃 currentColor —— 当前句的 .cur 把 color 设成了
+ * 高亮色，一旦用 currentColor，未唱部分也会跟着变亮，整句就是一片白。
+ */
+.np-lyric .ln{
+  --k-base:var(--karaoke-togo);
+  --k-done:var(--karaoke-played);
+  background-image:linear-gradient(90deg,
+    var(--k-done) calc(var(--kp,0) * 100%),
+    var(--k-base) calc(var(--kp,0) * 100%));
+  -webkit-background-clip:text;
+  background-clip:text}
+
 .np-lyric .ln.cur{font-size:calc(var(--lyric-size,11px) * 1.19);font-weight:600;color:var(--text);opacity:1;
   text-shadow:0 0 26px var(--accent-soft);letter-spacing:-.01em}
 .np-lyric .ln.blank{opacity:0}
+/* 上一句：整行唱完了，纯色标记即可，不需要渐变（同 .lyric 里的理由） */
+.np-lyric .ln.done{color:var(--text);font-weight:500;opacity:.88}
+/*
+ * 只有「正在唱」的那一行才掏空文字填充色（否则渐变看不见）。
+ *
+ * 用一个显式的 .kf 类，而不是 `[style*="--kp"]` 属性选择器：
+ * 后者依赖 style 字符串的字面内容，一旦有人给这一行加了别的内联样式
+ * （比如字号），匹配顺序就可能变，而且它读起来完全看不出意图。
+ * JS 侧在 setKaraoke 里同步维护这个类。
+ *
+ * ⚠️ 这段必须写在 .cur 之后。
+ * .cur 和 .kf 的优先级相同（都是「类+类」），后写者胜 ——
+ * .cur 里有 `color:var(--text)`，若它排在 .kf 后面，
+ * 就会把掏空了的 color 改回亮色，文字重新变成实心，
+ * 表现为「当前句完全没有染色效果」。这个 bug 我写反过一次，已踩过。
+ */
+.np-lyric .ln.kf{
+  -webkit-text-fill-color:transparent;
+  color:transparent;
+  /*
+   * 染色时不给 color 加过渡：
+   * .cur 上带 `color .3s`，而 kf 态的颜色其实是 transparent，
+   * 若让它参与过渡，换句那一瞬间会看到「文字从亮色渐变成透明再渐变回来」，
+   * 表现为闪一下。染色靠背景绘制即时生效，本来就不需要颜色过渡。
+   */
+  transition:opacity .3s var(--ease)}
 
 /* 进度：视觉宽度固定占满，靠 scaleX 表示播放比例 */
 .np-seek{flex:none;margin:14px 0 0;transition:opacity var(--dur-ani) var(--ease-inout)}
@@ -922,6 +1033,18 @@ body.no-cover .np-bg{opacity:0}
 .pick-hex{display:flex;align-items:center;gap:6px;margin:14px 4px 0;padding:10px 14px;
   border-radius:13px;background:var(--panel);border:1px solid var(--line)}
 .pick-hex span{font-size:14px;color:var(--text3);font-weight:600}
+/*
+ * 「深色模式自动反色」那一行。
+ * 样式与设置页的 .set-row 保持同一套节奏（左标题右开关），
+ * 但内边距更紧凑 —— 取色器面板本身就比设置页窄。
+ */
+.pick-invert{display:flex;align-items:center;gap:12px;
+  margin:14px 4px 0;padding:11px 12px;border-radius:14px;
+  background:var(--panel);border:1px solid var(--line)}
+.pick-invert .tx{flex:1;min-width:0}
+.pick-invert .tx b{display:block;font-size:12px;font-weight:520}
+.pick-invert .tx span{display:block;font-size:10px;color:var(--text3);margin-top:3px;
+  line-height:1.5;word-break:break-all}
 .pick-hex input{flex:1;min-width:0;background:none;border:0;outline:none;
   font-size:15px;letter-spacing:.1em;text-transform:uppercase;
   font-variant-numeric:tabular-nums;color:var(--text)}
@@ -1068,7 +1191,7 @@ body.no-cover .np-bg{opacity:0}
  *
  * flex-grow / min-height / padding 这几个量都会在展开瞬间跳变 ——
  * 不给它们 transition 的话，用户看到的就是「啪一下没了」。
- * 0.3s 是主人指定的时长，与 --dur-ani 的其它用法一致。
+ * 0.3s 是约定的时长，与 --dur-ani 的其它用法一致。
  */
 .cover-wrap{
   transition:flex-grow var(--dur-ani) var(--ease-inout),
@@ -1117,6 +1240,70 @@ body.no-cover .np-bg{opacity:0}
 .lyric .ln.on{color:var(--text);font-weight:600;
   font-size:calc(var(--ln-size, 14px) * 1.12);
   text-shadow:0 0 22px var(--accent-soft)}
+/*
+ * ============================================================
+ * 展开态整篇歌词的卡拉OK染色
+ * ============================================================
+ *
+ * 和三行歌词同一套原理（background-clip:text + 硬边渐变），但有两点不同：
+ *
+ * ① 展开层有译文。译文是 .tr 子块，若整行都去 background-clip:text，
+ *    译文的填充色也会被掏空，但它没有自己的渐变背景 —— 结果译文变成
+ *    一片透明（彻底看不见）。所以染色只作用在**正文文字**上：
+ *    给 .ln 设渐变时，用 `-webkit-text-fill-color:transparent` 会继承给子元素，
+ *    必须在 .tr 上显式还原成不透明，并用它自己的颜色。
+ *
+ * ② 展开层有几十行，逐行算渐变太贵。所以只有当前行（.on）走逐字填充，
+ *    已经唱过去的行（.done）给纯色即可 —— 它们的进度恒为 1，
+ *    渐变没有意义，纯色还省一次绘制。
+ */
+.lyric .ln{
+  --k-base:var(--karaoke-togo);
+  --k-done:var(--karaoke-played);
+}
+/*
+ * 已唱完的行：纯色，不用渐变（进度恒为 1，渐变没有意义）。
+ *
+ * 颜色取 --text（正文色）而不是 --text2：
+ * 实测 --text2（深色 .62 / 浅色 .62）与未唱行的 --text3（深色 .52 / 浅色 .52）
+ * 只差一档不透明度，在真机小屏上几乎看不出区别 ——
+ * 用户会觉得「唱过的句子还是灰的」，卡拉OK的层次感完全没体现出来。
+ * 用正文色 + 500 字重，和未唱行形成明确对比，又不会抢走当前行（当前行有放大+渐变）。
+ */
+.lyric .ln.done{color:var(--text);font-weight:500;opacity:.88}
+.lyric .ln.done.on{color:var(--text)}
+/*
+ * 当前行逐字染色。
+ *
+ * ⚠️ 顺序与三行歌词同理：必须写在 .on 之后，否则同优先级下
+ * .on 的 color 会把 transparent 覆盖回去，染色失效。
+ */
+.lyric .ln.kf{
+  background-image:linear-gradient(90deg,
+    var(--k-done) calc(var(--kp,0) * 100%),
+    var(--k-base) calc(var(--kp,0) * 100%));
+  -webkit-background-clip:text;
+  background-clip:text;
+  -webkit-text-fill-color:transparent;
+  color:transparent;
+  /* 同上：染色态不要让 color 参与过渡，否则换句会闪一下 */
+  transition:background-color .36s var(--ease),opacity .36s var(--ease)}
+/*
+ * 译文必须从「掏空」里救回来。
+ *
+ * .kf 上的 -webkit-text-fill-color:transparent 会被子元素 .tr 继承，
+ * 而 .tr 自己没有渐变背景，于是整段译文彻底不可见 ——
+ * 这是改造前不存在、只会在开了染色后出现的新 bug，
+ * 也是「当前句译文消失」这个症状的唯一原因。
+ * 显式还原成不透明，并保留它原本的 --lyric-tr 颜色。
+ */
+.lyric .ln.kf .tr{
+  -webkit-text-fill-color:var(--lyric-tr);
+  color:var(--lyric-tr);
+  background-image:none;
+  -webkit-background-clip:border-box;
+  background-clip:border-box;
+}
 /* 当前行的译文：**不能再叠一层 opacity**。
    基色已是弱化档（--lyric-tr），再乘 .65 后实测只剩 2.83:1（深色）/ 2.63:1（浅色）——
    而这是正在唱的那一句的对照译文，恰好是最该看清的一行。
@@ -1124,6 +1311,44 @@ body.no-cover .np-bg{opacity:0}
 .lyric .ln.on .tr{font-weight:400}
 .lyric .ln.near{color:var(--text2)}
 .lyric .empty{text-align:center;color:var(--text3);font-size:12px;padding:30px 0;line-height:1.8}
+
+/*
+ * ============================================================
+ * 卡拉OK染色的两个总开关（挂在 <html> 上，由 applyKaraokeSwitches 维护）
+ * ============================================================
+ *
+ * html.no-karaoke —— 完全关闭染色。
+ *   注意不能只让 JS 不再写 --kp：已经染到一半的那一行，
+ *   文字还处在 -webkit-text-fill-color:transparent 状态，
+ *   只停更新就会永久半透明+渐变，看起来像卡死。
+ *   所以这里用 !important 把填充色和背景一起强行还原。
+ *
+ * html.no-kdone —— 只关「已唱完」的静态标记，当前句的逐字染色保留。
+ *   这是给「觉得整篇亮色太花、只想看当前唱到哪」的用户准备的。
+ */
+html.no-karaoke .np-lyric .ln.kf,
+html.no-karaoke .lyric .ln.kf{
+  -webkit-text-fill-color:currentColor!important;
+  color:inherit!important;
+  background-image:none!important;
+  -webkit-background-clip:border-box!important;
+  background-clip:border-box!important;
+}
+html.no-karaoke .np-lyric .ln.done,
+html.no-karaoke .lyric .ln.done{
+  color:inherit!important;font-weight:inherit!important;opacity:1!important;
+}
+html.no-kdone .np-lyric .ln.done,
+html.no-kdone .lyric .ln.done{
+  color:inherit!important;font-weight:inherit!important;opacity:1!important;
+}
+/*
+ * no-karaoke 下当前行也要恢复成正常的行色（否则继承到父级的 color:transparent）。
+ * .np-lyric .ln.cur 里的 color 是 --text，这里让它正常生效即可 ——
+ * 不写规则反而会被上面的 currentColor 拖进透明，所以必须显式给值。
+ */
+html.no-karaoke .np-lyric .ln.cur{color:var(--text)!important}
+html.no-karaoke .lyric .ln.on{color:var(--text)!important}
 
 /* ---------- 设置 ---------- */
 .set-group{margin:18px 0 0}
@@ -1484,10 +1709,67 @@ html:has(#pickSheet.on) #sbSheet.on{
  */
 :root{--kb-h:0px}
 
-/* 评论面板：底部发布框让位给键盘 */
-html.kb-open .cmt-sheet{padding-bottom:calc(var(--kb-h) + 8px)}
-/* 面板本身不要被键盘挤到只剩一条：限制最大高度，内部滚动 */
-html.kb-open .cmt-sheet{max-height:calc(100% - var(--kb-h) - 24px)}
+/*
+ * ============================================================
+ * 键盘弹出时的避让：用 transform 上移，**不要**改 padding / 高度
+ * ============================================================
+ *
+ * 用户反馈「打开软键盘还是会影响评论布局」。
+ *
+ * 旧写法是 `padding-bottom: calc(var(--kb-h) + 8px)` —— 它把面板的
+ * **总高度**撑大了，而面板是贴底弹上来的，于是它的顶边被顶得更高，
+ * 同时也挤压了 body 的可用高度 → 里面的内容要重排、滚动位置会跳。
+ * 这就是「影响布局」的来源：改 padding 等于改布局。
+ *
+ * 现在改成纯视觉位移：translateY(-键盘高度)。
+ *   · 面板自身尺寸一个字节都不变 → 内部布局、滚动位置完全不受影响；
+ *   · 视觉上整块浮到键盘上方，输入框正好露出来。
+ * 这也正是「只移动、不重排」这个原则的标准做法。
+ */
+html.kb-open .cmt-sheet{
+  transform:translateY(calc(-1 * var(--kb-h)));
+  /*
+   * 位移用过渡，跟随键盘弹起的动画，避免瞬移。
+   * 用 --dur-s（0.22s）而不是默认的 --dur（0.42s）：
+   * 键盘本身的弹出动画大约 200ms 上下，慢了会显得"追不上"。
+   */
+  transition:transform var(--dur-s) var(--ease-out);
+}
+
+/*
+ * 取色器面板：底部有十六进制输入框（#pickHexInput），
+ * 点进去会弹出软键盘 —— 键盘会把它整个盖住，用户看不见自己在输入什么。
+ *
+ * 用户反馈「自定义颜色输入颜色时，软键盘弹出但菜单没有跟着上升」，
+ * 根因就是这里：上面只给 .cmt-sheet 做了避让，取色器（.pick-sheet）
+ * 一直没跟上。1.3.3 之前取色器只被状态栏歌词用（在播放页/设置页底部弹），
+ * 这次卡拉OK染色也接了它，才被更多人碰到。
+ *
+ * 处理方式与评论面板一致：底部补一块和键盘等高的 padding，并限制最大高度。
+ */
+html.kb-open #pickSheet{
+  /*
+   * 同评论面板的理由：只位移、不改尺寸。
+   * 改 padding 会让面板变高、内部控件重排，用户看到的就是「菜单跳了一下」。
+   */
+  transform:translateY(calc(-1 * var(--kb-h)));
+  transition:transform var(--dur-s) var(--ease-out);
+}
+/*
+ * 取色器的输入框本身也要保证不被键盘压到：
+ * 把它所在的最后一行加一点下边距，并用 scroll-margin 让
+ * 「浏览器自动滚动到焦点元素」时留出余量（.pick-sheet 内部可滚动）。
+ */
+html.kb-open .pick-hex{
+  margin-bottom:6px;
+  scroll-margin-bottom:calc(var(--kb-h) + 16px);
+}
+
+/*
+ * 状态栏歌词样式面板（.sb-sheet）里没有输入框，键盘不会为该面板弹出；
+ * 但它的「自定义色」按钮会打开取色器 —— 那种情况下真正需要避让的是取色器，
+ * 已经由上面的 #pickSheet 规则覆盖。
+ */
 
 /* 搜索框在页面顶部，键盘弹出时不需要额外避让 ——
    也就不能动 .page 的 padding-bottom，那会把底部留白改掉，

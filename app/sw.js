@@ -1,4 +1,4 @@
-const CACHE = 'ripple-132';
+const CACHE = 'ripple-133';
 const SHELL = [
   './', './index.html', './manifest.webmanifest',
   './css/base.css', './css/layouts.css', './css/components.css', './css/responsive.css',

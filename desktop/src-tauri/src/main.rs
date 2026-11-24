@@ -29,12 +29,40 @@ use ripple_desktop::netease;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tauri::{Manager, RunEvent, State};
+use tauri::{Emitter, Manager, RunEvent, State};
 
 /// 全局客户端。桌面端只有一份登录态，所有命令共享它。
 struct AppState {
     client: Mutex<Option<Arc<Mutex<netease::Client>>>>,
     data_dir: PathBuf,
+    /// 歌词窗口的状态（见 lyric.rs）。与 client 分开加锁，
+    /// 免得「推一句歌词」和「发一次网络请求」互相等锁。
+    lyric: Mutex<LyricState>,
+}
+
+/// 歌词窗的运行时状态。
+///
+/// 这里存的是「当前该显示成什么样」，而不是窗口对象本身 ——
+/// 窗口可能还没建、也可能被用户关掉了，而状态要一直留着，
+/// 下次建窗口时按它做首帧渲染（否则刚弹出来是空白，
+/// 要等下一句歌词上报才有内容）。
+#[derive(Default, Clone)]
+struct LyricState {
+    locked: bool,
+    text: String,
+    progress: f32,
+    color: String,
+    size: f32,
+    alpha: f32,
+    x: i32,
+    y: i32,
+    bold: bool,
+    shadow: bool,
+    fill: bool,
+    fill_hex: String,
+    /// 窗口是否已成功创建过。创建失败（无合成器 / 无 DISPLAY）时置 false，
+    /// 后续 show 直接返回失败而不是反复尝试。
+    window_ok: bool,
 }
 
 /// 惰性初始化共享 Client：首次调用时建，之后所有命令共用同一个实例。
@@ -168,6 +196,297 @@ fn safe_mode() -> bool {
     false
 }
 
+/* ================= 歌词窗（状态栏歌词的桌面端对等物） =================
+ *
+ * Android 那边是「盖在系统状态栏上的悬浮窗」（LyricOverlay.java），
+ * 桌面端没有系统状态栏，于是用一个**独立的无边框置顶小窗口**承担同一职责：
+ *
+ *   | 行为 | Android | 桌面端 |
+ *   |---|---|---|
+ *   | 载体 | TYPE_APPLICATION_OVERLAY 浮层 | 独立的 Tauri WebviewWindow |
+ *   | 置顶 | 系统级悬浮窗天然在最上 | always_on_top + skip_taskbar |
+ *   | 锁定 | FLAG_NOT_TOUCHABLE（点击穿透） | set_ignore_cursor_events(true) |
+ *   | 未锁定 | 可拖动，点一下回调网页弹面板 | data-tauri-drag-region 拖动 |
+ *   | 内容 | TextView + LinearGradient 硬边 | lyric.html + background-clip:text |
+ *   | 进度 | setProgress(0..1) | 同一个 0..1，语义一致 |
+ *
+ * 为什么承载歌词的是一个 **webview 窗口**而不是原生绘制：
+ *   卡拉OK染色在网页里只需要一条 CSS 渐变（background-clip:text），
+ *   而在原生侧要自己算字形边界、裁切、处理 DPI —— 那套东西 app/ 里
+ *   已经有了（四个表面共用同一份 CSS 变量），复用它比重新实现可靠得多。
+ *
+ * 窗口是**懒创建**的：第一次 showLyricOverlay 才建。理由是启动即建会让
+ * 每个用户都多一个窗口（哪怕从没开过状态栏歌词），而且在没有合成器的
+ * 环境里还会多一条启动失败记录。
+ */
+
+/// 歌词窗口的 label。前端 lyric.html 用同一个名字发/收事件。
+const LYRIC_WINDOW: &str = "lyric";
+/// Rust → 歌词窗口的事件名。
+const LYRIC_EVENT: &str = "lyric-state";
+
+/// 把当前状态推给歌词窗口。
+///
+/// 推的是**整份状态**而不是增量：状态字段总共十几个小值，
+/// 每次全量推反而让 lyric.html 不必维护「哪些字段这次没变」的判断，
+/// 少一类「某个字段忘了同步」的 bug。
+fn push_lyric_state(app: &tauri::AppHandle, st: &LyricState) {
+    let payload = serde_json::json!({
+        "locked": st.locked,
+        "text": st.text,
+        "progress": st.progress,
+        "color": st.color,
+        "size": st.size,
+        "alpha": st.alpha,
+        "bold": st.bold,
+        "shadow": st.shadow,
+        "fill": st.fill,
+        "fillHex": st.fill_hex,
+    });
+    // 窗口还没建 / 已被关闭时 emit 会返回错误 —— 这不是异常情况，
+    // 用户关掉歌词窗再打开就会走到这条路径，所以只忽略不报错。
+    let _ = app.emit_to(LYRIC_WINDOW, LYRIC_EVENT, payload);
+}
+
+/// 读位置文件。返回 (x, y)，没有文件或解析失败时返回 None。
+fn read_lyric_pos(dir: &std::path::Path) -> Option<(i32, i32)> {
+    let p = dir.join("lyric-pos.json");
+    let raw = std::fs::read_to_string(p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let x = v.get("x")?.as_i64()?;
+    let y = v.get("y")?.as_i64()?;
+    Some((x as i32, y as i32))
+}
+
+/// 写位置文件。失败只记日志：位置存不下来不是致命问题，
+/// 下次就回到默认位置而已，不该因此让整个命令失败。
+fn save_lyric_pos(dir: &std::path::Path, x: i32, y: i32) {
+    let p = dir.join("lyric-pos.json");
+    let body = format!("{{\"x\":{},\"y\":{}}}\n", x, y);
+    if let Err(e) = std::fs::write(&p, body) {
+        eprintln!("[lyric] 位置保存失败（{}）：{e}", p.display());
+    }
+}
+
+/// 惰性创建歌词窗口；已存在则直接返回。
+///
+/// 三个平台都能走到，但 Linux 上没有合成器时透明窗口可能创建失败 ——
+/// 那种情况下把 window_ok 置 false 并返回 Err，调用方据此让前端走降级路径
+/// （前端所有 RippleNative 调用点都有 typeof 判空，返回失败不会崩）。
+fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), String> {
+    if app.get_webview_window(LYRIC_WINDOW).is_some() {
+        return Ok(());
+    }
+    let data_dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let pos = read_lyric_pos(&data_dir);
+
+    let mut builder = tauri::WebviewWindowBuilder::new(
+        app,
+        LYRIC_WINDOW,
+        tauri::WebviewUrl::App("lyric.html".into()),
+    )
+    .title("Ripple 歌词")
+    .inner_size(360.0, 64.0)
+    .min_inner_size(120.0, 32.0)
+    .decorations(false)
+    /* 透明底：让文字直接浮在桌面上。没有合成器时会退化成黑底，
+    但文字仍然可读（lyric.html 自己也画了一层深色描边兜底）。 */
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    /* 不抢焦点：用户正在别的程序里打字时，弹一句歌词不该把光标抢走 */
+    .focused(false)
+    .resizable(false)
+    .shadow(false)
+    .visible_on_all_workspaces(true)
+    .accept_first_mouse(true);
+
+    if let Some((x, y)) = pos {
+        builder = builder.position(x as f64, y as f64);
+    }
+
+    match builder.build() {
+        Ok(win) => {
+            /* 按当前锁定状态决定是否穿透。锁定 = 鼠标事件直接穿过去，
+            盖在别的程序上也不影响用户点它下面的东西。 */
+            let _ = win.set_ignore_cursor_events(st.locked);
+            Ok(())
+        }
+        Err(e) => Err(format!("歌词窗口创建失败：{e}")),
+    }
+}
+
+/// 与 Android `HttpBridge.showLyricOverlay` 同签名（10 个参数）。
+///
+/// 参数全部按字符串收：前端那边是 `String(!!x)` / `String(n)` 这样传的，
+/// 与 Android 完全一致。这样三端桥的形状相同，前端不需要为桌面端写分支。
+///
+/// 解析容错与 Android 一致：解析失败就沿用旧值，而不是报错让调用方失败 ——
+/// 一次脏数据不该让整条歌词链路停摆。
+#[tauri::command]
+fn lyric_overlay_show(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    locked: String,
+    color: String,
+    size: String,
+    alpha: String,
+    x: String,
+    y: String,
+    bold: String,
+    shadow: String,
+    fill: String,
+    fill_hex: String,
+) -> bool {
+    let mut guard = match state.lyric.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    guard.locked = locked == "true";
+    if !color.is_empty() {
+        guard.color = color;
+    }
+    if let Ok(v) = size.trim().parse::<f32>() {
+        guard.size = v.clamp(8.0, 32.0);
+    }
+    if let Ok(v) = alpha.trim().parse::<f32>() {
+        guard.alpha = v.clamp(0.15, 1.0);
+    }
+    if let Ok(v) = x.trim().parse::<i32>() {
+        guard.x = v;
+    }
+    if let Ok(v) = y.trim().parse::<i32>() {
+        guard.y = v;
+    }
+    guard.bold = bold == "true";
+    guard.shadow = shadow == "true";
+    guard.fill = fill == "true";
+    if !fill_hex.is_empty() {
+        guard.fill_hex = fill_hex;
+    }
+
+    // 首次创建窗口。失败就如实返回 false，前端会走降级。
+    if !guard.window_ok || app.get_webview_window(LYRIC_WINDOW).is_none() {
+        guard.window_ok = ensure_lyric_window(&app, &guard).is_ok();
+        if !guard.window_ok {
+            return false;
+        }
+        // 新建的窗口还没加载完页面，此时 emit 会被丢掉 ——
+        // lyric.html 自己会在加载完成后主动 invoke 一次 lyric_overlay_sync
+        // 把首帧状态取回去，所以这里不需要额外等待。
+    }
+    // 锁定状态变化要同步到窗口的点击穿透设置
+    if let Some(win) = app.get_webview_window(LYRIC_WINDOW) {
+        let _ = win.set_ignore_cursor_events(guard.locked);
+    }
+    push_lyric_state(&app, &guard);
+    true
+}
+
+/// 更新歌词文字。与 Android `updateLyricOverlay` 同语义。
+#[tauri::command]
+fn lyric_overlay_text(app: tauri::AppHandle, state: State<'_, AppState>, text: String) {
+    let mut guard = match state.lyric.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let v = text.trim().to_string();
+    if guard.text == v {
+        return; // 同一句不重复推送（与 Android setText 的去重同义）
+    }
+    guard.text = v;
+    /*
+     * 换句时进度归零。
+     *
+     * 与 Android LyricOverlay.setText 里那段是同一个理由：
+     * 前端先推新文字、再推新进度，两次跨桥之间必然隔一帧。
+     * 不清的话新歌词会顶着上一句的 0.99 先渲染一次 —— 一次很明显的闪烁，
+     * 而且正好出现在最该顺滑的换句时刻。
+     */
+    guard.progress = 0.0;
+    push_lyric_state(&app, &guard);
+}
+
+/// 更新「当前这一句」的进度 0..1。
+///
+/// ⚠️ 语义是**句内**进度，不是整首进度 —— 与 1.3.3 改过的前端一致。
+/// 桌面端这里不做任何「除以时长」的换算，直接当 --p 用。
+#[tauri::command]
+fn lyric_overlay_progress(app: tauri::AppHandle, state: State<'_, AppState>, progress: String) {
+    let mut guard = match state.lyric.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let v = match progress.trim().parse::<f32>() {
+        Ok(v) if v.is_finite() => v.clamp(0.0, 1.0),
+        _ => return,
+    };
+    if (v - guard.progress).abs() < 0.004 {
+        return; // 0.4% 以内不推（与 Android setProgress 的阈值一致）
+    }
+    guard.progress = v;
+    push_lyric_state(&app, &guard);
+}
+
+/// 隐藏（销毁）歌词窗口。与 Android `hideLyricOverlay` 同语义。
+///
+/// 销毁而不是 hide：与 Android 那头 `wm.removeView` 一致，
+/// 也更省资源 —— 用户关掉状态栏歌词后不该还挂着一个看不见的 webview。
+#[tauri::command]
+fn lyric_overlay_hide(app: tauri::AppHandle, state: State<'_, AppState>) {
+    if let Some(win) = app.get_webview_window(LYRIC_WINDOW) {
+        let _ = win.close();
+    }
+    if let Ok(mut g) = state.lyric.lock() {
+        g.window_ok = false;
+        g.text.clear();
+        g.progress = 0.0;
+    }
+}
+
+/// 歌词窗加载完成后主动拉一次当前状态（解决「首帧空白」）。
+///
+/// 为什么需要它：窗口创建和页面加载是异步的，Rust 那边 push 首帧时
+/// webview 可能还没跑起来，事件就被丢了。让页面自己来要一次最稳妥。
+#[tauri::command]
+fn lyric_overlay_sync(state: State<'_, AppState>) -> serde_json::Value {
+    let guard = match state.lyric.lock() {
+        Ok(g) => g,
+        Err(_) => return serde_json::json!({}),
+    };
+    let v = serde_json::json!({
+        "locked": guard.locked,
+        "text": guard.text,
+        "progress": guard.progress,
+        "color": guard.color,
+        "size": guard.size,
+        "alpha": guard.alpha,
+        "bold": guard.bold,
+        "shadow": guard.shadow,
+        "fill": guard.fill,
+        "fillHex": guard.fill_hex,
+    });
+    drop(guard);
+    v
+}
+
+/// 歌词窗拖动结束后回报新位置并落盘。
+#[tauri::command]
+fn lyric_save_pos(app: tauri::AppHandle, state: State<'_, AppState>, x: i32, y: i32) {
+    if let Ok(mut g) = state.lyric.lock() {
+        g.x = x;
+        g.y = y;
+    }
+    let dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    save_lyric_pos(&dir, x, y);
+}
+
 /// 单实例守卫（审查 D-07）。
 ///
 /// 为什么不用 `tauri-plugin-single-instance`：本机（aarch64 proot）的 cargo
@@ -253,6 +572,7 @@ fn main() {
             app.manage(AppState {
                 client: Mutex::new(None),
                 data_dir,
+                lyric: Mutex::new(LyricState::default()),
             });
             Ok(())
         })
@@ -261,7 +581,14 @@ fn main() {
             notify,
             can_draw_overlay,
             request_overlay_permission,
-            safe_mode
+            safe_mode,
+            /* 歌词窗（状态栏歌词的桌面端对等物），见上方注释 */
+            lyric_overlay_show,
+            lyric_overlay_text,
+            lyric_overlay_progress,
+            lyric_overlay_hide,
+            lyric_overlay_sync,
+            lyric_save_pos
         ])
         .build(tauri::generate_context!())
         .expect("Tauri 启动失败")

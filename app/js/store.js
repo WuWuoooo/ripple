@@ -29,7 +29,7 @@
     showLyric: true,
     /*
      * 软件内通知：控制顶部弹出的 toast（不是系统通知栏）。
-     * 默认**开启** —— 主人 2026-11-22 指定要默认打开。
+     * 默认**开启** —— 2026-11-22 按用户要求设为默认打开。
      * （原注释说「顶部通知会盖住内容，默认关闭」，但实际用下来
      * 切歌/收藏/网络失败这些即时反馈没有提示反而不确定操作有没有生效。）
      * 注：底部的操作确认（如"再按一次退出"）不受这个开关影响。
@@ -60,8 +60,66 @@
     sbY: -1,
     sbBold: true,
     sbShadow: true,
-    sbFill: false,            // 跟随播放进度填充
-    sbFillColor: '#7DE3D0',   // 填充色
+    sbFill: true,             // 跟随播放进度填充（1.3.3 起默认开：卡拉OK染色是本版主功能）
+    /*
+     * 填充色默认用**强调紫**而不是原来的浅青 #7DE3D0。
+     *
+     * 原因：文字默认色是纯白 #FFFFFF，而浅青和白色都是高明度色，
+     * 在深色状态栏上「已唱/未唱」两部分亮度几乎一样 ——
+     * 用户反馈「打开填充就只是边缘发亮，没有填充效果」，根子就在这。
+     * 换成和白色有明显色相差的紫，且明度低于白色，填充边界一眼可见。
+     * （这两个值都取自主题的 --accent，和整体观感同族。）
+     */
+    sbFillColor: '#b3a2ff',   // 填充色：已播放部分的颜色
+    /*
+     * 状态栏歌词的两个「深色模式自动反色」开关。
+     *
+     * ⚠️ 默认**关闭**（与 karaokeInvert 的默认值不同，这是有意的）。
+     *
+     * 曾经一度默认开，结果是一个严重的回归：状态栏浮层盖在**系统状态栏**
+     * 上，背景是用户的壁纸，**跟 App 的深/浅色主题毫无关系**。
+     * 而用户的壁纸九成是深色 —— 默认反色就把白字变成纯黑
+     *（实测日志 `overlay apply color=#000000`），暗橄榄色填充，
+     * 在深色背景上完全看不见，用户报的「填充只有边缘发亮/完全没有填充」
+     * 就是这个原因。
+     *
+     * 所以这里保持关闭：浮层颜色该由用户对着自己的壁纸调，
+     * 不该被 App 主题的深浅联动。想要联动的用户可以自己打开。
+     */
+    sbInvert: false,
+    sbFillInvert: false,
+    /* ---------- 卡拉OK逐句染色（三端通用，与上面的状态栏浮层无关） ----------
+     * 和 sbFill 的区别：
+     *   sbFill     只管「状态栏浮层那一条」的文字填充，只在 APK 有意义；
+     *   karaokeLyric 管四个歌词表面：状态栏浮层、展开的整篇、收起的三行、
+     *               桌面端的独立歌词窗。桌面端和浏览器里只有它能生效。
+     * 默认开 —— 它本来就是「歌词跟着播放进度染色」这个需求的正面实现，
+     * 而不是可选装饰；给开关只是为了照顾「不喜欢花哨效果」的用户和省电模式。
+     */
+    karaokeLyric: true,
+    karaokeDone: true,        // 已唱完的行是否做静态标记（关掉只留当前句染色）
+    /*
+     * 染色的「已播放」色。空串 = 用主题默认色（深色 #b3a2ff / 浅色 #5833ff）。
+     *
+     * 为什么默认空串而不是写死一个十六进制：
+     *   主题有两套，同一个颜色在两套背景上的可读性完全不同
+     *   （实测 #b3a2ff 在浅色底只有 1.91:1，必须压暗成 #5833ff 才有 5.45:1）。
+     *   写死就必然有一套主题是错的。空串让 CSS 的 --karaoke-played 接管，
+     *   用户主动选了颜色才覆盖。
+     */
+    karaokeColor: '',
+    /*
+     * 「跟随主题反色」：开启时，用户选的染色色在深浅两个主题下**互为反色**。
+     *
+     * 为什么需要：用户选了一个颜色（比如浅色主题下的黑 #000000），
+     * 切到深色主题后，同一个黑色在深底上完全看不见。
+     * 开着这个开关，深色主题会自动用它的反色（#FFFFFF），
+     * 一个颜色选择就能在两套主题下都可用。
+     * 默认**开**（用户要求）—— 大多数人只在一种主题下挑颜色，
+     * 切到另一套主题后颜色失效是很常见的困惑，反色能自动兜住。
+     * 不喜欢的人可以在取色器里关掉（关掉后两套主题都用同一个颜色）。
+     */
+    karaokeInvert: true,
 
     sleepMin: 0,          // 睡眠定时（分钟）；以前 DEFAULTS 里根本没有这一项
     sleepUntil: 0,        // 睡眠定时的绝对结束时刻，重启后据此恢复
@@ -143,7 +201,134 @@
     eq: { jazz: 'off', classical: 'off' },
   };
 
-  function coerceSettings(saved) {
+  /*
+   * 设置结构版本。
+   *
+   * 用途：DEFAULTS 里某一项的默认值改了之后，**老用户不会自动获得新默认值** ——
+   * 他们的 localStorage 里存着旧值，coerceSettings 只是把旧值原样读回来。
+   * 这对「新增功能」类改动是致命的：1.3.3 把 sbFill（状态栏歌词跟随进度填充）
+   * 的默认值从 false 改成 true，结果只有全新安装的用户看得到填充动画，
+   * 而所有老用户升级后**依然没有** —— 用户反馈的「状态栏歌词没有播放填充动画」
+   * 正是这个原因，不是代码没生效。
+   *
+   * 这里记一个版本号，加载时若低于当前版本就执行一次「补默认值」迁移，
+   * 然后写回新版本号，保证只迁一次、且用户之后手动关掉也不会被重置。
+   */
+  const SCHEMA_VERSION = 5;
+
+  function migrateSettings(out, saved, fromVersion) {
+    /*
+     * v1 → v2（1.3.3）：把 sbFill 补成 true。
+     *
+     * 只在「用户从没碰过这个开关」时迁移才有意义，但我们无法区分
+     * 「没碰过」和「主动关掉了」—— 所以用保守策略：只在版本升级的这一次
+     * 把它打开，之后用户关了就不会再被改回来（版本号已经记成 2 了）。
+     * 优先照顾「升级后能看到新功能」，代价是极少数主动关过它的人要再关一次。
+     */
+    if (fromVersion < 2) {
+      if (saved.sbFill === false || saved.sbFill === undefined) {
+        out.sbFill = true;
+      }
+    }
+    /*
+     * v2 → v3（1.3.3 第二轮）：把状态栏填充色从旧的浅青 #7DE3D0
+     * 升级成和文字有明确色差的 #b3a2ff。
+     *
+     * 为什么要迁移而不是只改默认值：老用户的 localStorage 里存着
+     * #7DE3D0。而这个颜色和默认白色文字都属高明度，
+     * 在深色状态栏上「已唱/未唱」几乎看不出区别 ——
+     * 这正是用户反馈「打开跟随进度填充只是边缘发亮」的根因。
+     * 只改 DEFAULTS 对他们无效（同一个坑 1.3.3 已经踩过一次了）。
+     *
+     * 只改「恰好等于旧默认值」的情况：用户自己调过的颜色要尊重，
+     * 不能因为升级就把人家的选择冲掉。
+     */
+    if (fromVersion < 3) {
+      const c = String(out.sbFillColor || '').toUpperCase();
+      if (!c || c === '#7DE3D0') {
+        out.sbFillColor = DEFAULTS.sbFillColor;
+      }
+    }
+    /*
+     * v3 → v4（1.3.3 第三轮）：把状态栏浮层的反色开关关掉。
+     *
+     * 这两个字段是 v3 才加的、且当时默认值写成了 true —— 那是一次严重回归：
+     * 浮层盖在系统状态栏上，背景是用户壁纸（九成深色），
+     * 默认反色会把白字变成纯黑、把紫色填充变成暗橄榄色，
+     * 在深色壁纸上完全看不见。用户报的「状态栏歌词没有填充」就是它。
+     *
+     * v3 的用户（包括刚装上试的那些）localStorage 里已经存了 true，
+     * 只改 DEFAULTS 对他们无效 —— 所以必须有这条迁移。（同一个坑已踩过三次了。）
+     *
+     * 只改「确实是 v3 遗留下来的 true」；v4 起用户可以自己再打开。
+     */
+    if (fromVersion < 4) {
+      out.sbInvert = false;
+      out.sbFillInvert = false;
+      /*
+       * 还有一个连带污染：反色开着的时候，用户可能在设置面板里
+       * 「看到」了黑色/暗橄榄色，然后**把它当成自己的选择存了下来**。
+       * 这时 sbColor 已经是 #000000，光把开关关掉还是黑的。
+       * 所以只在「颜色恰好是从白/紫反色而来的那两个值」时还原，
+       * 用户真正手选的其他颜色不动。
+       */
+      const sc = String(out.sbColor || '').toUpperCase();
+      const sf = String(out.sbFillColor || '').toUpperCase();
+      if (!sc || sc === '#000000') {
+        // #000000 只可能是 #FFFFFF 被反色后的结果（深色壁纸上没人会主动选纯黑文字）
+        out.sbColor = DEFAULTS.sbColor;
+      }
+      /*
+       * 填充色要还原两种值：
+       *   #4C5D00 —— #b3a2ff 被反色后的结果（v3 迁移已知）
+       *   #000000 —— 见 v4 → v5 迁移（那条专门处理，因为 v4 用户不会再跑到这里）
+       */
+      if (sf === '#4C5D00' || sf === '#000000') {
+        out.sbFillColor = DEFAULTS.sbFillColor;
+      }
+    }
+    /*
+     * v4 → v5（1.3.3 第四轮）：把被存成纯黑的**填充色**还原。
+     *
+     * 为什么必须单独加一条，不能并进上面的 v3→v4：
+     *   用户装上一版（schema=4）时已经跑过 v3→v4 了，存档里现在是 4。
+     *   只要不动 SCHEMA_VERSION，`fromVersion < 4` 永远为 false ——
+     *   **改迁移逻辑对老用户完全无效**。这个坑在 1.3.3 里已经是第四次了
+     *   （改 DEFAULTS / 改迁移 / 改 coerce 各有一次栽在这上面）。
+     *
+     * 病因（2026-11-24 真机日志）：
+     *   `timing diag: … color=#FFFBFB fillColor=#000000`
+     *   文字是白的、填充是纯黑 —— 在深色壁纸上「已唱」和「未唱」
+     *   亮度完全一样，用户看到的还是「没有填充」。
+     *
+     * 纯黑的来源有两个，都发生在上一版：
+     *   ① 反色开关开着时 sbFillColor 被算成 #4C5D00，用户对着那个面板
+     *      在取色器里确认了一次，落盘成反色后的值；
+     *   ② HSV 取色器的明度滑块误触到最上边缘（V=0），直接存下 #000000。
+     *
+     * 只认「恰好是纯黑」这一种：正常人给状态栏填充调色不会主动选纯黑
+     *（那等于让填充完全不可见），所以可以放心还原。
+     * 用户真正手选的其他颜色一律不动。
+     */
+    if (fromVersion < 5) {
+      const sf5 = String(out.sbFillColor || '').toUpperCase();
+      if (sf5 === '#000000' || !sf5) {
+        out.sbFillColor = DEFAULTS.sbFillColor;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * @param {object} saved 存档里的 settings 对象
+   * @param {object} [root] 整个存档（用来读 schema 这类**不属于 settings** 的元数据）
+   *
+   * 为什么要把 root 单独传进来：schema 写在存档最外层（{schema, settings, ...}），
+   * 而这里拿到的是 saved.settings —— 第一版写成 `saved.schema`，
+   * 永远读到 undefined，于是 fromVersion 恒为 1，迁移**每次启动都跑一遍**，
+   * 用户手动关掉的 sbFill 一重启又被打开。这个 bug 被 store-migrate.test.js 抓到。
+   */
+  function coerceSettings(saved, root) {
     const out = Object.assign({}, DEFAULTS);
     if (!saved || typeof saved !== 'object') return out;
     Object.keys(DEFAULTS).forEach((k) => {
@@ -202,7 +387,8 @@
         out[k] = r ? Math.max(r[0], Math.min(r[1], n)) : n;
       }
     });
-    return out;
+    const fromVersion = Number(root && root.schema) || 1;
+    return migrateSettings(out, saved, fromVersion);
   }
 
   const Store = {
@@ -225,7 +411,7 @@
        */
       const arr = (v) => (Array.isArray(v) ? v : []);
       this.state = {
-        settings: coerceSettings(saved.settings),
+        settings: coerceSettings(saved.settings, saved),
         liked: arr(saved.liked).filter((x) => typeof x === 'string'),
         history: arr(saved.history).filter((x) => x && x.id),
         playedSec: Number(saved.playedSec) > 0 ? Number(saved.playedSec) : 0,
@@ -256,6 +442,12 @@
     save() {
       const s = this.state;
       const payload = () => JSON.stringify({
+        /*
+         * schema 必须写进去：它是「DEFAULTS 改过默认值」这类迁移只跑一次的凭据。
+         * 不写的话每次启动都 fromVersion=1 → 每次都把 sbFill 强制改回 true，
+         * 用户手动关掉状态栏歌词填充后一重启又自己开了，而且永远关不掉。
+         */
+        schema: SCHEMA_VERSION,
         settings: s.settings, liked: s.liked, history: s.history.slice(0, 200),
         playedSec: s.playedSec, imports: s.imports, onlineCache: (s.onlineCache || []).slice(0, 60),
       });
@@ -267,6 +459,7 @@
         /* 第一次失败：先瘦身重试，多数情况这样就能救回来 */
         try {
           const slim = JSON.stringify({
+            schema: SCHEMA_VERSION,
             settings: s.settings, liked: s.liked, history: s.history.slice(0, 100),
             playedSec: s.playedSec, imports: s.imports, onlineCache: (s.onlineCache || []).slice(0, 30),
           });

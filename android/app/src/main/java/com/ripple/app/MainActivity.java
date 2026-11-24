@@ -198,17 +198,36 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 安全区推给网页（0dp 时网页用自己的 fallback） */
+    /**
+     * 安全区推给网页（0dp 时网页用自己的 fallback）。
+     *
+     * ⚠️ 键盘弹出时必须把 --safe-b 归零，否则会和 --kb-h 叠加成「顶两次」。
+     *
+     * 为什么：Android 11+ 的 navigationBars() insets 在键盘弹出时**仍然包含
+     * 导航栏高度**（导航栏并未消失，只是被键盘盖住）。而界面上键盘是从屏幕
+     * 最底部升起的，已经把那块导航栏区域一起盖掉了。如果这时既给
+     * --safe-b（面板按导航栏高度上移）又给 --kb-h（再按键盘高度上移），
+     * 面板就会被顶起来两次 —— 用户看到的是「一打开键盘评论 UI 突然降低」。
+     *
+     * 实测症状（Review 反馈）：打开评论输入框 → 键盘弹出 → 底部发布框先跳一下；
+     * 键盘收起时又跳回来。根因就是这两个量同时非零。
+     *
+     * 现在：有键盘时 --safe-b 归零（键盘已经盖住那块区域了），
+     * 只让 --kb-h 生效；没有键盘时两者都正常。
+     */
     private void pushInsets(int top, int bottom, int left, int right, int ime) {
         if (web == null) return;
         float d = getResources().getDisplayMetrics().density;
+        // 键盘真的弹出来了（与 toggled 的 .kb-open 判据一致：> 60dp）
+        final boolean kb = ime / d > 60;
+        final int safeBottom = kb ? 0 : bottom;
         String code = "(function(){try{var r=document.documentElement.style;"
                 + "r.setProperty('--safe-t','" + (top / d) + "px');"
-                + "r.setProperty('--safe-b','" + (bottom / d) + "px');"
+                + "r.setProperty('--safe-b','" + (safeBottom / d) + "px');"
                 + "r.setProperty('--safe-l','" + (left / d) + "px');"
                 + "r.setProperty('--safe-r','" + (right / d) + "px');"
                 + "r.setProperty('--kb-h','" + (ime / d) + "px');"
-                + "document.documentElement.classList.toggle('kb-open', " + (ime / d > 60) + ");"
+                + "document.documentElement.classList.toggle('kb-open', " + kb + ");"
                 + "document.documentElement.classList.add('native');}catch(e){}})();";
         runOnUiThread(() -> {
             try {
@@ -945,9 +964,20 @@ public class MainActivity extends Activity {
         o.show();
     }
 
-    /** 进度 0..1，用于状态栏歌词的填充效果 */
+    /** 进度 0..1，用于状态栏歌词的填充效果（兼容旧路径，不主动外推） */
     void setLyricProgress(String p) {
         if (lyricOverlay != null) lyricOverlay.setProgress(p);
+    }
+
+    /**
+     * 设置进度基准点，让原生侧自己按时间外推（1.3.3 第三轮）。
+     *
+     * 见 LyricOverlay.setTiming 的注释：网页在后台时几乎推不动进度，
+     * 必须由原生在这个场景下自己驱动，否则状态栏歌词就是「一句只染一次」。
+     */
+    void setLyricTiming(String progress, String lineDur, String rate, String playing) {
+        LyricOverlay o = overlay();
+        o.setTiming(progress, lineDur, rate, playing);
     }
 
     void updateLyricOverlay(String text) {
@@ -1279,6 +1309,21 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         isForeground = false;
+        /*
+         * 通知状态栏歌词浮层「App 已切到后台」。
+         *
+         * 它必须知道这件事，因为驱动方式要换：
+         *   · 前台 → Choreographer（对齐 vsync，最顺）
+         *   · 后台 → Handler.postDelayed（不受 vsync 影响，照样跑）
+         * Choreographer 靠 vsync 驱动，而后台进程收不到 vsync，
+         * 不切的话外推会彻底停摆 —— 用户看到的就是
+         * 「只有换句那一下才填充」。
+         */
+        try {
+            LyricOverlay o = LyricOverlay.peek();
+            if (o != null) o.setAppBackground(true);
+        } catch (Throwable ignored) {
+        }
         try {
             if (web != null) {
                 /*
@@ -1306,6 +1351,12 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         isForeground = true;
+        /* 回到前台：切回 Choreographer 驱动（见 onPause 里的说明） */
+        try {
+            LyricOverlay o = LyricOverlay.peek();
+            if (o != null) o.setAppBackground(false);
+        } catch (Throwable ignored) {
+        }
         try {
             if (web != null) {
                 web.resumeTimers();

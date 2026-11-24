@@ -162,7 +162,39 @@ body.compact .qitem{padding-top:3px;padding-bottom:3px}
 @keyframes skSweep{to{transform:translateX(100%)}}
 
 /* ---------- 评论输入条 ---------- */
-.cmt-sheet{display:flex;flex-direction:column}
+/*
+ * ============================================================
+ * 评论面板：高度必须**固定**，不能由内容撑出来
+ * ============================================================
+ *
+ * 用户反馈两个现象：
+ *   ① 「打开软键盘还是会影响评论布局」
+ *   ② 「骨架加载到完整评论仍会改变布局」
+ *
+ * 两者是同一个根因：.np-sheet 定位是 `max-height:72%` —— 注��� `max-`，
+ * 意味着面板实际高度 = 内容高度（封顶 72%）。于是：
+ *   · 骨架屏铺 6 条、真实评论是「热门 + 若干条」，高度必然不同 → 换内容时顶边跳；
+ *   · 键盘弹出时 .cmt-body 的可滚动空间变了、内容重排 → 高度又变一次。
+ * 而面板是贴底弹上来的，高度一变，**顶边就上下跳**，用户看到的就是「布局被影响」。
+ *
+ * 上一版只加 min-height 没用对地方：min-height 只是给一个下限，
+ * 内容更多时高度照样会长；而且它加在 flex-column 的面板本身上，
+ * 会和 max-height 打架。
+ *
+ * 正确做法：给面板一个**确定的 height**。高度定死之后，
+ * 无论里面是 6 条骨架、30 条评论、还是键盘顶起来，顶边的位置都不动 ——
+ * 内容多了换成 body 内部滚动（那本来就是这个面板该有的行为）。
+ *
+ * 72vh 而不是 78%：百分比是相对**视口**算的，用 vh 表达同一件事但更直观；
+ * 留 28vh 给顶部的播放页与状态栏，面板不会把整屏吃满。
+ * max() 兜一个底线，避免极矮的窗口（横屏小窗）里面板矮到只剩标题栏。
+ */
+.cmt-sheet{
+  display:flex;flex-direction:column;
+  height:max(320px, 72vh);
+  /* max-height 仍保留：极矮视口（横屏分屏）时 height 会被它压住，不至于溢出 */
+  max-height:84vh;
+}
 .cmt-sheet .cmt-body{flex:1;min-height:0}
 .cmt-send{display:flex;gap:8px;align-items:center;flex:none;padding:9px 14px 11px;
   border-top:1px solid var(--line)}

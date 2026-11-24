@@ -18,7 +18,7 @@ import java.util.zip.GZIPInputStream;
 /**
  * 真正的网易云客户端（Java 侧）。
  *
- * 和 Enji 走同一套协议：weapi 加密 POST + 登录 cookie 复用。
+ * weapi 加密 POST + 登录 cookie 复用。
  * 网页侧只发「命令 + 参数」，加密、Cookie、UA、防盗链全部在这里做，
  * 所以网页不需要任何代理服务，也不需要跨域权限。
  *

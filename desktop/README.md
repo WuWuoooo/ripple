@@ -2,7 +2,7 @@
 
 **简体中文** | [English](./README_en.md)
 
-Ripple 的桌面客户端。**复用 `app/` 那 13000 行前端，一行不改**，
+Ripple 的桌面客户端。**复用 `app/` 那 8200 行前端，一行不改**，
 只补一个 Rust 侧的原生桥和网易云客户端。
 
 > **当前状态：已随 1.3.0 正式发布**
@@ -51,7 +51,7 @@ cd desktop/src-tauri && cargo tauri dev
 ```
 app/js/netease.js
       ↓  window.RippleNative.netease(cmd, json, cbId)
-desktop/bridge.js          ← 这 86 行就是全部适配成本
+desktop/bridge.js          ← 这 377 行就是全部适配成本
       ↓  __TAURI__.core.invoke('netease', {...})
 desktop/src-tauri/src/main.rs
       ↓
@@ -80,7 +80,11 @@ N.netease(cmd, paramsJson, cbId)   // 立刻返回
 | `RippleNative.netease(cmd,json,id)` | Java weapi | ✅ Rust weapi |
 | `RippleNative.notify(title,body)` | 通知栏 | ❌ 恒 false（走降级） |
 | `RippleNative.mediaState(json)` | MediaSession | ❌ 恒 false |
-| `RippleNative.canDrawOverlay()` | 悬浮窗权限 | ❌ 恒 false |
+| `RippleNative.canDrawOverlay()` | 悬浮窗权限 | ✅ 恒 true（建置顶窗无需授权） |
+| `RippleNative.showLyricOverlay(...)` | 状态栏悬浮窗 | ✅ 独立置顶小窗（见下） |
+| `RippleNative.updateLyricOverlay` | 换一句词 | ✅ |
+| `RippleNative.setLyricProgress` | 句内进度 0..1 | ✅ |
+| `RippleNative.hideLyricOverlay` | 隐藏浮层 | ✅ |
 | `RippleNative.login(mode,id)` | 内嵌登录页 | 不需要（登录走扫码，见下） |
 
 前端所有原生调用点都写成 `if (window.RippleNative && typeof N.xxx === 'function')`，
@@ -94,16 +98,40 @@ N.netease(cmd, paramsJson, cbId)   // 立刻返回
 ### ✅ 完整可用
 
 播放引擎（三个 `<audio>` 架构）、均衡器（WebAudio）、歌词（含翻译）、
-歌单、每日推荐、心动模式、无限漫游、评论、搜索、本地导入、
-液态玻璃观感、深色浅色双主题、封面取色、多尺寸响应式布局
+**卡拉OK逐句染色**、**独立置顶歌词小窗**、歌单、每日推荐、心动模式、无限漫游、
+评论、搜索、本地导入、液态玻璃观感、深色浅色双主题、封面取色、多尺寸响应式布局
 
 ### ⚠️ 形态不同
 
 | 功能 | Android | 桌面端 |
 |---|---|---|
 | 媒体控制 | 通知栏 + MediaSession + 耳机键 | 无（待做系统托盘 / SMTC / MPRIS） |
-| 歌词浮层 | 状态栏悬浮窗 | 无（待做置顶小窗） |
+| 歌词浮层 | 盖在系统状态栏上的悬浮窗 | **独立无边框置顶小窗**（1.3.3 起） |
 | edge-to-edge | 状态栏透明 | 无此概念 |
+
+### 歌词浮层：桌面端是怎么做的
+
+Android 没有公开的「往状态栏里写东西」接口，所谓状态栏歌词都是用系统级
+悬浮窗盖在状态栏区域上，所以要「显示在其他应用上层」权限。桌面端没有
+系统状态栏这个概念，因此换成一个**独立的无边框置顶小窗口**
+（`desktop/lyric.html` + `main.rs` 里的 `lyric_overlay_*` 系列命令）：
+
+| 行为 | Android | 桌面端 |
+|---|---|---|
+| 载体 | `TYPE_APPLICATION_OVERLAY` 浮层 | 独立 `WebviewWindow`（懒创建） |
+| 置顶 | 系统级悬浮窗天然在最上 | `always_on_top` + `skip_taskbar` |
+| 锁定 | `FLAG_NOT_TOUCHABLE`（点击穿透） | `set_ignore_cursor_events(true)` |
+| 未锁定 | 可拖动，点一下回调网页弹面板 | `data-tauri-drag-region` 拖动 |
+| 位置持久化 | `settings.sbX / sbY` | 配置目录下 `lyric-pos.json` |
+| 进度 | `setProgress(0..1)` | 同一个 0..1，**语义是「当前这一句」** |
+
+六个桥方法与 Java 侧**同名同签名**，所以 `app/` 前端一行都不用改 ——
+它仍然以为自己在跟 Android 说话。
+
+> **已知限制**：Linux 下透明窗口依赖桌面合成器。没有合成器时会退化成
+> 不透明背景（文字仍可读），窗口创建失败时 `showLyricOverlay` 返回 `false`，
+> 前端会保持开关打开并在下次启动再试 —— 而不是把开关强制关掉
+> （那样用户会以为功能消失了）。
 
 ### ❌ 未实现
 
@@ -161,7 +189,7 @@ Apple Developer（$99/年）+ 公证流程。本项目是个人项目，这笔�
 
 ### 3. 命令参数口径必须与另两端逐字一致
 
-三端（Java / Node / Rust）各实现一份 20 个命令，任何一端参数漂了就表现为
+三端（Java / Node / Rust）各实现 22 条命令（前端实际调用 20 个），任何一端参数漂了就表现为
 「APK 能播、桌面端播不了」这类难查的差异。几个容易写错的：
 
 | 命令 | 容易写错 | 正确 |

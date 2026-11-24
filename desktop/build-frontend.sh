@@ -30,6 +30,18 @@ rm -f "$DIST/sw.js"
 # 2. 把适配层复制进去
 cp "$HERE/bridge.js" "$DIST/bridge.js"
 
+# 2b. 歌词窗页面。
+#     它不在 app/ 里（app/ 是三端共享的前端，那边只有播放页内的歌词），
+#     而是桌面端独有的一层「独立小窗口」页面，所以上面那行 cp -r 不会带上它。
+#     忘了这一行的话，构建出的包能通过编译、但运行到第一次显示歌词时
+#     会去加载一个不存在的 lyric.html —— 表现为歌词窗一片空白，
+#     而控制台里什么错都没有（Tauri 对 App 协议的 404 处理是静默的）。
+if [ ! -f "$HERE/lyric.html" ]; then
+  echo "[desktop] ❌ 找不到 desktop/lyric.html（歌词窗页面）" >&2
+  exit 1
+fi
+cp "$HERE/lyric.html" "$DIST/lyric.html"
+
 # 3. 在 index.html 里注入 <script src="bridge.js">
 #    位置：所有业务脚本之前（version.js 之后，因为 version.js 只是常量）
 #    用 python 而不是 sed：要处理「找不到锚点就报错」这件事，
