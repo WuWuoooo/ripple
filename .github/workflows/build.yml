@@ -365,6 +365,14 @@ jobs:
         id: notes
         run: |
           VN="${{ steps.meta.outputs.version }}"
+          # versionCode 也要在这里重新取一次。
+          # ⚠️ 上一版这里只声明了 VN，而下面「埋 versionCode 标记」那段用的是 $VC ——
+          # 那个 VC 是**上一个 step**（meta）里的局部变量，跨 step 根本不存在，
+          # 于是渲染出来是 `<!-- ripple-version-code:  -->`，数字整个是空的。
+          # 而 App 内「检查更新」正是靠这行判新旧 → 它永远解析失败，
+          # 只能退化成版本名比较（1.3.10 vs 1.3.9 就会判错）。
+          # 这次 1.3.5 的 Release 就是带着一个空标记发出去的，已确认是空的。
+          VC="${{ steps.meta.outputs.code }}"
           OUT=/tmp/notes.md
           ZH=/tmp/notes_zh.md
           EN=/tmp/notes_en.md
@@ -456,6 +464,14 @@ jobs:
             # 而 App 内「检查更新」必须按整数比版本 ——
             # 按版本名字符串比会在 1.3.10 vs 1.3.9 上判错。
             # 埋一行 HTML 注释给它解析；找不到时 App 端退化成版本名比较。
+            # 防呆：VC 为空就直接让这一步失败。
+            # 上一版就是因为它为空而**静默**发了一个解析不出新旧版本的 Release，
+            # 直到发布后人工核对才发现 —— 这类「产物看起来正常、但一行关键元数据是空的」
+            # 必须由 CI 自己拦住，而不是靠人记得去查。
+            if [ -z "$VC" ]; then
+              echo "::error::versionCode 为空 —— Release 正文会写成空的 version-code 标记，App 内检查更新将永远解析失败。请检查 steps.meta.outputs.code 是否已传出。"
+              exit 1
+            fi
             echo "<!-- ripple-version-code: $VC -->"
           } > "$OUT"
 
