@@ -1,4 +1,4 @@
-# Ripple 涟漪
+<h1 align="center">Ripple 涟漪</h1>
 
 <p align="center">
   <b>一个会呼吸的音乐播放器</b><br>

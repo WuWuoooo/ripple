@@ -1,4 +1,4 @@
-# Ripple
+<h1 align="center">Ripple</h1>
 
 <p align="center">
   <b>A music player that breathes</b><br>

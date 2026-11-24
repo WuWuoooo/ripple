@@ -1,6 +1,8 @@
-# Ripple Desktop (Tauri)
+<h1 align="center">Ripple Desktop (Tauri)</h1>
 
-[简体中文](./README.md) | **English**
+<p align="center">
+  <a href="./README.md">简体中文</a> | <b>English</b>
+</p>
 
 The desktop client for Ripple. It **reuses the entire 8200-line `app/` frontend
 without changing a single line**, adding only a native bridge and a NetEase client

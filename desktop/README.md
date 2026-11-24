@@ -1,6 +1,8 @@
-# Ripple 桌面端（Tauri）
+<h1 align="center">Ripple 桌面端（Tauri）</h1>
 
-**简体中文** | [English](./README_en.md)
+<p align="center">
+  <b>简体中文</b> | <a href="./README_en.md">English</a>
+</p>
 
 Ripple 的桌面客户端。**复用 `app/` 那 8200 行前端，一行不改**，
 只补一个 Rust 侧的原生桥和网易云客户端。
