@@ -95,9 +95,19 @@
     isLow: function () { return document.documentElement.classList.contains('perf-low'); },
     /* 为什么被判成低配 —— 设置页可以直接显示出来，用户不用猜 */
     why: function () {
-      if (mode() === 'low') return '手动选择省电';
-      if (mode() === 'high') return '手动选择高画质';
-      if (autoLow()) return '实测帧率偏低（自动）';
+      /*
+       * 多语言（1.3.5）：这里的文案是**拼接**出来的（数值夹在句子中间），
+       * 英文语序和中文完全不同 —— 「屏幕物理像素 259 万，超过 450 万」
+       * 直译成「screen pixels 259 万 over 450 万」是读不通的。
+       * 所以不走片段替换，直接按语言各写一条完整句式。
+       *
+       * 数值单位也要换：中文用「万」，英文没有这个量级词，
+       * 用 K px（千像素）表达同一个数量级更自然。
+       */
+      var en = !!(g.I18n && g.I18n.lang === 'en');
+      if (mode() === 'low') return en ? 'Manually set to power saving' : '手动选择省电';
+      if (mode() === 'high') return en ? 'Manually set to high quality' : '手动选择高画质';
+      if (autoLow()) return en ? 'Measured frame rate is low (auto)' : '实测帧率偏低（自动）';
       if (guessLow()) {
         try {
           var dpr = g.devicePixelRatio || 1;
@@ -106,13 +116,17 @@
           var phys = Math.round(w * h * dpr * dpr / 10000) / 100;
           var cores = g.navigator && g.navigator.hardwareConcurrency;
           var mem = g.navigator && g.navigator.deviceMemory;
-          if (phys > PHYS_LOW / 10000) return '屏幕物理像素 ' + phys + ' 万，超过 ' + (PHYS_LOW / 10000) + ' 万';
-          if (cores && cores <= 4) return 'CPU 核心数 ' + cores;
-          if (mem && mem <= 3) return '设备内存约 ' + mem + ' GB';
+          if (phys > PHYS_LOW / 10000) {
+            return en
+              ? 'Screen has ' + Math.round(phys) + ' K px, above the ' + (PHYS_LOW / 10000) + ' K limit'
+              : '屏幕物理像素 ' + phys + ' 万，超过 ' + (PHYS_LOW / 10000) + ' 万';
+          }
+          if (cores && cores <= 4) return (en ? 'CPU cores: ' : 'CPU 核心数 ') + cores;
+          if (mem && mem <= 3) return en ? 'Device memory ~' + mem + ' GB' : '设备内存约 ' + mem + ' GB';
         } catch (e) {}
-        return '硬件信息判定为低配';
+        return en ? 'Detected as low-end hardware' : '硬件信息判定为低配';
       }
-      return '当前高画质';
+      return en ? 'Currently high quality' : '当前高画质';
     },
     /* 设置页切换：auto / high / low */
     set: function (m) {

@@ -1,4 +1,4 @@
 /* 由 android/build-apk.sh 从项目根 version.json 自动生成，不要手改 */
 (function (g) {
-  g.RIPPLE_VERSION = { code: 134, name: '1.3.4' };
+  g.RIPPLE_VERSION = { code: 135, name: '1.3.5' };
 })(window);

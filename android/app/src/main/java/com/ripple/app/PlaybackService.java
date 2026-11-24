@@ -199,8 +199,11 @@ public class PlaybackService extends Service {
         if (nm == null) return;
         NotificationChannel ch = nm.getNotificationChannel(CH_PLAYING);
         if (ch != null) return;
-        ch = new NotificationChannel(CH_PLAYING, "正在播放", NotificationManager.IMPORTANCE_LOW);
-        ch.setDescription("媒体播放控制，不发声");
+        ch = new NotificationChannel(CH_PLAYING,
+                // 1.3.5 多语言：渠道名/描述用户在系统设置里能直接看到，必须跟着语言走
+                L10n.t("正在播放", "Now playing"), NotificationManager.IMPORTANCE_LOW);
+        ch.setDescription(L10n.t("媒体播放控制，不发声",
+                "Playback controls, no sound"));
         ch.setSound(null, null);
         ch.enableVibration(false);
         ch.setShowBadge(false);
@@ -637,8 +640,9 @@ public class PlaybackService extends Service {
         } else {
             b = new Notification.Builder(this);
         }
-        b.setContentTitle(title.isEmpty() ? "Ripple 涟漪" : title)
-                .setContentText(artist.isEmpty() ? "未在播放" : artist)
+        // 1.3.5 多语言：兜底文案也翻。英文态下标题直接用产品名，不再拼「涟漪」
+        b.setContentTitle(title.isEmpty() ? L10n.t("Ripple 涟漪", "Ripple") : title)
+                .setContentText(artist.isEmpty() ? L10n.t("未在播放", "Nothing playing") : artist)
                 // U-28：自带单色矢量图标，系统 android.R.drawable.ic_media_play 在部分 ROM 上会被 tint 成白块
                 .setSmallIcon(R.drawable.ic_stat_music)
                 /*
@@ -665,14 +669,20 @@ public class PlaybackService extends Service {
                 try { style.setMediaSession(session.getSessionToken()); } catch (Throwable ignored) {}
             }
             b.setStyle(style);
+            /*
+             * 1.3.5 多语言：四个动作标题会被 TalkBack 朗读，也是紧凑视图的长按提示，
+             * 所以必须跟着语言走。英文刻意用单词（Previous/Pause/Next/Like），
+             * 通知栏这两处空间都很窄，长句会被截成省略号。
+             */
             Notification.Action prev = new Notification.Action.Builder(
-                    android.R.drawable.ic_media_previous, "上一首",
+                    android.R.drawable.ic_media_previous, L10n.t("上一首", "Previous"),
                     cmdIntent("prev")).build();
             Notification.Action toggle = new Notification.Action.Builder(
                     playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
-                    playing ? "暂停" : "播放", cmdIntent("toggle")).build();
+                    playing ? L10n.t("暂停", "Pause") : L10n.t("播放", "Play"),
+                    cmdIntent("toggle")).build();
             Notification.Action next = new Notification.Action.Builder(
-                    android.R.drawable.ic_media_next, "下一首",
+                    android.R.drawable.ic_media_next, L10n.t("下一首", "Next"),
                     cmdIntent("next")).build();
             /*
              * 第 8 条：通知栏加「喜欢」。
@@ -681,7 +691,7 @@ public class PlaybackService extends Service {
              * 收藏逻辑（含未登录提示）仍然只有网页那一份，不重复实现。
              */
             Notification.Action like = new Notification.Action.Builder(
-                    R.drawable.ic_heart, "喜欢", cmdIntent("like")).build();
+                    R.drawable.ic_heart, L10n.t("喜欢", "Like"), cmdIntent("like")).build();
             /* 用户要求「喜欢」放在最右边：上一首 / 播放暂停 / 下一首 / 喜欢 */
             b.addAction(prev).addAction(toggle).addAction(next).addAction(like);
             // 紧凑视图放前三个常用键；喜欢在最右侧的展开区

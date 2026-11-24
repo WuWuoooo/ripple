@@ -15,6 +15,21 @@
    */
   const LF = window.LyricFill || null;
   /*
+   * 多语言翻译入口（1.3.5）。
+   *
+   * 为什么在这里再包一层而不是到处写 window.I18n.T：
+   *   ① app.js 里 20 多处要带插值拼串，每次都写 window.I18n 太长，
+   *      写成 TT('共 {n} 首', {n: 3}) 才读得下去；
+   *   ② i18n.js 有可能加载失败（将来被某个构建剪掉、或者离线缓存缺文件），
+   *      这时 TT 必须退化成「原样返回中文」而不是抛异常 ——
+   *      一个翻译模块的问题不该让整个播放器白屏。
+   */
+  function TT(s, vars) {
+    const I = window.I18n;
+    if (!I || typeof I.T !== 'function') return s;
+    try { return I.T(s, vars); } catch (e) { return s; }
+  }
+  /*
    * 状态栏填充色的兜底值。
    *
    * 必须定义在 IIFE 顶部（而不是用到它的函数旁边）——
@@ -60,6 +75,20 @@
     _booted = true;
     Log.add('BOOT', 'start, mode=' + Netease.mode + ' native=' + !!window.RippleNative);
     Store.load();
+    /*
+     * 界面语言（1.3.5）。
+     *
+     * i18n.js 的 boot 已经在它自己的 <script> 执行期（早于 app.js）
+     * 按存档把整页翻好了 —— 那时 Store 还没 load，它直接读的原始
+     * localStorage。这里只做两件 Store 加载后才能做的事：
+     *   ① 把语言同步给原生层（通知渠道名、通知动作标题、崩溃页文字
+     *      都是 Java 里的字符串，网页翻不到）；
+     *   ② 让 Store 里的值成为唯一事实，必要时用 resolveLang() 校正一次
+     *      （比如存档被外部改坏、语言包缺失）。
+     * 顺序放在 applyTheme 之前：主题会重建状态栏图标等 DOM，
+     * 先定语言可以让那一轮重建出来的节点直接是目标语言。
+     */
+    applyLangSetting();
     applyTheme();
     applyVars();
     Player.init();
@@ -118,7 +147,13 @@
     } catch (e) {}
 
     renderClock();
-    $('#helloTitle').textContent = greet() + '，欢迎回来';
+    /*
+     * 问候语也是拼接的（'晚上好' + '，欢迎回来'）。
+     * 中文直接拼；英文不能拼 —— "Good evening, welcome back" 里那个逗号
+     * 和空格是英文习惯，而中文是全角逗号。所以英文态整句取一条译文，
+     * 五种问候各一条，读起来才像人写的。
+     */
+    $('#helloTitle').textContent = greetingText();
 
     syncConnectionUI();
     refreshSystemBars();
@@ -155,9 +190,28 @@
       const el = $('#helloDate');
       if (!el) return;
       const d = new Date();
-      const txt = d.getHours().toString().padStart(2, '0') + ':'
-        + d.getMinutes().toString().padStart(2, '0')
-        + ' · 星期' + '日一二三四五六'[d.getDay()];
+      const hm = d.getHours().toString().padStart(2, '0') + ':'
+        + d.getMinutes().toString().padStart(2, '0');
+      /*
+       * 星期是**拼接**出来的（' · 星期' + '日一二三四五六'[n]），
+       * 这种结构没法靠整串词典翻译 —— 英文的星期是「Mon」这样的独立词，
+       * 而不是「星期」+ 一个汉字。所以这里按语言走两条路：
+       *   中文：保持原来的拼接（一个字改变日期文案最小，不动它）
+       *   英文：用 Date 自带的 toLocaleDateString 取短星期，交给系统语言环境
+       * 判据直接看 I18n.lang 而不是「译文里有没有那个片段」——
+       * 后者依赖词典内容，词典一改行为就变，属于隐性耦合。
+       */
+      const isEn = !!(window.I18n && window.I18n.lang === 'en');
+      let txt;
+      if (isEn) {
+        let wd = '';
+        try {
+          wd = d.toLocaleDateString('en-US', { weekday: 'short' });
+        } catch (e) { wd = ''; }
+        txt = hm + (wd ? ' · ' + wd : '');
+      } else {
+        txt = hm + ' · 星期' + '日一二三四五六'[d.getDay()];
+      }
       if (txt === _lastClock) return;
       _lastClock = txt;
       el.textContent = txt;
@@ -215,6 +269,19 @@
     return '晚上好';
   }
 
+  /** 欢迎语整句（中文拼接 / 英文整句，理由见调用处的注释） */
+  function greetingText() {
+    const g = greet();
+    const isEn = !!(window.I18n && window.I18n.lang === 'en');
+    if (!isEn) return g + '，欢迎回来';
+    /*
+     * 中文侧也是整句进词典：'晚上好，欢迎回来' 作为一条 key。
+     * 这样词典里中英一一对应，不会出现「英文有整句、中文靠拼接」
+     * 这种不对称 —— 不对称的代价是以后加语言时容易只翻一半。
+     */
+    return TT(g + '，欢迎回来');
+  }
+
   /* 原生在系统深色/浅色切换时回调这里 */
   window.__rippleSystemTheme = function () {
     if (S().theme !== 'auto') return;
@@ -238,6 +305,128 @@
       try { return !!N.systemDark(); } catch (e) { /* 落到媒体查询 */ }
     }
     return !matchMedia('(prefers-color-scheme: light)').matches;
+  }
+
+  /* ================= 界面语言 ================= */
+  /*
+   * 多语言（1.3.5）。引擎在 js/i18n.js —— 它对外只有几个入口，
+   * 这里封一层是给「设置变更 / 原生同步 / 分段控件」用的。
+   *
+   * 为什么语言一定要同步给原生层：
+   *   通知渠道名、通知栏三个动作按钮（上一首/播放/下一首）、崩溃页、
+   *   「安装未知应用」的引导 —— 这些字符串在 Java 里，网页翻不到它们。
+   *   不同步的话，英文用户会看到「界面是英文、通知栏还是中文」，
+   *   而这恰恰是最容易被看见的地方（锁屏上一直在）。
+   */
+
+  /** 取一个语言 code 的显示名（中文显示「中文」，英文显示 English） */
+  function langName(code) {
+    const I = window.I18n;
+    if (!I) return code;
+    const hit = I.list().find((x) => x.code === code);
+    return hit ? hit.name : code;
+  }
+
+  /**
+   * 当前可用的语言列表。
+   *
+   * 以 I18n.list() 为准（语言包自己注册上来的），再用 store.js 的 ENUMS.lang
+   * 白名单兜底过滤一遍。两边都必须认：只有 I18n 认的话，
+   * 一个没有对应语言包的 code 被写进设置后（手工改 localStorage）
+   * coerceSettings 拦不住；只有 ENUMS 认的话，新加的语言要在两个文件里同步，
+   * 漏一个就变成「语言包有、界面上选不到」。
+   */
+  function availableLangs() {
+    const I = window.I18n;
+    if (!I) return ['zh'];
+    const all = I.list().map((x) => x.code);
+    return all.indexOf('zh') < 0 ? ['zh'].concat(all) : all;
+  }
+
+  /** 把语言写进原生层（Android 有对应桥；桌面端/浏览器没有就跳过） */
+  function syncLangToNative(code) {
+    const N = window.RippleNative;
+    if (!N || typeof N.setLang !== 'function') return;
+    try {
+
+      N.setLang(code);
+      Log.add('I18N', 'native lang -> ' + code);
+    } catch (e) { Log.err('I18N', e, 'setLang failed'); }
+  }
+
+  /**
+   * 把 Store 里的语言应用到界面与原生层。
+   * boot 时调一次；设置页改动时按需再调。
+   */
+  function applyLangSetting() {
+    const I = window.I18n;
+    const want = S().lang || 'zh';
+    const legal = availableLangs();
+    const code = legal.indexOf(want) >= 0 ? want : 'zh';
+    /* 存档里的值不合法（语言包被删/名字打错）时顺手纠正，别让它一直错着 */
+    if (code !== want) { S().lang = code; try { Store.save(); } catch (e) {} }
+    if (I) I.setLang(code, true);      // silent：这里由我们自己负责落盘
+    syncLangToNative(code);
+    renderLangSeg();
+  }
+
+  /** 设置页「界面语言」分段控件：按可用语言动态生成按钮 */
+  function renderLangSeg() {
+    const box = $('#langSeg');
+    if (!box) return;
+    const I = window.I18n;
+    const cur = (I && I.lang) || 'zh';
+    const sig = availableLangs().join(',') + '|' + cur;
+    if (box._sig === sig) return;      // 没变化就不重建（避免把焦点弄丢）
+    box._sig = sig;
+    box.innerHTML = availableLangs().map((code) =>
+      `<button type="button" data-lang="${esc(code)}" role="radio" `
+      + `aria-checked="${code === cur ? 'true' : 'false'}" `
+      + `class="${code === cur ? 'on' : ''}">${esc(langName(code))}</button>`
+    ).join('');
+    const h = $('#langHint');
+    if (h) h.textContent = langName(cur);
+  }
+
+  /**
+   * 切换语言。
+   *
+   * 除了换文案，还有三件事必须做，否则界面会「半英半中」：
+   *   ① 重跑一遍所有 render* —— 列表/面板里的大量文案是 innerHTML
+   *      拼出来的，缓存了签名（_lyricSig / _queueSig / 首页数据签名……），
+   *      不强制重建就还是旧语言；
+   *   ② 重建 toast —— 正在显示的那几条是已经生成好的 DOM，
+   *      MutationObserver 只改文本节点，不会重排 HTML 结构（没问题），
+   *      但它们对应的业务状态没变，留着不碍事，所以不清；
+   *   ③ 通知原生层 —— 见 applyLangSetting。
+   */
+  function setLang(code) {
+    const I = window.I18n;
+    if (!I) return;
+    if (availableLangs().indexOf(code) < 0) return;
+    S().lang = code;
+    Store.save();
+    I.setLang(code, true);
+    syncLangToNative(code);
+    renderLangSeg();
+    /*
+     * 强制重建所有带签名的列表：
+     * 清掉签名 = 下一次 render 一定重建，而不是被「签名没变」短路掉。
+     * 这几处正是本次踩到的坑 —— 只换 setLang 而不清签名的话，
+     * 切到英文后首页/曲库/歌词还是中文，得手动切页才刷新。
+     */
+    _lyricSig = '';
+    _queueSig = '';
+    /* 这两个挂在 App 上（历史原因），不是裸变量 —— 不加前缀就成了
+       给一个未声明的名字赋值，严格模式下直接抛 ReferenceError。 */
+    App._homeSig = '';
+    App._libSig = '';
+    try { renderAll(); } catch (e) { Log.err('I18N', e, 'renderAll'); }
+    /* 播放页与设置页的分组标题也是内部拼的，重刷一次 */
+    try { renderNP(); } catch (e) {}
+    try { syncSettingsUI(); } catch (e) {}
+    /* 语言名本身也是文案，切完再刷一次提示（用户要确认「点到了」） */
+    toast(I.T('界面语言'), langName(code), 'check');
   }
 
   function resolvedTheme() {
@@ -406,9 +595,15 @@
      * 它们都应该跟着同一个滑块一起变强变弱，不能只改模糊。
      * 用 0~1 的归一化值去缩放这三项的幅度（见 base.css 的液态玻璃段落）。
      *
-     * 40px 是滑块上限，对应「最强」；0 就是完全没有玻璃效果。
+     * 4px 是滑块上限，对应「最强」；0 就是完全没有玻璃效果。
      */
-    const gs = Math.max(0, Math.min(1, (Number(S().glassBlur) || 0) / 40));
+    /*
+     * 1.3.5：值域从 0~40 改成 0~4，所以归一化分母必须跟着改。
+     * 忘记改这里的话，滑块拖到最大（4）也只有 0.1 的强度 ——
+     * 表现为「折射和高光怎么调都几乎没有」，而模糊本身是好的，
+     * 排查时很容易只怀疑那一堆 CSS。
+     */
+    const gs = Math.max(0, Math.min(1, (Number(S().glassBlur) || 0) / 4));
     r.setProperty('--glass-strength', gs.toFixed(3));
     /*
      * 强度为 0 时给 <html> 挂 lg-off，CSS 那边据此彻底关掉 backdrop-filter。
@@ -1235,7 +1430,7 @@
   function renderCarousel(items, emptyText) {
     $('#carousel').innerHTML = items.length
       ? carouselHTML(items)
-      : `<div class="c-card ghost">${esc(emptyText || '暂无内容')}</div>`;
+      : `<div class="c-card ghost">${esc(emptyText || TT('暂无内容'))}</div>`;
   }
 
   function libFiltered(opts) {
@@ -1290,7 +1485,8 @@
       const v = key === 'seg' ? el.dataset.seg
         : key === 'theme' ? el.dataset.theme
           : key === 'perf' ? el.dataset.perf
-            : el.dataset.q;
+            : key === 'lang' ? el.dataset.lang
+              : el.dataset.q;
       const on = v === value;
       if (on) hit = true;
       el.classList.toggle('on', on);
@@ -1318,6 +1514,7 @@
       { sel: '#qualitySeg', key: 'q' },
       { sel: '#themeSeg', key: 'theme' },
       { sel: '#perfSeg', key: 'perf' },
+      { sel: '#langSeg', key: 'lang' },
     ];
     groups.forEach(({ sel, key }) => {
       const box = $(sel);
@@ -1374,7 +1571,7 @@
       ? list.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
       : `<div class="empty"><b>这里还没有音乐</b><p>点下面「从手机导入音乐」，或在搜索页搜网易云</p></div>`;
     $('#libCount').textContent = g
-      ? `${g.name} · ${list.length} 首`
+      ? TT('{name} · {n} 首', { name: g.name, n: list.length })
       : list.length + ' 首';
   }
 
@@ -1397,7 +1594,7 @@
       const rows = [...map.values()];
       $('#libList').innerHTML = rows.length
         ? rows.map((e) => `<div class="row" data-album="${esc(e.album)}" data-artist="${esc(e.artist)}"
-            role="button" tabindex="0" aria-label="专辑 ${esc(e.album)}，共 ${e.n} 首，查看歌曲">
+            role="button" tabindex="0" aria-label="${esc(TT('专辑 {album}，共 {n} 首，查看歌曲', { album: e.album, n: e.n }))}">
             <div class="r-th art"><img src="${safeCover(coverOf(e.first))}" alt="" loading="lazy"></div>
             <div class="r-tx"><b>${esc(e.album)}</b><span>${esc(e.artist)} · ${e.n} 首</span></div>
           </div>`).join('')
@@ -1415,7 +1612,7 @@
       const rows = [...map.values()];
       $('#libList').innerHTML = rows.length
         ? rows.map((e) => `<div class="row" data-artist="${esc(e.artist)}"
-            role="button" tabindex="0" aria-label="艺人 ${esc(e.artist)}，共 ${e.n} 首，查看歌曲">
+            role="button" tabindex="0" aria-label="${esc(TT('艺人 {artist}，共 {n} 首，查看歌曲', { artist: e.artist, n: e.n }))}">
             <div class="r-th art"><img src="${safeCover(coverOf(e.first))}" alt="" loading="lazy"></div>
             <div class="r-tx"><b>${esc(e.artist)}</b><span>${e.n} 首</span></div>
           </div>`).join('')
@@ -1453,7 +1650,7 @@
       box.innerHTML = pls.length ? pls.map(plRowHTML).join('')
         : `<div class="empty" style="padding:26px 10px"><b>没有歌单</b></div>`;
     } catch (e) {
-      box.innerHTML = `<div class="empty" style="padding:26px 10px"><b>读取失败</b><p>${esc(e.message)}</p></div>`;
+      box.innerHTML = `<div class="empty" style="padding:26px 10px"><b>${esc(TT('读取失败'))}</b><p>${esc(e.message)}</p></div>`;
     }
   }
 
@@ -1514,7 +1711,7 @@
       ava.hidden = true;
     }
     $('#acctName').innerHTML = p
-      ? esc(p.nickname) + (p.vip ? `<span class="badge">黑胶 VIP${p.vipLevel ? ' V' + p.vipLevel : ''}</span>` : '')
+      ? esc(p.nickname) + (p.vip ? `<span class="badge">${esc(TT('黑胶 VIP'))}${p.vipLevel ? ' V' + p.vipLevel : ''}</span>` : '')
       : (_accountUnknown ? '账号状态未知' : '未登录网易云');
     $('#acctSub').textContent = p
       ? (_accountUnknown
@@ -2509,6 +2706,15 @@
    * 这里用签名短路：曲子、行数、首尾时间、字号、译文开关没变就直接跳过。
    */
   let _lyricSig = '';
+  /*
+   * 换句滚动过渡的闸门（1.3.5）。
+   *
+   * renderLyric() 重建整篇歌词 DOM 时把它关掉，第一句由 syncLyric 写进去时
+   * 不做滚动 —— 换歌、重新渲染、改字号这些场景都不是「上一句唱完、下一句上来」，
+   * 硬套滚动动画会让人以为刚才那句被截断了。
+   * 由 syncLyric 在第一次成功写入后重新打开。
+   */
+  let _lyricRollArmed = false;
 
   function renderLyric() {
     const t = Player.track;
@@ -2556,9 +2762,13 @@
         el.style.setProperty('--ln-size', S().lyricSize + 'px');
       });
     }
+    /* 换歌/重建：这次的第一次写入不该有滚动过渡（见 _lyricRollArmed） */
+    _lyricRollArmed = false;
     lyricIdx = -2;
     lyricFollow = true;
     _lyricRecenter = true;
+    /* 重建了 DOM → 旧的 data-lbd 全没了，重新标一遍（否则模糊要等下次换句才出现） */
+    if (lyricBlurActive()) markLyricBlurDepth();
     if (box) box.classList.remove('free');
     bindLyricScroll();
     syncLyric();
@@ -2722,6 +2932,7 @@
     const r = document.documentElement;
     r.classList.toggle('no-karaoke', !S().karaokeLyric);
     r.classList.toggle('no-kdone', !S().karaokeDone);
+
     /*
      * 自定义「已播放」色。
      *
@@ -2749,6 +2960,100 @@
     } else {
       r.style.removeProperty('--karaoke-played');
     }
+  }
+
+  /* ================= 歌词模糊（1.3.5） ================= */
+
+  /**
+   * 当前是否处于「高画质」档位。
+   *
+   * 判据用 html 上实际挂着的 perf-low 类，而不是 localStorage 里的用户选择 ——
+   * 因为「自动」档可能因为实测帧率低而降级，那时候 set() 里记的还是 auto，
+   * 但实际跑的已经是低配。歌词模糊这类「只在真正高画质下才给」的项，
+   * 必须看实际状态，否则会出现「界面说高画质、开关却在低配上毫无效果」。
+   */
+  function highQuality() {
+    return !document.documentElement.classList.contains('perf-low');
+  }
+
+  /**
+   * 「歌词模糊」当前是否应该生效。
+   *
+   * 三个条件缺一不可：
+   *   ① 用户在设置里开着（默认开）
+   *   ② 没有处于低配（html.perf-low）
+   *   ③ 有可模糊的歌词（调用方自己判断）
+   *
+   * 为什么性能档位要参与：每一行带 filter:blur 的元素都是一个独立合成层，
+   * 展开态有几十行 —— 低配机上那是几十个离屏图层，代价很实在。
+   * 而「低配」的定义本来就是「关掉一切不必要的合成开销」。
+   */
+  function lyricBlurActive() {
+    return !!S().lyricBlur && highQuality();
+  }
+
+  /**
+   * 把「歌词模糊」开关落到根元素上。
+   *
+   * 用**正向类** `lyr-blur` 而不是 `no-lyr-blur` 取反：
+   * CSS 那边要同时排除 perf-low，两个否定叠在一起（:not(.no-…) :not(.perf-low)）
+   * 读起来很容易看反。正向类让 CSS 只写一条 `html.lyr-blur .lyric .ln[...]`。
+   */
+  function applyLyricBlur() {
+    const on = lyricBlurActive();
+    const r = document.documentElement;
+    r.classList.toggle('lyr-blur', on);
+    if (on) markLyricBlurDepth();
+    else clearLyricBlurDepth();
+  }
+
+  /**
+   * 按「离当前句多远」给每一行标一个深度（0 = 当前句，最大 4）。
+   *
+   * 为什么要写成 data 属性而不是直接写行内 filter：
+   *   · 行内样式优先级最高，用户把开关关掉后残留的 filter 会压过样式表，
+   *     只能逐行 removeProperty —— 而 data 属性配合 `html.lyr-blur` 门控，
+   *     一关就是全部失效，不需要逐行清理；
+   *   · 深度值只有 0~4 五档，值得做成五条 CSS 规则而不是每行一个 inline，
+   *     浏览器能为每档复用同一条样式规则。
+   *
+   * 4 档封顶：再远的行已经被容器的 mask 淡出，模糊多少都看不出来，
+   * 但每多一层就是一个合成层 —— 封在 4 档是效果与开销的平衡点。
+   */
+  function markLyricBlurDepth() {
+    const box = $('#npLyric');
+    if (!box) return;
+    const rows = Array.prototype.filter.call(
+      box.children, (el) => el.classList && el.classList.contains('ln'));
+    if (!rows.length) return;
+    let cur = -1;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].classList.contains('on')) { cur = i; break; }
+    }
+    if (cur < 0) cur = 0;
+    for (let i = 0; i < rows.length; i++) {
+      /*
+       * 封顶 5 档（而不是 4）：
+       * 模糊半径封在 2px 之后，若深度也只到 4，那么「距离 4 及以上」全挤在
+       * 同一档 —— 从第 5 句开始整片一样糊，层次感会在末尾突然消失。
+       * 多留一档让最外围（距离≥5）统一停在 2px，过渡更绵。
+       * CSS 那边 data-lbd="4" 与 "5" 都是 2px，这里只是语义上分开。
+       */
+      const d = Math.min(Math.abs(i - cur), 5);
+      /* 只在值真的变了时才写，避免每帧一次无意义的属性写 */
+      if (rows[i].getAttribute('data-lbd') !== String(d)) {
+        rows[i].setAttribute('data-lbd', String(d));
+      }
+    }
+  }
+
+  /** 关掉时把深度标记清干净，免得下次开启前样式被旧值短暂命中 */
+  function clearLyricBlurDepth() {
+    const box = $('#npLyric');
+    if (!box) return;
+    Array.prototype.forEach.call(box.querySelectorAll('.ln[data-lbd]'), (el) => {
+      el.removeAttribute('data-lbd');
+    });
   }
 
   /**
@@ -2839,6 +3144,75 @@
     }
   }
 
+  /* ================= 换句过渡（1.3.5） ================= */
+  /*
+   * 三行歌词换句时做一次「向上滚 + 高斯模糊」的过渡。
+   *
+   * 为什么需要快照层（#lyrGhost）：
+   *   换句是直接改 textContent 的，旧文字在新文字写进去那一刻就没了 ——
+   *   想让它「往上飘走」就必须先把它复制出来一份。快照层是绝对定位的，
+   *   盖在正文同一个位置上，尺寸和行高跟正文完全一致（都吃 --lyr-lh）。
+   *
+   * 为什么快照只做**三段文字**、不连卡拉OK渐变一起复制：
+   *   渐变是靠 --kp 这个 CSS 变量算的，复制节点不会带过去；
+   *   而且过渡只有 260ms，那一瞬间的颜色差异根本看不见 ——
+   *   为它去复制内联变量只会把代码弄复杂。
+   *
+   * 动画不能重叠：一句歌词最短也可能几百毫秒就换。
+   * 上一轮的 ghost 还没淡完就要开始下一轮时，直接重置 class 重新触发，
+   * 而不是排队 —— 排队的观感是「动画越来越落后于现实」。
+   */
+  let _rollTimer = 0;
+  function playLyricRoll() {
+    const box = $('#npLyricMini');
+    const ghost = $('#lyrGhost');
+    if (!box || !ghost) return;
+    /*
+     * 性能闸门：低配机不做这个过渡。
+     * 注意这里判断的是**低配**，不是因为低配下模糊更贵 ——
+     * 低配模式本来就是「关掉一切不停在动的东西」，歌词每两三秒滚一次
+     * 属于常驻动画，和 perf.js 里那条取向一致。
+     * 另外「减少动效」偏好也在这里尊重一下：系统里明确说过别动，
+     * 就不要为了好看而违反（CSS 里另有一层兜底，见 responsive.css）。
+     */
+    let reduce = false;
+    try { reduce = !!(matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) {}
+    if (reduce) return;
+
+    /* ① 先把当前三行拷进快照层 */
+    const prev = $('#lyrPrev');
+    const cur = $('#lyrCur');
+    const next = $('#lyrNext');
+    ghost.innerHTML = [prev, cur, next].map((el) => {
+      if (!el || !el.textContent) return '<div></div>';
+      return '<div>' + esc(el.textContent) + '</div>';
+    }).join('');
+    /* 快照里中间那行是「正在唱」的，视觉上要比上下两行亮一点，
+       否则它淡出时比原来暗一档，看起来像闪了一下。 */
+    const mid = ghost.children[1];
+    if (mid) { mid.style.color = 'var(--text)'; mid.style.fontWeight = '500'; }
+
+    /* ② 快照往上飘走；正文从下面滚进来 */
+    ghost.classList.remove('roll-out');
+    box.classList.remove('roll-in');
+    /*
+     * 强制重排再挂类：同一帧里先 remove 再 add，浏览器会认为
+     * 「类没有变化」而**不重新开始动画**（这正是 CSS 动画最常见的坑）。
+     * 读一次 offsetWidth 就能把样式计算刷干净。
+     */
+    void ghost.offsetWidth;
+    ghost.classList.add('roll-out');
+    box.classList.add('roll-in');
+
+    /* ③ 动画结束收摊：把快照彻底清掉，别让它一直挂着一个隐藏图层 */
+    clearTimeout(_rollTimer);
+    _rollTimer = setTimeout(() => {
+      ghost.classList.remove('roll-out');
+      box.classList.remove('roll-in');
+      ghost.innerHTML = '';
+    }, 320);
+  }
+
   /** force=true 时即使还在同一句也会重新计算（改歌词偏移后需要用） */
   function syncLyric(force) {
     if (!lyricLines.length) {
@@ -2883,6 +3257,20 @@
       const prevTx = i - 1 >= 0 ? lyricLines[i - 1].text : '';
       const curTx = i >= 0 ? lyricLines[i].text : '♪';
       const nextTx = i + 1 < lyricLines.length ? lyricLines[i + 1].text : '';
+      /*
+       * 换句过渡（1.3.5）：必须在**写文字之前**调 —— 它要把旧的三行
+       * 拷进快照层。写在后面就只能拷到新文字，等于没有旧内容可淡出。
+       *
+       * 但「换句」有两种情况不该有滚动：
+       *   ① 换歌（renderLyric 刚重建过 DOM）—— 那是另一个语义，
+       *      从中间滚进来会像「刚才那句没唱完就被扔掉」，很怪；
+       *      由 _lyricRollArmed 标记控制，renderLyric 里会关掉它。
+       *   ② 用户拖进度条跳转（wentBack）—— 同理，是跳不是滚。
+       * 判据放在这里而不是调用方，是因为这三个变量都在本函数的作用域里。
+       */
+      if (lineChanged && _lyricRollArmed && !wentBack) playLyricRoll();
+      /* 第一次写入完成（无论有没有播动画），之后就是正常的「换句」了 */
+      _lyricRollArmed = true;
       $('#lyrPrev').textContent = prevTx || '';
       $('#lyrCur').textContent = curTx;
       $('#lyrNext').textContent = nextTx || '';
@@ -2953,6 +3341,15 @@
       _lyricFocusNode = rows[focus];
       setKaraoke(rows[focus], LF.lineProgress(lyricLines, i, t, Player.duration()));
     }
+    /*
+     * 歌词模糊（1.3.5）：每一行按「离当前句多远」标深度。
+     *
+     * 必须在这里（换句后）重新标，而不是只在开关打开时标一次 ——
+     * 当前句一换，所有行的相对距离都变了，旧标记会让模糊停在上一句周围。
+     * 只在 changed 时重标：这个函数每 100ms 被调一次，
+     * 每帧遍历几十行去读 class 是没必要的（换句几秒才一次）。
+     */
+    if (changed && lyricBlurActive()) markLyricBlurDepth();
     /* 展开且可见时才滚动。
        两个前置条件缺一不可：
          · lyricFollow —— 用户在翻看时一次都不许动
@@ -3129,9 +3526,9 @@
           ${optRow('i-eq', '淡入淡出', s.fade ? s.fade + 's' : '关闭',
             optSeg('fade', [[0, '关'], [0.4, '0.4s'], [0.8, '0.8s']]))}
           ${optRow('i-eq', '均衡器', EQ_NAMES[s.eq] || '关闭',
-            `<div class="val">${EQ_NAMES[s.eq] || '关闭'} ›</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="eq"')}
+            `<div class="val">${TT(EQ_NAMES[s.eq] || '关闭')} ›</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="eq"')}
           ${optRow('i-moon', '睡眠定时', s.sleepMin ? s.sleepMin + ' 分钟后暂停' : '关闭',
-            `<div class="val">${s.sleepMin ? s.sleepMin + ' 分钟 ›' : '关闭 ›'}</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="sleep"')}
+            `<div class="val">${s.sleepMin ? s.sleepMin + TT(' 分钟') + ' ›' : TT('关闭') + ' ›'}</div>`).replace('class="opt-row"', 'class="opt-row" data-optact="sleep"')}
         </div>
       </div>
 
@@ -3158,6 +3555,14 @@
             /^#[0-9a-fA-F]{6}$/.test(String(s.karaokeColor || ''))
               ? String(s.karaokeColor).toUpperCase() : '跟随主题',
             '<div class="val">选择 ›</div>').replace('class="opt-row"', 'class="opt-row" data-optact="kcolor"')}
+          <!--
+            歌词模糊：和设置页同一项。只在高画质下出现 ——
+            低配时它本来就不生效（见 lyricBlurActive），
+            留一个拨了也没反应的开关比不显示更糟。
+            data-perf-only 由 syncSettingsUI / syncOptSheet 统一处理。
+          -->
+          ${highQuality() ? optRow('i-lyric', '歌词模糊', '非当前句越远越模糊',
+            optSwitch('lyricBlur')) : ''}
         </div>
       </div>
 
@@ -4334,10 +4739,10 @@
         </div>
       </div>`;
     const hot = data.hot.length
-      ? `<div class="cmt-hd">精彩评论 · ${data.hot.length}</div>${data.hot.map(line).join('')}`
+      ? `<div class="cmt-hd">${esc(TT('精彩评论 · {n}', { n: data.hot.length }))}</div>${data.hot.map(line).join('')}`
       : '';
     const list = data.list.length
-      ? `<div class="cmt-hd">最新评论 · ${fmtN(data.total)}</div>${data.list.map(line).join('')}`
+      ? `<div class="cmt-hd">${esc(TT('最新评论 · {n}', { n: fmtN(data.total) }))}</div>${data.list.map(line).join('')}`
       : '<div class="empty" style="padding:26px 0"><b>还没有评论</b></div>';
 
     $('#cmtCount').textContent = fmtN(data.total) + ' 条';
@@ -4596,7 +5001,7 @@
     if (!songs.length) return toast('还没有推荐', '稍后再来，或先登录', 'info');
     App._plCurrent = {
       title: Netease.loggedIn ? '每日推荐' : '今日推荐',
-      sub: `${songs.length} 首 · 按你的口味生成`,
+      sub: TT('{n} 首 · 按你的口味生成', { n: songs.length }),
       kind: '每日',
       cover: songs[0] && songs[0].cover,
       tracks: songs,
@@ -4672,7 +5077,7 @@
       } catch (e) {
         /* 过期请求的失败不该覆盖新歌单的画面 */
         if (my !== _plSeq) return;
-        $('#plTracks').innerHTML = `<div class="empty"><b>读取失败</b><p>${esc(e.message)}</p></div>`;
+        $('#plTracks').innerHTML = `<div class="empty"><b>${esc(TT('读取失败'))}</b><p>${esc(e.message)}</p></div>`;
         const plLoad3 = $('#plLoading');
         if (plLoad3) plLoad3.textContent = '失败';
         return;
@@ -4695,7 +5100,7 @@
     const total = data.tracks.length;
     const shown = total > PL_MAX ? data.tracks.slice(0, PL_MAX) : data.tracks;
     $('#plCount').textContent = total > PL_MAX
-      ? `前 ${PL_MAX} 首（共 ${total} 首）`
+      ? TT('前 {max} 首（共 {n} 首）', { max: PL_MAX, n: total })
       : total + ' 首';
     const cur = Player.track;
     $('#plTracks').innerHTML = shown.map((t, i) => rowHTML(t, i, cur && cur.id === t.id)).join('')
@@ -4765,6 +5170,18 @@
        所以不能只看 localStorage，要看 html 上实际挂着的类）。 */
     const perfMode = (window.RipplePerf && RipplePerf.mode()) || 'auto';
     const perfLow = !!(window.RipplePerf && RipplePerf.isLow());
+    /*
+     * 只在高画质可用的行（1.3.5）。
+     *
+     * 声明式标记：HTML 里写 data-perf-only，这里统一按档位显示/隐藏。
+     * 为什么不写 hidden="hidden" 然后逐个 if：那种写法每加一项就要改这个函数，
+     * 而 D-06 的教训正是「新加的行忘了加进名单」。
+     */
+    $$('[data-perf-only]').forEach((row) => {
+      row.hidden = perfLow;
+    });
+    /* 低配时把歌词模糊实际关掉（设置值保留，回到高画质自动恢复） */
+    applyLyricBlur();
     syncSegAria('#perfSeg', perfMode, 'perf');
     const perfHint = $('#perfHint');
     if (perfHint) {
@@ -4787,7 +5204,7 @@
     setTx('#volHint', Math.round((s.volume == null ? 0.85 : s.volume) * 100) + '%');
     setTx('#lyricSizeHint', s.lyricSize + ' px');
     setTx('#lyricOffsetHint', (s.lyricOffset > 0 ? '+' : '') + (+s.lyricOffset).toFixed(1) + 's');
-    setTx('#glassBlurHint', s.glassBlur + ' px');
+    setTx('#glassBlurHint', (+s.glassBlur).toFixed(1) + ' px');
     setTx('#animSpeedHint', (+s.animSpeed).toFixed(1) + '×');
     syncSbOverlay();
     syncNotifyPermUI();
@@ -4845,7 +5262,7 @@
      * Android 拿到原生横幅通知时才有意义，桌面端一并没有入口，
      * 所以同样收起来，避免出现「开关能拨但什么都不会发生」。
      */
-    $('#sleepVal').textContent = (s.sleepMin ? s.sleepMin + ' 分钟 ›' : '关闭 ›');
+    $('#sleepVal').textContent = (s.sleepMin ? s.sleepMin + TT(' 分钟') + ' ›' : TT('关闭') + ' ›');
     syncConnectionUI();
     /*
      * F-15：这两行是从 boot() 复制过来忘了删的。
@@ -4907,7 +5324,9 @@
 
   /* 每个滑块在设置里的「单位/格式」 */
   const SLD_FMT = {
-    glassBlur: (v) => v + 'px',
+    /* 玻璃强度是小数（0~4，步长 0.1），必须固定一位小数，
+       否则 2 会显示成 "2px"、2.5 显示成 "2.5px"，气泡里的数字长度会跳。 */
+    glassBlur: (v) => (+v).toFixed(1) + 'px',
     animSpeed: (v) => (+v).toFixed(1) + '×',
     volume: (v) => Math.round(v * 100) + '%',
     speed: (v) => (+v).toFixed(2).replace(/0$/, '') + '×',
@@ -4980,13 +5399,52 @@
      * 避免两处各写一套、以后改顺序时只改一处导致行为不一致。
      * 宽屏下顶栏那颗被 CSS 隐藏，侧栏那颗显示；窄屏反过来。
      */
+    /*
+     * 快速切换主题（顶栏那颗按钮 / 侧栏那颗）。
+     *
+     * ===== 1.3.5 改的是「自动」这一档的行为 =====
+     *
+     * 用户反馈：当前是「自动」且系统正处在深色时，点这颗按钮**应该直接变浅色**，
+     * 而不是先切到下一个档位、再看一遍一模一样的深色。
+     * 旧实现的循环是 dark → light → auto → dark…，
+     * 从 auto 出发会先到 dark —— 如果系统本来就是深色，
+     * 这一次点击在屏幕上**什么都没变**（只有 toast 的文案变了），
+     * 用户会以为按钮坏了，得连点两次才看到效果。
+     *
+     * 新规则：这是「快速切换深浅」的按钮，不是「循环三个档位」的按钮。
+     *   · 深色 → 浅色，浅色 → 深色（不变，本来就是这个语义）
+     *   · 自动 → 跳到**当前实际显示的反面**，并且停在那个显式档位上
+     *     （深色自动态 → 浅色；浅色自动态 → 深色）
+     *   · 停在显式档位之后，再点就继续在深/浅之间来回
+     *
+     * 为什么自动态要跳到显式档位而不是继续留在 auto：
+     *   留在 auto 的话，下一次点击又要「按当前明暗取反」，
+     *   而系统明暗和用户刚选的可能一致 —— 于是每一击都要看屏幕才知道结果，
+     *   这不是一个「快速切换」按钮该有的手感。跳到显式档位后，
+     *   前两次点击的效果就是完全确定的：第一次变反色，第二次变回来。
+     *
+     * 想回到「跟随系统」的入口是设置页那段三分段控件（#themeSeg），
+     * 那颗按钮的语义是「选档位」，和这里不冲突。
+     */
     const cycleTheme = () => {
-      const order = ['dark', 'light', 'auto'];
-      const next = order[(order.indexOf(S().theme) + 1) % 3];
+      const cur = S().theme;
+      /* resolvedTheme() 已处理 auto → 跟随系统；显式档位直接返回自己 */
+      const showing = resolvedTheme();
+      const next = showing === 'dark' ? 'light' : 'dark';
       S().theme = next; Store.save();
       applyTheme();
       if (Player.track) paletteFor(Player.track);
-      toast('主题已切换', { dark: '深色', light: '浅色', auto: '跟随系统' }[next], 'theme');
+      /*
+       * toast 里说清楚「从什么变到什么」。
+       * 自动档跳过去时用户会疑惑「我的自动呢」，
+       * 所以这一种情况补一句「已改为手动」，让他知道怎么回去。
+       */
+      const wasAuto = cur === 'auto';
+      toast('主题已切换',
+        TT(wasAuto
+          ? ({ dark: '深色 · 已改为手动', light: '浅色 · 已改为手动' }[next])
+          : ({ dark: '深色', light: '浅色' }[next])),
+        'theme');
     };
     $('#btnTheme').addEventListener('click', cycleTheme);
     const railThemeBtn = $('#railTheme');
@@ -5290,7 +5748,11 @@
       e.target.value = '';
       renderAll();
       toast(added.length ? '导入完成' : '没有可导入的音频',
-        added.length ? (Store._volatile ? `本次会话可用 ${added.length} 首（存储受限）` : `新增 ${added.length} 首`) : '请选择音频文件',
+        added.length
+          ? (Store._volatile
+            ? TT('本次会话可用 {n} 首（存储受限）', { n: added.length })
+            : TT('新增 {n} 首', { n: added.length }))
+          : '请选择音频文件',
         'check');
     });
     $('#rowSheet').addEventListener('click', async () => {
@@ -5691,7 +6153,7 @@
       const p = Netease.profile || {};
       modal(`
         <h3>${esc(p.nickname || '我的账号')}</h3>
-        <p style="margin-bottom:14px">${esc(p.vip ? '黑胶 VIP' : '普通账号')}${p.signature ? ' · ' + esc(p.signature) : ''}</p>
+        <p style="margin-bottom:14px">${esc(p.vip ? TT('黑胶 VIP') : TT('普通账号'))}${p.signature ? ' · ' + esc(p.signature) : ''}</p>
         <div class="modal-btns">
           <button class="btn ghost" data-cancel>关闭</button>
           <button class="btn solid" id="acctReload">刷新资料</button>
@@ -5706,6 +6168,21 @@
         toast('已刷新', (Netease.profile && Netease.profile.nickname) || '已重新拉取账号信息', 'check');
       };
     });
+    /*
+     * 界面语言：分段控件的 click 委派。
+     * 按钮是 renderLangSeg() 动态生成的（见上面的注释），所以用委派而不是
+     * 给每个按钮单独绑 —— 语言列表变化时不用重新绑事件。
+     */
+    const langSeg = $('#langSeg');
+    if (langSeg) {
+      langSeg.addEventListener('click', (e) => {
+        const b = e.target.closest('button[data-lang]');
+        if (!b) return;
+        const code = b.dataset.lang;
+        if (code === (window.I18n && window.I18n.lang)) return;   // 点的是当前语言
+        setLang(code);
+      });
+    }
     $('#themeSeg').addEventListener('click', (e) => {
       const b = e.target.closest('button[data-theme]');
       if (!b) return;
@@ -5739,6 +6216,19 @@
       const m = b.dataset.perf;
       const low = (window.RipplePerf ? RipplePerf.set(m) : false);
       syncSettingsUI();
+      /*
+       * 「歌词模糊」那一行只在高画质下存在，改了档位要重建面板 ——
+       * 不重建的话，从省电切回高画质后，面板里仍然没有这一行（或者反过来留着
+       * 一个拨了没反应的开关）。其他项都是「存在与否与档位无关」，
+       * 所以这里只有这一处需要重渲染。
+       */
+      /*
+       * renderOptSheet 内部已经 syncOptSheet + bindOptSheet 了，
+       * 这里不要再先 sync 一遍 —— 那会对着即将被替换掉的旧 DOM 白做一次活。
+       */
+      try {
+        if ($('#npOptBody')) renderOptSheet();
+      } catch (e) { Log.err('OPT', e, 'renderOptSheet after perf change'); }
       toast(m === 'high' ? '已切到高画质' : m === 'low' ? '已切到省电' : '已交给自动判断',
         low ? '当前：关闭毛玻璃、减少模糊' : '当前：毛玻璃与模糊全部开启', 'info');
     });
@@ -6109,11 +6599,25 @@
     }
 
     /* ---- 界面 ---- */
+    /*
+     * 语言变更：走 setLang 那条统一入口（它会重翻 + 重建列表 + 同步原生）。
+     * 注意 setLang 内部还会再 Store.save() 一次 —— 这里已经在 onSettingChange
+     * 里被调用，多存一次听起来冗余，但 setLang 也需要能被别处（比如
+     * 「恢复默认设置」）直接调用，所以不把落盘职责拆出去。
+     * 用 applyLangSetting() 而不是 setLang()：恢复默认这类路径下
+     * S().lang 已经是目标值了，再走一遍 setLang 会重复 toast。
+     */
+    if (k === 'lang') applyLangSetting();
     if (k === 'compactList') document.body.classList.toggle('compact', v);
+    /*
+     * 歌词模糊（1.3.5）：挂/撤根元素上的 lyr-blur 类，并重新标深度。
+     * 关掉时必须把 data-lbd 全清 —— 见 clearLyricBlurDepth 的注释。
+     */
+    if (k === 'lyricBlur') applyLyricBlur();
     if (k === 'glassBlur') {
       applyVars();
       // 效果本来就是靠 CSS 变量实时生效的，这里补上左侧的小字
-      const h = $('#glassBlurHint'); if (h) h.textContent = v + ' px';
+      const h = $('#glassBlurHint'); if (h) h.textContent = (+v).toFixed(1) + ' px';
     }
     if (k === 'animSpeed') {
       applyVars();
@@ -6151,7 +6655,7 @@
     try {
       const r = await Netease.test();
       toast(r.ok ? '连接成功' : '返回异常',
-        r.ok ? `${r.ms} ms · 示例：${r.name}` : '请检查网络或接口',
+        r.ok ? TT('{ms} ms · 示例：{name}', { ms: r.ms, name: r.name }) : '请检查网络或接口',
         r.ok ? 'check' : 'warn');
     } catch (e) {
       toast('连接失败', e.message, 'warn');
@@ -6200,7 +6704,7 @@
     const total = sess.total || sess.loaded;
     if (sess.loaded >= total) {
       return total > SEARCH_PAGE
-        ? `<div class="search-done">已经到底了 · 共 ${total} 首</div>` : '';
+        ? `<div class="search-done">${esc(TT('已经到底了 · 共 {n} 首', { n: total }))}</div>` : '';
     }
     return `<button class="search-more" id="searchMore" type="button">
       加载更多<span>${sess.loaded} / ${total}</span></button>`;
@@ -6272,7 +6776,7 @@
         /* 上游给不出更多了：把总数收口到已取条数，尾巴换成「到底了」 */
         sess.total = sess.loaded;
         const more = $('#searchMore');
-        if (more) more.outerHTML = `<div class="search-done">已经到底了 · 共 ${sess.loaded} 首</div>`;
+        if (more) more.outerHTML = `<div class="search-done">${esc(TT('已经到底了 · 共 {n} 首', { n: sess.loaded }))}</div>`;
         return;
       }
       appendSearchSongs(got, sess.loaded);
@@ -6281,7 +6785,7 @@
       const more = $('#searchMore');
       if (more) {
         if (sess.loaded >= sess.total) {
-          more.outerHTML = `<div class="search-done">已经到底了 · 共 ${sess.total} 首</div>`;
+          more.outerHTML = `<div class="search-done">${esc(TT('已经到底了 · 共 {n} 首', { n: sess.total }))}</div>`;
         } else {
           more.disabled = false;
           more.classList.remove('loading');
@@ -6312,7 +6816,7 @@
     _searchSession = null;                   // 新搜索：作废旧会话
     if (App.scope === 'online') {
       if (!Netease.ready) { showOnlineIntro(); return; }
-      body.innerHTML = `<div class="empty"><b>搜索中…</b><p>${esc(kw)}</p></div>`;
+      body.innerHTML = `<div class="empty"><b>${esc(TT('搜索中…'))}</b><p>${esc(kw)}</p></div>`;
       try {
         const [songs, pls] = await Promise.all([
           Netease.searchSongs(kw, SEARCH_PAGE, 0),
@@ -6332,7 +6836,7 @@
           html += `<div class="sec-head"><span class="n">PL</span><h2>歌单 · ${pls.list.length}</h2></div>
             <div class="list">${pls.list.map(plRowHTML).join('')}</div>`;
         }
-        html += `<div class="sec-head"><span class="n">NE</span><h2>单曲 · ${songs.total || songs.list.length}</h2></div>`;
+        html += `<div class="sec-head"><span class="n">NE</span><h2>${esc(TT('单曲 · {n}', { n: songs.total || songs.list.length }))}</h2></div>`;
         html += songs.list.length
           ? `<div class="list" id="searchSongList">${songs.list.map((t, i) => rowHTML(t, i, false)).join('')}</div>
              ${searchSongsTailHTML(_searchSession)}`
@@ -6340,7 +6844,7 @@
         body.innerHTML = html;
       } catch (e) {
         if (my !== _searchSeq) return;         // 过期请求的失败也不该覆盖新结果
-        body.innerHTML = `<div class="empty"><b>搜索失败</b><p>${esc(e.message)}</p></div>`;
+        body.innerHTML = `<div class="empty"><b>${esc(TT('搜索失败'))}</b><p>${esc(e.message)}</p></div>`;
       }
       return;
     }
@@ -7416,7 +7920,9 @@
 
   async function testNotification() {
     const title = Player.track ? Player.track.title : 'Ripple';
-    const body = Player.track ? `${Player.track.artist} · 正在播放，通知不会打断` : '通知不会打断音乐播放';
+    const body = Player.track
+      ? TT('{artist} · 正在播放，通知不会打断', { artist: Player.track.artist })
+      : '通知不会打断音乐播放';
     if (nativeNotify()) {
       // quiet 来自设置里的「通知不打断播放」；关掉它会走另一个有提示音的通道
       const quiet = S().notifyQuiet !== false;

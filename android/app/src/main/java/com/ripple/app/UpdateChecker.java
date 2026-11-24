@@ -247,7 +247,9 @@ final class UpdateChecker {
             try {
                 File dir = new File(app.getCacheDir(), "update");
                 if (!dir.exists() && !dir.mkdirs()) {
-                    throw new java.io.IOException("无法创建更新目录");
+                    // 1.3.5 多语言：这句会通过 onError 一路显示到前端弹窗上
+                    throw new java.io.IOException(L10n.t("无法创建更新目录",
+                            "Cannot create the update folder"));
                 }
                 /* 先清掉旧包：避免磁盘里堆一堆历史版本，
                    也避免 FileProvider 授权到过期文件。 */
@@ -316,15 +318,23 @@ final class UpdateChecker {
                 if (expectSize > 0 && dst.length() != expectSize) {
                     //noinspection ResultOfMethodCallIgnored
                     dst.delete();
-                    throw new java.io.IOException(
-                            "下载不完整（" + dst.length() + "/" + expectSize + " 字节）");
+                    /*
+                     * 1.3.5 多语言：这两句会经 onError 原样显示到前端弹窗，
+                     * 是用户真正会读到的错误文案，所以随语言走。
+                     * 数字和单位保持阿拉伯数字，中英两版都读得通。
+                     */
+                    throw new java.io.IOException(L10n.t(
+                            "下载不完整（" + dst.length() + "/" + expectSize + " 字节）",
+                            "Download incomplete (" + dst.length() + "/" + expectSize + " bytes)"));
                 }
                 /* 至少得比一个正常 APK 大，防止下到错误页面（比如 HTML 错误页） */
                 if (dst.length() < 100 * 1024) {
                     long len = dst.length();
                     //noinspection ResultOfMethodCallIgnored
                     dst.delete();
-                    throw new java.io.IOException("下载内容异常（" + len + " 字节，不是安装包）");
+                    throw new java.io.IOException(L10n.t(
+                            "下载内容异常（" + len + " 字节，不是安装包）",
+                            "Invalid download (" + len + " bytes, not an APK)"));
                 }
 
                 LogBridge.add(app, "UPDATE", "download ok: " + dst.getName()
@@ -374,7 +384,12 @@ final class UpdateChecker {
                         MAIN.post(() -> {
                             try {
                                 android.widget.Toast.makeText(act,
-                                        "请允许「安装未知应用」，返回后再点一次安装",
+                                        /*
+                                         * 1.3.5 多语言：这条是「跳去设置页之后」唯一的引导文字，
+                                         * 用户如果看不懂就永远装不上更新。
+                                         */
+                                        L10n.t("请允许「安装未知应用」，返回后再点一次安装",
+                                                "Please allow \"Install unknown apps\", then tap Install again"),
                                         android.widget.Toast.LENGTH_LONG).show();
                             } catch (Throwable ignored) {}
                         });
@@ -395,8 +410,9 @@ final class UpdateChecker {
             LogBridge.add(act, "UPDATE", "install failed: " + e);
             MAIN.post(() -> {
                 try {
+                    // 1.3.5 多语言：安装器没拉起来时的兜底 Toast（e.getMessage() 是系统原话，不翻）
                     android.widget.Toast.makeText(act,
-                            "拉起安装器失败：" + e.getMessage(),
+                            L10n.t("拉起安装器失败：", "Failed to open the installer: ") + e.getMessage(),
                             android.widget.Toast.LENGTH_LONG).show();
                 } catch (Throwable ignored) {}
             });
@@ -438,8 +454,11 @@ final class UpdateChecker {
                  * 有这一行就能立刻判断是限流还是网络问题。
                  */
                 String remain = c.getHeaderField("X-RateLimit-Remaining");
+                // 1.3.5 多语言：这个 error 串会被前端原样显示出来，所以括号里那句也翻
                 throw new java.io.IOException("HTTP " + code
-                        + (remain != null ? "（剩余额度 " + remain + "）" : ""));
+                        + (remain != null
+                        ? L10n.t("（剩余额度 " + remain + "）", " (rate limit remaining: " + remain + ")")
+                        : ""));
             }
             StringBuilder sb = new StringBuilder();
             try (BufferedReader r = new BufferedReader(

@@ -111,7 +111,7 @@ public class MainActivity extends Activity {
             CrashLog.step(this, "buildUi ok");
         } catch (Throwable e) {
             CrashLog.recordAsync(this, "webview-init", e);
-            showFatal("WebView 初始化失败", e);
+            showFatal(L10n.t("WebView 初始化失败", "Failed to initialize WebView"), e);
             return;
         }
 
@@ -426,9 +426,14 @@ public class MainActivity extends Activity {
                         startActivity(it);
                     } catch (android.content.ActivityNotFoundException e) {
                         // 没有任何应用能打开这个链接：明确告诉用户，而不是点了没反应
-                        Toast.makeText(MainActivity.this, "没有可以打开该链接的应用", Toast.LENGTH_SHORT).show();
+                        // 1.3.5 多语言：Toast 是用户唯一能看到的反馈，必须跟着语言走
+                        Toast.makeText(MainActivity.this,
+                                L10n.t("没有可以打开该链接的应用", "No app can open this link"),
+                                Toast.LENGTH_SHORT).show();
                     } catch (Throwable e) {
-                        Toast.makeText(MainActivity.this, "打开链接失败", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(MainActivity.this,
+                                L10n.t("打开链接失败", "Failed to open link"),
+                                Toast.LENGTH_SHORT).show();
                     }
                     return true;
                 }
@@ -485,7 +490,9 @@ public class MainActivity extends Activity {
                         i.addCategory(Intent.CATEGORY_OPENABLE);
                         i.setType("audio/*");
                         i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-                        startActivityForResult(Intent.createChooser(i, "选择音频文件"), REQ_FILE);
+                        // 1.3.5 多语言：系统文件选择器的标题条会显示这一句
+                        startActivityForResult(Intent.createChooser(i,
+                                L10n.t("选择音频文件", "Choose an audio file")), REQ_FILE);
                         return true;
                     } catch (Exception e) {
                         filePathCallback = null;
@@ -565,7 +572,8 @@ public class MainActivity extends Activity {
     private void recreateWeb() {
         try {
             if (webRoot == null) {
-                showFatal("页面渲染进程被系统回收（无法重建）", null);
+                showFatal(L10n.t("页面渲染进程被系统回收（无法重建）",
+                        "The page renderer was reclaimed by the system (cannot rebuild)"), null);
                 return;
             }
             final WebView w = new WebView(this);
@@ -578,7 +586,8 @@ public class MainActivity extends Activity {
             LogBridge.add(this, "UI", "WebView 已重建（渲染进程曾被杀）");
         } catch (Throwable e) {
             CrashLog.recordAsync(this, "webview-recreate", e);
-            showFatal("页面渲染进程被系统回收", e);
+            showFatal(L10n.t("页面渲染进程被系统回收",
+                    "The page renderer was reclaimed by the system"), e);
         }
     }
 
@@ -603,13 +612,19 @@ public class MainActivity extends Activity {
             box.setBackgroundColor(Color.parseColor("#07070b"));
 
             TextView h = new TextView(this);
-            h.setText("Ripple 启动出错\n" + title);
+            /*
+             * 1.3.5 多语言：崩溃页是纯原生绘制的，前端 i18n 管不到这里 ——
+             * 这大概是最需要翻译的一处（出问题时用户最慌，看不懂更没底）。
+             * title 由各调用点用 L10n.t 翻好传进来，这里只翻固定的两段壳文字。
+             */
+            h.setText(L10n.t("Ripple 启动出错", "Ripple failed to start") + "\n" + title);
             h.setTextColor(Color.parseColor("#ff8fa3"));
             h.setTextSize(18f);
 
             TextView body = new TextView(this);
             body.setText((trace == null ? "" : trace)
-                    + "\n\n堆栈已写入「下载」目录的 Ripple-crash-*.txt");
+                    + "\n\n" + L10n.t("堆栈已写入「下载」目录的 Ripple-crash-*.txt",
+                    "Stack trace written to Ripple-crash-*.txt in the Downloads folder"));
             body.setTextColor(Color.parseColor("#bbbbbb"));
             body.setTextSize(11f);
             body.setPadding(0, 24, 0, 0);
@@ -949,7 +964,9 @@ public class MainActivity extends Activity {
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(it);
             } catch (Throwable e2) {
-                Toast.makeText(this, "无法打开悬浮窗授权页，请到系统设置手动开启", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, L10n.t("无法打开悬浮窗授权页，请到系统设置手动开启",
+                        "Cannot open the overlay permission page; please enable it in system settings"),
+                        Toast.LENGTH_LONG).show();
             }
         }
     }
@@ -1160,7 +1177,8 @@ public class MainActivity extends Activity {
                 SharedPreferences sp = getSharedPreferences("ripple", MODE_PRIVATE);
                 if (sp.getBoolean("notify_hint_done", false)) return;
                 sp.edit().putBoolean("notify_hint_done", true).apply();
-                Toast.makeText(this, "允许通知才能用锁屏/耳机控制（设置 → 通知）",
+                Toast.makeText(this, L10n.t("允许通知才能用锁屏/耳机控制（设置 → 通知）",
+                        "Allow notifications for lock screen and headset controls (Settings → Notifications)"),
                         Toast.LENGTH_LONG).show();
             } catch (Throwable ignored) {
             }

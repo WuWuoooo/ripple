@@ -143,6 +143,11 @@ Wi-Fi and use "Add to Home Screen" for a fullscreen experience.
   lines · desktop standalone window
 - The colouring colour is customisable (follows the theme by default; both themes are
   contrast-checked)
+- **Smooth line transitions**: the previous line drifts up and fades out while the next one
+  floats in from below, with gaussian blur on high quality
+- **Lyric blur**: in the expanded view, lines blur progressively with distance from the
+  current one (0.2 → 1.25px, bounded so text stays readable). High quality only, toggleable
+  in settings and the player panel
 - Bilingual lyrics with translations, adjustable font size and offset, marquee for long lines
 
 </details>
@@ -150,7 +155,12 @@ Wi-Fi and use "Add to Home Screen" for a fullscreen experience.
 <details open>
 <summary><b>Interface</b></summary>
 
+- **UI language: Chinese / English**, switchable under "Me → Interface language". The
+  dictionary is keyed by the Chinese source string, so anything untranslated falls back to
+  Chinese instead of showing an empty string or a bare key. English gets its own typography
+  (line height, word breaking, small-text size) rather than a blind string swap
 - A single "liquid glass" language — one set done thoroughly, not several skins
+- Glass intensity 0–4 px (default 2), taken literally: glass should be see-through, not a wall
 - Edge-to-edge on Android: status and navigation bars are transparent and follow the page
   background and the cover's dominant colour
 - Three lyric lines on the player page (tap for the full view), dynamic cover colour

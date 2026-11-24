@@ -52,6 +52,18 @@
   --dur:.42s;
   --dur-s:.22s;
   --dur-l:.52s;
+  /*
+   * 歌词换句的滚动时长（1.3.5）。
+   *
+   * 为什么单列一个而不是复用上面的三档：
+   *   --dur（.42s）对一句话来说是"慢"，一段歌词两三秒就换一次，
+   *   每次换句都拖 0.42 秒会让整片歌词一直是糊的、在动，反而吵；
+   *   而 --dur-s（.22s）又快到看不出方向。实测 260ms 是「看得出滚过去了、
+   *   又不影响读下一句」的那一档。
+   * 不参与 --anim 换算：动画速度那个滑块的本意是界面动效，
+   * 歌词跟随音乐节奏，不该被界面偏好带快带慢。
+   */
+  --lyr-roll:.26s;
   --ease:cubic-bezier(.22,.9,.24,1);
   --ease-out:cubic-bezier(.16,1,.3,1);
   /* 用于「内容回来」这类要看得清的过渡：起手平缓，不会一闪而过 */
@@ -68,7 +80,10 @@
   --ease-inout:linear(0, 0.118 4.27%, 0.1983 6.29%, 0.2921 9.89%, 0.4154 14.38%, 0.493 18.5%, 0.5781 22.12%, 0.6482 27.7%, 0.7206 32.87%, 0.787 41.02%, 0.858 50.85%, 0.9148 62.99%, 0.9504 74.71%, 1);
   /* 展开/收回动画时长：0.3s，由 applyVars() 按「动画速度」换算 */
   --dur-ani:.3s;
-  --glass-blur:26px;
+  /* 玻璃强度（1.3.5 起 0~4px，默认 2）。真正生效的值由 app.js 的
+     applyVars() 写到 :root 上；这里只是 JS 还没跑起来时的首帧兜底，
+     必须与 store.js 的 DEFAULTS.glassBlur 相同，否则英文/中文首帧会闪一下厚度。 */
+  --glass-blur:2px;
   /* 玻璃饱和度统一成一个令牌。
      以前四个档位（180% / 190% / 120% / 无）混用，
      同屏不同层的「玻璃浓度」不一样，看着像两种材质。 */
@@ -774,6 +789,92 @@ body.no-cover .np-bg{opacity:0}
   -webkit-background-clip:text;
   background-clip:text}
 
+/*
+ * ============================================================
+ * 换句的平滑过渡（1.3.5）
+ * ============================================================
+ *
+ * 改动前的问题：换句是**瞬时**的 —— syncLyric 一次性把三行 textContent
+ * 全换掉，浏览器在下一帧就画出新文字。视觉上是"啪"地跳一下，没有任何
+ * 方向感：上一句往上走、下一句从下面来，这个「滚」的语义完全丢失了。
+ *
+ * 为什么不能只给 .ln 加 transition：
+ *   换句改的是**文本内容**，不是可过渡的属性。opacity 从 1 → 0 再 → 1
+ *   确实能做出淡出淡入，但旧文字已经在新内容写入的那一刻被替换掉了，
+ *   淡出动画放出来的是**新文字**在淡出 —— 看起来像闪了一下，比不动更糟。
+ *
+ * 所以用两层叠：
+ *   ① 新三行（.np-lyric 本体）：换句瞬间挂 .roll-in，
+ *      从「下方 + 高斯模糊」淡入到位；
+ *   ② 旧三行的快照（#lyrGhost）：换句前由 JS 拷一份当前文字，
+ *      换句后挂 .roll-out，往「上方 + 高斯模糊」淡出。
+ *      它是 a11y-hidden 的纯装饰副本，读屏不会念两遍。
+ *
+ * 高斯模糊的开关：
+ *   只有高画质（没有 html.perf-low）才加 filter:blur。
+ *   低配机上每帧对一个文字层做 blur 是纯亏 —— 这个过渡只有 260ms，
+ *   少了模糊也还是「平滑地滚过去」，语义是完整的。
+ *   「减少动效」偏好下整块过渡直接关掉（见 responsive.css）。
+ */
+
+/* 快照层：绝对定位盖在正文上，平时不可见、不响应事件 */
+.np-lyric{position:relative}
+.np-lyric .ln-ghost{
+  position:absolute;left:0;right:0;top:0;
+  /* 三行的总高 = 行高 × 3，和 .np-lyric 自己一样，这样副本和正文严丝合缝 */
+  height:calc(var(--lyr-lh) * 3);
+  display:flex;flex-direction:column;justify-content:center;text-align:center;
+  pointer-events:none;
+  /* 没在过渡时彻底移除：opacity:0 的元素仍会参与合成，
+     而这一层里有三段文字，留着就是三条常驻的图层。 */
+  visibility:hidden;
+  opacity:0;
+}
+.np-lyric .ln-ghost > div{
+  height:var(--lyr-lh);line-height:var(--lyr-lh);
+  font-size:var(--lyric-size,11px);
+  color:var(--lyric-dim);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+}
+
+/* 旧文字：向上走 + 变模糊 + 淡出 */
+.np-lyric .ln-ghost.roll-out{
+  visibility:visible;
+  animation:lyrGhostOut var(--lyr-roll) var(--ease-inout) both
+}
+@keyframes lyrGhostOut{
+  from{opacity:1;transform:translateY(0)}
+  to{opacity:0;transform:translateY(calc(var(--lyr-lh) * -1))}
+}
+html:not(.perf-low) .np-lyric .ln-ghost.roll-out{
+  /*
+   * 模糊是**加在关键帧外面**的一层：这里用 filter 的过渡而不是写进
+   * keyframes，是为了让 prefers-reduced-motion 那边能一条规则同时关掉
+   * 位移与模糊（见 responsive.css），不用维护两套 keyframes。
+   */
+  animation-name:lyrGhostOutBlur
+}
+@keyframes lyrGhostOutBlur{
+  from{opacity:1;transform:translateY(0);filter:blur(0)}
+  to{opacity:0;transform:translateY(calc(var(--lyr-lh) * -1));filter:blur(3px)}
+}
+
+/* 新文字：从下方来 + 由模糊转清晰 */
+.np-lyric.roll-in{
+  animation:lyrRollIn var(--lyr-roll) var(--ease-inout) both
+}
+@keyframes lyrRollIn{
+  from{opacity:0;transform:translateY(var(--lyr-lh))}
+  to{opacity:1;transform:translateY(0)}
+}
+html:not(.perf-low) .np-lyric.roll-in{
+  animation-name:lyrRollInBlur
+}
+@keyframes lyrRollInBlur{
+  from{opacity:0;transform:translateY(var(--lyr-lh));filter:blur(3px)}
+  to{opacity:1;transform:translateY(0);filter:blur(0)}
+}
+
 .np-lyric .ln.cur{font-size:calc(var(--lyric-size,11px) * 1.19);font-weight:600;color:var(--text);opacity:1;
   text-shadow:0 0 26px var(--accent-soft);letter-spacing:-.01em}
 .np-lyric .ln.blank{opacity:0}
@@ -1309,6 +1410,95 @@ body.no-cover .np-bg{opacity:0}
    而这是正在唱的那一句的对照译文，恰好是最该看清的一行。
    层次改用字重表达：正文行放大加粗，译文保持 400 常规。 */
 .lyric .ln.on .tr{font-weight:400}
+/*
+ * ============================================================
+ * 歌词模糊（1.3.5）· 展开的整篇
+ * ============================================================
+ *
+ * 不是「一行模糊、一行不模糊」，而是**按离当前句的距离逐级加深**：
+ *
+ *   当前句（距离 0）  完全清晰
+ *   上下各一句（1）    很浅的模糊，还读得清
+ *   再外面（2）        明显模糊，轮廓可辨
+ *   再外面（3）        只剩色块
+ *   更远（4 及以上）   几乎化开
+ *
+ * 参考的是 Apple Music / iOS 音乐那种「焦点在中间、越远越虚」的层次感 ——
+ * 它比「均匀地降低不透明度」更能把视线锁在当前句上，
+ * 因为人眼对**结构**（笔画能否分辨）比对方对**亮度**敏感得多。
+ *
+ * 三个实现上的取舍：
+ *
+ * ① 用 filter:blur 而不是 mask 渐变
+ *    容器 .lyric 已经有一层上下 mask 做整体淡出（那是「边缘渐隐」），
+ *    两套叠加时 mask 会让 blur 的边缘算得不准。而逐行 filter 是各算各的，
+ *    互不干扰，也不会把相邻行糊到一起（这正是截图里那种效果）。
+ *
+ * ② 深度用 data-lbd 属性分档，不写行内 filter
+ *    行内样式优先级最高，关掉开关后残留的 filter 会压过样式表，
+ *    只能逐行 removeProperty。用属性 + 根元素正向类门控，一关就整体失效。
+ *    另外只有 5 档，浏览器能为每档复用同一条规则，不用每行一个 inline。
+ *
+ * ③ 半径必须**小**，而且要按「能看清字」这条线来收
+ *    第一版用的是 .5 / 1.2 / 2.4 / 4 px，实测结论是「太强了、看不清字」——
+ *    4px 在 14px 的字上已经化成一团，2.4px 也很难读。
+ *    现在的取值把封顶压到 2px、紧邻当前句只有 .2px，
+ *    保证「上下各一句基本还读得清」，越远才逐渐化开：
+ *
+ *      距离 1 → .2px    几乎只是「柔一点」，字完全可读
+ *      距离 2 → .45px   看得出虚，仍能辨认
+ *      距离 3 → .8px    明显虚化，轮廓在
+ *      距离 4 → 1.25px  化开（封顶，不再加深）
+ *
+ *    封顶从 2px 再收到 1.25px（用户实测后要求再轻一档）。
+ *    紧邻那一句保持 .2px 不动 —— 它已经是「能不能感知到」的下限，
+ *    再压就完全看不出模糊了，那等于把功能关掉。
+ *    所以只压后三档，并让倍数递减（2.25× → 1.78× → 1.56×）：
+ *    由近及远「先快后慢」地加深，近处区分度够、远处不会突然一刀。
+ *    等差的四档在相邻行之间几乎分辨不出，层次感会消失。
+ *
+ * 只在 html.lyr-blur 下生效 —— 那个类由 app.js 的 applyLyricBlur() 控制，
+ * 它同时要求「设置里开着」且「不是低配」。低配机上几十个带 filter 的
+ * 文字行 = 几十个离屏合成层，代价很实在，而低配的定义本来就是省掉这些。
+ */
+
+/* 基础：让每行的模糊能独立过渡，不会在换句时硬跳 */
+html.lyr-blur .lyric .ln{
+  /* 过渡只作用在 filter 上；颜色与字号各有自己的过渡，别在这里重复声明 */
+  transition:filter var(--dur) var(--ease),color .36s var(--ease),
+    opacity .36s var(--ease)
+}
+
+/* 四档递进模糊。注意选择器要带上 .lyric 限定 ——
+   .np-lyric 的三行是另一套表面，它有自己的换句动画，不参与这里。 */
+html.lyr-blur .lyric .ln[data-lbd="1"]{filter:blur(.2px)}
+html.lyr-blur .lyric .ln[data-lbd="2"]{filter:blur(.45px)}
+html.lyr-blur .lyric .ln[data-lbd="3"]{filter:blur(.8px)}
+html.lyr-blur .lyric .ln[data-lbd="4"]{filter:blur(1.25px)}
+/* 距离 5 及以上统一停在封顶值：它们大多已被容器 mask 淡出，
+   再加深既看不出，又白白多一层不同的合成状态 */
+html.lyr-blur .lyric .ln[data-lbd="5"]{filter:blur(1.25px)}
+
+/*
+ * 当前句（data-lbd="0"）显式不模糊。
+ * 必须写这一条：上面四条只覆盖 1~4，而 blur 是可以从祖先继承的效果 ——
+ * 不给 0 档一个明确值，一旦以后有人给 .lyric 容器加上 filter，
+ * 当前句就跟着一起糊了。
+ */
+html.lyr-blur .lyric .ln[data-lbd="0"]{filter:none}
+
+/*
+ * 「减少动效」下不做模糊过渡，但**保留模糊本身**。
+ *
+ * 这条和换句动画的处理不一样：那个是「动画」，这类用户不要画面在动；
+ * 而歌词模糊是**静态层次**，不涉及运动。保留它不违背偏好，去掉反而
+ * 让整篇歌词变成一坨等重的文字，更难读。
+ * 只把 transition 关掉即可（松手/换句时瞬间到位）。
+ */
+@media (prefers-reduced-motion:reduce){
+  html.lyr-blur .lyric .ln{transition:none}
+}
+
 .lyric .ln.near{color:var(--text2)}
 .lyric .empty{text-align:center;color:var(--text3);font-size:12px;padding:30px 0;line-height:1.8}
 

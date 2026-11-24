@@ -14,9 +14,26 @@
   const DB_STORE = 'files';
 
   const DEFAULTS = {
+    /*
+     * 界面语言（1.3.5）。
+     * 以语言 code 存，不存显示名 —— 以后加日语只要注册 'ja'，
+     * 这里的白名单跟着加一项即可，不用改存档里的历史值。
+     */
+    lang: 'zh',
     theme: 'auto',       // 默认跟随系统深浅色
     dynamicColor: true,
-    glassBlur: 26,
+    /*
+     * 玻璃强度（1.3.5 起语义变了）。
+     *
+     * 旧版是「backdrop blur 的像素值」，范围 0~40、默认 26 —— 26px 模糊
+     * 早已不是「通透的玻璃」，隔着它基本看不到底下的东西，和这软件
+     * 主打的其他观感也不一致。用户实测 2px 的效果最好，4px 以上就
+     * 看不见玻璃下面的内容了，所以要的是**字面的小数值**，不是缩放。
+     *
+     * 现在：范围 0~4（px），默认 2，步长 0.1 —— 比原来的 step=2 细 20 倍。
+     * 迁移见 migrateSettings 的 fromVersion < 6 段。
+     */
+    glassBlur: 2,
     animSpeed: 1,
     compactList: false,
     quality: 'exhigh',
@@ -106,6 +123,18 @@
     karaokeLyric: true,
     karaokeDone: true,        // 已唱完的行是否做静态标记（关掉只留当前句染色）
     /*
+     * 「歌词模糊」（1.3.5）：非当前句按距离逐级加深的高斯模糊。
+     *
+     * 默认**开启**。它只在「高画质」下真正生效（见 lyricBlurActive()）——
+     * 低配机上每帧对几十行文字做 filter:blur 是实打实的开销，
+     * 而且低配模式本来就是「关掉一切不必要的合成层」。
+     *
+     * 为什么不把「高画质」本身当开关用、还要多一个设置：
+     *   高画质是性能档位，用户可能是为了让玻璃通透才选的，
+     *   不代表他一定想要歌词变模糊。两件事分开，各自可关。
+     */
+    lyricBlur: true,
+    /*
      * 染色的「已播放」色。空串 = 用主题默认色（深色 #b3a2ff / 浅色 #5833ff）。
      *
      * 为什么默认空串而不是写死一个十六进制：
@@ -148,7 +177,7 @@
    * 但会让每帧模糊计算爆炸的写入。
    */
   const NUM_RANGE = {
-    glassBlur: [0, 40],
+    glassBlur: [0, 4],
     animSpeed: [0.4, 2.5],
     fade: [0, 5],
     speed: [0.5, 2],
@@ -167,6 +196,13 @@
   };
   // 白名单枚举：不在这几个值里的直接回落默认
   const ENUMS = {
+    /*
+     * 语言白名单（1.3.5）。
+     * 只列「内置有词典」的语言；以后加语言时这里是第二处（第一处是
+     * app/js/lang/<code>.js 的 register 调用），忘改这里的话用户选完
+     * 重启会静默回落中文，而且看不出原因。
+     */
+    lang: ['zh', 'en'],
     theme: ['auto', 'dark', 'light'],
     /*
      * quality 以 netease.js 的 LEVELS 为准：5 档（standard/higher/exhigh/lossless/hires）。
@@ -221,7 +257,7 @@
    * 这里记一个版本号，加载时若低于当前版本就执行一次「补默认值」迁移，
    * 然后写回新版本号，保证只迁一次、且用户之后手动关掉也不会被重置。
    */
-  const SCHEMA_VERSION = 5;
+  const SCHEMA_VERSION = 6;
 
   function migrateSettings(out, saved, fromVersion) {
     /*
@@ -336,6 +372,55 @@
       if (sf5 === '#000000' || !sf5) {
         out.sbFillColor = DEFAULTS.sbFillColor;
       }
+    }
+    /*
+     * v5 → v6（1.3.5）：玻璃强度从「0~40px、默认 26」改成「0~4px、默认 2」。
+     *
+     * 为什么必须在迁移里做，而不是光改 DEFAULTS：
+     *   老存档里存的是旧值域的数（绝大多数人是没动过的 26）。
+     *   如果只改 DEFAULTS，老用户升级后 glassBlur 还是 26，
+     *   而 coerceSettings 的 NUM_RANGE 已经把上限收到 4 ——
+     *   于是 26 被**静默钳成 4**，用户看到的是「玻璃突然变成最厚的一档」，
+     *   和他自己的选择毫无关系，而且看起来像 bug。这正是 SCHEMA 段开头
+     *   说的那类「改默认值对老用户完全无效」的坑的镜像版本。
+     *
+     * 映射方式：按比例 ÷10。
+     *   旧值域 0..40、新值域 0..4，正好十倍关系，所以 ÷10 能保住
+     *   「他在那个滑块上的相对位置」—— 原来调到 8（很薄）的人得到 0.8，
+     *   调到 40（最厚）的人得到 4。旧步长是 2，÷10 后正好落在 0.2，
+     *   仍然对齐新步长 0.1，不会出现 1.7999999 这种脏值。
+     *
+     * 注意取的是 **saved 里的原值**，不是 out.glassBlur ——
+     * coerceSettings 是先钳范围再调 migrateSettings，
+     * 此时 out.glassBlur 已经被 26 钳成 4 了，原始信息只剩 saved 里有。
+     *
+     * 为什么不加「>4 才换」这种条件：
+     *   旧值域里 4 表示「很薄」，新值域里 4 表示「最厚」，同名不同义。
+     *   拿阈值去猜哪个值属于哪个值域，必然有一批用户被换算错方向。
+     *   fromVersion < 6 已经保证这里拿到的**一定是旧值域的数**，
+     *   所以在整个旧值域上做同一个换算，才是唯一不会错的做法。
+     */
+    if (fromVersion < 6) {
+      /*
+       * ⚠️ 这里不能直接 Number(saved.glassBlur)：`typeof null === 'object'`
+       * 而 `Number(null) === 0` —— 存档里那个坏值 null 会被换算成 0，
+       * 也就是「玻璃效果被彻底关掉」，而 coerceSettings 的数值分支
+       * 明明会把它当成无效值回落默认。两套口径不一致就是这个 bug 的来源。
+       * 所以先把 null / undefined / 空串统一成「没设过」。
+       */
+      const rawSaved = saved ? saved.glassBlur : undefined;
+      const rawG = (rawSaved === null || rawSaved === undefined || rawSaved === '')
+        ? NaN : Number(rawSaved);
+      /*
+       * 旧默认值是 26，而绝大多数用户从没动过这个滑块 ——
+       * 如果一律 ÷10，他们会得到 2.6，而全新安装的用户是 2.0：
+       * 同一批「没改过设置」的人却看到两档不同的玻璃，很难解释。
+       * 所以「恰好是旧默认值」这一种直接落到新默认值，其余按比例换算。
+       */
+      if (rawG === 26) out.glassBlur = DEFAULTS.glassBlur;
+      else out.glassBlur = Number.isFinite(rawG)
+        ? Math.round(rawG) / 10
+        : DEFAULTS.glassBlur;
     }
     return out;
   }

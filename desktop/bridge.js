@@ -238,6 +238,17 @@
      */
     platform: 'desktop',
 
+    /**
+     * 界面语言同步（1.3.5）。
+     *
+     * 桌面端没有需要翻译的原生字符串 —— 窗口标题、系统菜单都是
+     * Tauri/系统自己管的（而且 Ripple 用的是 decorations:false 无边框窗口，
+     * 连标题栏都是网页自己画的）。但前端切语言时会**无条件**调这个方法，
+     * 缺了它就会在控制台留下一串 TypeError。
+     * 所以给一个什么都不做的实现：形状对得上、语义上确实是「无需处理」。
+     */
+    setLang: function () { return true; },
+
     /** 桌面端永远不是安全模式 */
     safeMode: function () { return false; }
   };
@@ -287,12 +298,32 @@
 
     const box = document.createElement('div');
     box.id = 'tauri-winbtns';
+    /*
+     * 窗口按钮的 aria-label / title 也要跟界面语言走（1.3.5 多语言）。
+     *
+     * 这三颗按钮是**桥注入**的，不在 index.html 里，i18n.js 的
+     * 「加载时整页走一遍」碰不到它们 —— 那时这段代码还没跑。
+     * 好在 i18n.js 的 MutationObserver 会接住后来插入的节点，
+     * 所以这里只要写中文原文即可，英文态下会被自动替换。
+     *
+     * 为什么仍然显式写 t()：
+     *   如果将来有一天关掉 Observer（比如为了性能），这三颗按钮会
+     *   永久停在中文。显式 t() 让它不依赖那条通路。
+     */
+    const t = (zh, en) => {
+      const I = g.I18n;
+      if (I && typeof I.lang === 'string' && I.lang !== 'zh') return en;
+      return zh;
+    };
     box.innerHTML =
-      '<button type="button" data-act="min" aria-label="最小化" title="最小化">'
+      '<button type="button" data-act="min" aria-label="' + t('最小化', 'Minimize')
+      + '" title="' + t('最小化', 'Minimize') + '">'
       + '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6h7"/></svg></button>'
-      + '<button type="button" data-act="max" aria-label="最大化" title="最大化">'
+      + '<button type="button" data-act="max" aria-label="' + t('最大化', 'Maximize')
+      + '" title="' + t('最大化', 'Maximize') + '">'
       + '<svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="1"/></svg></button>'
-      + '<button type="button" data-act="close" aria-label="关闭" title="关闭">'
+      + '<button type="button" data-act="close" aria-label="' + t('关闭', 'Close')
+      + '" title="' + t('关闭', 'Close') + '">'
       + '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>';
 
     const css = document.createElement('style');

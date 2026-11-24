@@ -55,12 +55,34 @@ public class HttpBridge {
     /*
      * 两个渠道的显示名收敛成「通知 / 提示音」两类。
      * 老 id（ripple_playback）保持不变：渠道名可以改，id 一改用户在系统设置里
-     * 针对这个渠道做的调整（静音、重要性）就全丢了。
+     * 对这个渠道做的调整（静音、重要性）就全丢了。
+     *
+     * 1.3.5 多语言：这两个渠道名和描述原来是 static final 常量，现在改成方法取值。
+     * 不能继续用常量 —— 静态字段在类初始化时就算死了，而 L10n.init 是在
+     * Application.onCreate 里跑的，两者的初始化顺序不受我们控制；一旦常量先于
+     * init 求值，渠道名就会永远钉死在中文。方法则每次建渠道时才取当前语言。
+     *
+     * 注意：渠道名只在**首次创建**时生效（ensureChannel 里见已存在就 return），
+     * 所以切换语言后系统设置里旧渠道名不会跟着变 —— 这是 Android 的行为，不是漏改。
      */
-    private static final String NAME_QUIET = "Ripple 通知";
-    private static final String DESC_QUIET = "低频通知，不发声、不打断音乐播放";
-    private static final String NAME_ALERT = "Ripple 提示（有声音）";
-    private static final String DESC_ALERT = "设置里关掉「通知不打断播放」后使用，会发出提示音";
+    private static String nameQuiet() {
+        return L10n.t("Ripple 通知", "Ripple notifications");
+    }
+
+    private static String descQuiet() {
+        return L10n.t("低频通知，不发声、不打断音乐播放",
+                "Low-priority notifications that stay silent and never interrupt playback");
+    }
+
+    private static String nameAlert() {
+        return L10n.t("Ripple 提示（有声音）", "Ripple alerts (with sound)");
+    }
+
+    private static String descAlert() {
+        return L10n.t("设置里关掉「通知不打断播放」后使用，会发出提示音",
+                "Used when \"Don't interrupt playback\" is turned off; plays a sound");
+    }
+
     /*
      * 提示类通知的固定 id 段。
      * 以前用的是 currentTimeMillis() % 100000，而播放通知 0x9A01(=39425)
@@ -139,7 +161,10 @@ public class HttpBridge {
             });
         } catch (Throwable e) {
             // 队列满 / 池已关闭：明确告诉网页，别让它干等到超时
-            act.replyToWeb(cbId, "{\"code\":-1,\"msg\":\"原生请求队列已满，请稍后重试\"}");
+            // 1.3.5 多语言：这段 msg 会被前端原样弹给用户，所以跟着语言走
+            act.replyToWeb(cbId, "{\"code\":-1,\"msg\":\"" + L10n.t(
+                    "原生请求队列已满，请稍后重试",
+                    "Native request queue is full, please try again later") + "\"}");
         }
     }
 
@@ -241,16 +266,38 @@ public class HttpBridge {
         NotificationChannel ch = nm.getNotificationChannel(id);
         if (ch != null) return;
         if (quiet) {
-            ch = new NotificationChannel(id, NAME_QUIET, NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription(DESC_QUIET);
+            ch = new NotificationChannel(id, nameQuiet(), NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription(descQuiet());
             ch.setSound(null, null);
             ch.enableVibration(false);
             ch.setShowBadge(false);
         } else {
-            ch = new NotificationChannel(id, NAME_ALERT, NotificationManager.IMPORTANCE_DEFAULT);
-            ch.setDescription(DESC_ALERT);
+            ch = new NotificationChannel(id, nameAlert(), NotificationManager.IMPORTANCE_DEFAULT);
+            ch.setDescription(descAlert());
         }
         nm.createNotificationChannel(ch);
+    }
+
+    /* ================= 多语言（1.3.5） ================= */
+
+    /**
+     * 前端切换界面语言时调用，把语言同步给原生层并落盘。
+     *
+     * 为什么原生也需要知道：通知渠道名、通知栏那几个动作按钮（上一首/暂停/播放/
+     * 下一首/喜欢）、Toast、崩溃兜底页都是 Java 侧直接构造的，前端翻了它们也不会变。
+     *
+     * 参数只认 "en"（大小写不敏感），其余一律当中文 —— 前端传上来未知语言码时，
+     * 宁可回落到中文，也不要让原生层停在两套文案都不是的状态。
+     *
+     * 线程：只改一个 volatile 字段 + 一次 SharedPreferences.apply()，不碰 UI，
+     * 所以不像 systemBars 那样需要 runOnUiThread；而且 apply() 本来就是异步落盘。
+     */
+    @JavascriptInterface
+    public void setLang(String code) {
+        try {
+            L10n.setLang(ctx, code);
+        } catch (Throwable ignored) {
+        }
     }
 
     /* ================= 运行日志 ================= */
@@ -604,8 +651,16 @@ public class HttpBridge {
         if (f == null || !f.isFile()) {
             LogBridge.add(ctx, "UPDATE", "installUpdate: 没有待安装的包");
             try {
+                /*
+                 * 1.3.5 多语言：这个 msg 会被前端 toast 出来（__rippleUpdateInstallResult），
+                 * 属于用户可见文案，所以要翻。
+                 *
+                 * 注意英文串里不能出现单引号：它被拼进一段用单引号包起来的 JS 字面量，
+                 * 多一个 ' 就会让整个 evaluateJavascript 变成语法错误、回调反而丢了。
+                 */
                 act.runJs("window.__rippleUpdateInstallResult && "
-                        + "window.__rippleUpdateInstallResult(false,'没有待安装的包')");
+                        + "window.__rippleUpdateInstallResult(false,'"
+                        + L10n.t("没有待安装的包", "No update package is ready") + "')");
             } catch (Throwable ignored) {}
             return;
         }

@@ -25,11 +25,19 @@ public class RippleApp extends Application {
      * 正常路径下不起作用 —— 版本号优先从 PackageManager 读（J-04），
      * 免得有人绕开 build-apk.sh 手改版本后，日志里报的还是旧版本。
      */
-    private static final String FALLBACK_VERSION_TAG = "version=1.3.4(134)";
+    private static final String FALLBACK_VERSION_TAG = "version=1.3.5(135)";
 
     @Override
     public void onCreate() {
         super.onCreate();
+        /*
+         * 1.3.5 多语言：尽可能早地把原生层语言读回来。
+         *
+         * 放在 onCreate 最前面（连启动日志都还没写）是因为崩溃兜底页 showFatal
+         * 和通知渠道都在后面的路径上，越早恢复语言，「界面还没出来就崩」时
+         * 那句标题也才是用户上次选的语言。读盘失败会被 init 内部吞掉，不影响启动。
+         */
+        L10n.init(this);
         LogBridge.add(this, "APP", "onCreate start, sdk=" + Build.VERSION.SDK_INT
                 + " " + Build.MANUFACTURER + " " + Build.MODEL
                 + " " + versionTag(this));
@@ -88,7 +96,7 @@ public class RippleApp extends Application {
     }
 
     /**
-     * 运行时版本标记（"version=1.3.4(134)" 这种形状）。
+     * 运行时版本标记（"version=1.3.5(135)" 这种形状）。
      * 读不到时回落 FALLBACK_VERSION_TAG；任何异常都不能冒出去 ——
      * 这行日志是启动取证的一部分，不能反过来把启动搞挂。
      */

@@ -129,7 +129,7 @@ test('save() 会把 schema 版本一起写进去', () => {
   Store.load();
   Store.save();
   const raw = JSON.parse(ls.getItem(KEY));
-  assert.equal(raw.schema, 5, 'schema 必须落盘，否则迁移每次启动都会重跑');
+  assert.equal(raw.schema, 6, 'schema 必须落盘，否则迁移每次启动都会重跑');
 });
 
 test('迁移后立刻 save()，再 load() 一次不会重复迁移', () => {
@@ -182,7 +182,7 @@ test('坏值仍然按 DEFAULTS 类型收敛（回归，不受迁移影响）', (
   Store.load();
   const s = Store.state.settings;
   assert.equal(s.lyricSize, 11, 'lyricSize 坏值应回落默认');
-  assert.equal(s.glassBlur, 26, 'glassBlur 为 null 应回落默认');
+  assert.equal(s.glassBlur, 2, 'glassBlur 为 null 应回落默认（1.3.5 起默认 2px）');
   assert.equal(s.volume, 1, 'volume 应被钳到 [0,1]');
   assert.equal(s.theme, 'auto', '非法枚举应回落默认');
   assert.equal(s.karaokeColor, '', 'karaokeColor 不是字符串应回落空串');
@@ -385,4 +385,105 @@ test('v3 → v5 一次跑完：反色关掉且填充色还原', () => {
   assert.equal(Store.state.settings.sbInvert, false);
   assert.equal(Store.state.settings.sbFillInvert, false);
   assert.equal(Store.state.settings.sbFillColor, '#b3a2ff');
+});
+
+/* ---------------------------------------------- v5 → v6：玻璃强度值域换算 */
+
+test('v5 → v6：旧默认值 26 落到新默认值 2', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 5, settings: { glassBlur: 26 } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.glassBlur, 2,
+    '从没动过滑块的老用户应该和全新安装看到同一档玻璃');
+});
+
+test('v5 → v6：用户自己调过的值按 ÷10 保住相对位置', () => {
+  const cases = [[0, 0], [2, 0.2], [8, 0.8], [20, 2], [34, 3.4], [40, 4]];
+  for (const [before, after] of cases) {
+    const { Store } = loadStore(makeStorage({
+      [KEY]: JSON.stringify({ schema: 5, settings: { glassBlur: before } }),
+    }));
+    Store.load();
+    assert.equal(Store.state.settings.glassBlur, after,
+      `旧值 ${before} 应换算成 ${after}`);
+  }
+});
+
+test('v5 → v6：存档里没有 glassBlur 时拿到新默认值', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 5, settings: {} }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.glassBlur, 2,
+    '没写过这个键的老存档，等价于从没动过 → 新默认值');
+});
+
+test('v6 存档：玻璃强度不会重复换算', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 6, settings: { glassBlur: 3.4 } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.glassBlur, 3.4,
+    '已经是新值域的数，再 ÷10 就会变成 0.34 —— 迁移只能跑一次');
+});
+
+test('新值域上限 4：超出的值被钳住而不是静默放开', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 6, settings: { glassBlur: 999 } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.glassBlur, 4,
+    '浮层窗口的模糊是每帧重新采样的，没有上限会让低端机直接掉帧');
+});
+
+/* ---------------------------------------------- 语言设置 */
+
+test('lang 默认是 zh', () => {
+  const { Store } = loadStore();
+  Store.load();
+  assert.equal(Store.state.settings.lang, 'zh');
+});
+
+test('lang 只接受白名单里的值', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 6, settings: { lang: 'klingon' } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.lang, 'zh',
+    '没有词典的语言必须回落中文，否则界面会变成一片中文');
+});
+
+test('lang 选过 en 会存下来', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 6, settings: { lang: 'en' } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.lang, 'en');
+});
+
+/* ---------------------------------------------- 歌词模糊（1.3.5） */
+
+test('lyricBlur 默认开启', () => {
+  const { Store } = loadStore();
+  Store.load();
+  assert.equal(Store.state.settings.lyricBlur, true,
+    '这是观感项，用户没动过就该是开着的（默认关会让人以为作者没做）');
+});
+
+test('lyricBlur 关掉后能存下来', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 6, settings: { lyricBlur: false } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.lyricBlur, false);
+});
+
+test('lyricBlur 非布尔值回落默认', () => {
+  const { Store } = loadStore(makeStorage({
+    [KEY]: JSON.stringify({ schema: 6, settings: { lyricBlur: 'yes' } }),
+  }));
+  Store.load();
+  assert.equal(Store.state.settings.lyricBlur, true,
+    '字符串 "yes" 不能被当成 true —— 布尔项只认真正的布尔');
 });

@@ -1,9 +1,13 @@
-const CACHE = 'ripple-134';
+const CACHE = 'ripple-135';
 const SHELL = [
   './', './index.html', './manifest.webmanifest',
   './css/base.css', './css/layouts.css', './css/components.css', './css/responsive.css',
   './js/version.js', './js/perf.js', './js/log.js', './js/lrc.js', './js/netease.js',
-  './js/store.js', './js/player.js', './js/qrcode.js', './js/app.js',
+  './js/store.js', './js/player.js', './js/qrcode.js',
+  /* 多语言（1.3.5）：语言包必须预缓存，否则离线首开只有中文。
+     加新语言时这两行旁边要再补一条 lang/<code>.js。 */
+  './js/i18n.js', './js/lang/en.js',
+  './js/app.js',
   /* 示例音频 / 封面已从项目中移除（7 个文件约 5.4 MB），代码里从不引用它们 */
   './assets/icons/icon-192.png', './assets/icons/icon-512.png', './assets/icons/icon-180.png'
 ];

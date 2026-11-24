@@ -6,6 +6,252 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.5 — Twelfth Version
+
+> **Basis**: six experience issues reported by the user (UI languages / lyric line
+> transition / gaussian blur on line change / theme quick toggle / glass intensity range).
+> **Implementation and docs by**: Deepseek V4.1 Flash 1017.
+>
+> An experience release: five items are new behaviour or new feel, one is a
+> behaviour correction. All three platforms (Android / Windows / Linux) ship together.
+
+### 1. UI languages (Chinese / English, extensible)
+
+**Why not the usual `t('settings.appearance.glass')` scheme**
+
+This project has 660+ UI strings spread across 8,600 lines of `app.js` and 890 lines of
+`index.html`, most of them one-off literals like `toast('已刷新', …)`. Switching to key
+names means touching hundreds of call sites, and every one of them is a chance to break
+something — a mistake shows up as *missing copy* or a *raw key on screen*, which is worse
+than not translating at all.
+
+So the dictionary is keyed by **the Chinese source string itself**: `T('玻璃强度')` →
+`"Glass intensity"`. Two benefits:
+
+- An untranslated entry **falls back to Chinese automatically** — never an empty string,
+  never a bare key name.
+- The key looks exactly like the code it replaces, so a reviewer can see at a glance
+  whether a given line has a translation.
+
+**Three translation paths (skip one and you get gaps)**
+
+| Path | Coverage | How |
+|---|---|---|
+| Static HTML | 190 | Walk the whole DOM once at load |
+| DOM inserted at runtime | 500+ | `MutationObserver` catches it — **no call site changes** |
+| Templated strings | 20 | Explicit `TT('{n} 首', {n: 3})` in source |
+
+**Details that had to be handled**
+
+- **Fragment concatenation**: strings built as `n + ' 首'` do not match any dictionary
+  entry as a whole. The engine also does prefix/suffix fragment replacement, so
+  `30 分钟` → `30 min` and `3 首本机文件` → `3 local files` (longest fragment first,
+  otherwise it would produce `3 songs本机文件`).
+- **Entries containing HTML**: a whole string like
+  `<div class="empty"><b>这里还没有音乐</b>…` never matches — the browser parses
+  `innerHTML` into separate text nodes, so the engine only ever sees a short sentence.
+  Registering a dictionary therefore splits such entries on tags and adds the
+  **inner text segments** as entries too.
+- **Single-character fragments over-match**: on a real device, `深` → `Dark` turned the
+  hero headline 「深夜很长，歌会一首接一首」 into 「**Dark**夜很长，」. The cause: a
+  fragment starting with a Chinese character was being used as a prefix match. Fragments
+  must now start with a **non-Chinese** character (space or punctuation).
+- **Remote data is never translated**: song titles, artists, albums, lyrics and comments
+  are left alone. Beyond "the dictionary simply has no such entries", containers such as
+  `.lyric`, `#npTitle`, `.r-tx` and `#cmtBody` are explicitly skipped — this avoids the
+  rare but baffling case of a track actually titled 「全部」 turning into "All".
+- **Logs are never translated**: strings in `Log.add` / `console.*` are for developers;
+  translating them only makes grepping harder.
+
+**English typography is a separate layer**
+
+Swapping copy without adjusting layout always breaks something: `"Volume normalization"`
+is far wider than 「音量归一化」, while a settings row gives up 30px to the icon and the
+rest to a switch, leaving only 200–240px for the middle. Under `html.lang-en` the
+following are tuned separately: settings row `min-height` 52→56px, small text +0.5px,
+line-height 1.55, `overflow-wrap:break-word` to contain long words, and tab-bar labels
+elided on one line instead of wrapping. **Chinese is unchanged down to the pixel** —
+that side has already been tuned over several rounds for contrast and line height.
+
+**The native layer has to follow**
+
+Notification channel names, the three notification action buttons, the crash screen and
+the "install unknown apps" guidance all live in Java, where the web layer cannot reach
+them. A new `L10n.java` (two-argument `t(zh, en)`, deliberately no key table) covers 31
+places, synced from the web layer via `RippleNative.setLang()`.
+
+> **Known limitation**: once an Android notification channel has been created, the system
+> does not allow renaming it — after switching language, an **already existing** channel
+> only updates on reinstall or clear-data. That is platform behaviour, not an oversight.
+
+**Adding a third language later**: create `app/js/lang/xx.js` calling
+`I18n.register('xx', 'self-name', dict)`, add one `<script>` line in `index.html`, add one
+entry to `SHELL` in `sw.js`, and add the code to `ENUMS.lang` in `store.js`. All four
+places carry comments; `tests/i18n.test.js` asserts the last two agree with the first two.
+
+### 2. Smooth transition between previous / next lyric lines
+
+Line changes used to be **instantaneous**: `textContent` was rewritten and the browser
+painted the new text on the next frame. Visually it snapped, and the direction —
+previous line drifting up, next line arriving from below — was entirely lost.
+
+**Why a transition on `.ln` alone does not work**: a line change replaces text content,
+not a transitionable property. Fading `opacity` out would animate the **new** text, which
+reads as a flash and is worse than no animation.
+
+So two layers are stacked:
+
+1. **Before** the line change, the current three lines are copied into a snapshot layer
+   `#lyrGhost` (absolutely positioned, sized from the same `--lyr-lh`).
+2. After the change, the snapshot drifts up and blurs out while the new three lines fade
+   in from below, blurred.
+
+The duration is its own token, `--lyr-roll: .26s`, not `--dur(.42s)` — lyrics change every
+two or three seconds, and .42s would keep the whole block moving and blurry, while .22s is
+too fast to read as direction.
+
+Two kinds of line change deliberately get no animation: **changing track** (different
+semantics; rolling in makes it look like the previous line was cut off) and **seeking**
+(that is a jump, not a scroll), decided by `_lyricRollArmed` / `wentBack`.
+
+### 3. Gaussian blur on line change (high quality only)
+
+This is the `filter:blur(3px)` → `0` inside the transition above.
+
+- **Enabled only under `html:not(.perf-low)`**: blurring a text layer every frame is pure
+  cost on a low-end device, and since the transition lasts 260ms, dropping the blur still
+  gives a smooth scroll with the semantics intact.
+- **Respects `prefers-reduced-motion`**: if the system says no motion, the effect does not
+  override that (with a backstop in `responsive.css`).
+
+### 4. Lyric blur: lines blur more the further they are from the current one (new setting, high quality only)
+
+In the expanded lyric view, **the further a line is from the current one, the blurrier it
+gets** — not "one clear line, everything else equally blurred":
+
+| Distance from current line | Blur radius |
+|---|---|
+| 0 (current) | none |
+| 1 (one above / below) | 0.2px |
+| 2 | 0.45px |
+| 3 | 0.8px |
+| 4 and beyond | 1.25px (capped) |
+
+This holds the eye on the current line better than lowering opacity uniformly — the human
+eye is far more sensitive to **structure** (whether strokes are still separable) than to
+brightness. It follows the iOS Music idea of a sharp centre fading with distance.
+
+**New setting "Lyric blur", on by default**, in two places:
+- "Me → Lyrics → Lyric blur"
+- Player top-right "…" → end of the lyrics group
+
+Both appear **only on high quality**. It does nothing on low-end anyway (dozens of lines
+with `filter` means dozens of offscreen layers), and a switch that has no effect is worse
+than no switch at all.
+
+**Three implementation trade-offs**:
+
+1. **Per-line `filter:blur` rather than a container mask gradient.** `.lyric` already carries
+   a top/bottom mask for the overall fade; stacking both makes the blur edge compute wrong
+   and smears neighbouring lines together. Per-line filter keeps each line separate, which is
+   exactly what produces the stepped look.
+2. **Depth is a `data-lbd` attribute, not an inline filter.** Inline styles win over the
+   stylesheet, so a leftover filter after turning the setting off would need a per-line
+   `removeProperty`. Attribute plus a positive root class `html.lyr-blur` means switching off
+   disables everything at once.
+3. **Radii must be small, bounded by "text still readable"**. The numbers went through two
+   rounds of real-device tuning: the first version `0.5 / 1.2 / 2.4 / 4` was reported as
+   "too strong, can't read the text" (4px smears 14px text), and `0.2 / 0.6 / 1.2 / 2` was
+   still heavy, so the final values are `0.2 / 0.45 / 0.8 / 1.25`.
+   The adjacent line stays at 0.2px — that is already the threshold of perceptibility, and
+   going lower would effectively disable the feature, so only the outer three are reduced,
+   with a decreasing ratio (2.25× → 1.78× → 1.56×): fast near, slow far, keeping separation
+   close in without a sudden cliff further out. An arithmetic series is indistinguishable
+   between neighbouring lines and loses the hierarchy.
+
+Depth is re-marked whenever the current line changes (only on `changed`, not every 100ms),
+and again after the lyric DOM is rebuilt — otherwise the blur would wait for the next line
+change to appear.
+
+Under `prefers-reduced-motion` the **blur itself is kept** and only the transition is
+dropped — blur is a static hierarchy, not motion, and removing it turns the whole lyric view
+into a wall of equally weighted text. This differs deliberately from the line-change
+animation.
+
+### 5. Theme quick toggle: "auto" no longer looks like a no-op
+
+**Before**: the top-bar button cycled `dark → light → auto`. Starting from `auto` the next
+state was `dark` — so **if the system was already dark, the click changed nothing on
+screen** (only the toast text). Users assumed the button was broken and clicked twice.
+
+**After**: the button means "flip light/dark", not "cycle three modes".
+
+- dark ⇄ light (unchanged)
+- auto → jumps to the **opposite of what is currently displayed** and lands on that
+  explicit mode
+- once on an explicit mode, further clicks keep flipping between dark and light
+
+Why auto lands on an explicit mode rather than staying on auto: staying on auto would make
+every click require reading the screen to know the outcome, which is not how a quick-toggle
+should feel. The way back to "follow system" is the three-way segmented control in
+settings, whose semantics do not conflict.
+
+Both theme states (`auto` resolving to dark and `auto` resolving to light) follow this rule.
+
+### 6. Glass intensity is now a literal small value
+
+| | Before | After |
+|---|---|---|
+| Range | 0 – 40 px | **0 – 4 px** |
+| Default | 26 px | **2 px** |
+| Step | 2 | **0.1** (40 stops, 20× finer) |
+
+**Why**: 26px of blur is no longer glass — you can barely see what is behind it. Real-device
+testing puts the best look at 2px; above 4px the content underneath is invisible, and glass
+is supposed to be transparent. So the value is now taken literally, with no scaling.
+
+**Three places must change together** (miss one and dragging to the maximum does almost
+nothing):
+
+1. `DEFAULTS.glassBlur` and `NUM_RANGE` in `store.js`
+2. the **normalisation divisor** for `--glass-strength` in `app.js` (`/40` → `/4`) — the
+   subtlest of the three: the blur itself looks fine, only refraction and highlight barely
+   move
+3. the first-paint fallback `--glass-blur` in `base.css`
+
+**Migration for existing users (`schema` 5 → 6)**: old saves hold values in the old range.
+Changing `DEFAULTS` alone would let `NUM_RANGE` **silently clamp** them to 4 — the glass
+would jump to maximum thickness for no reason the user can see, unrelated to their own
+choice. Values are therefore divided by 10 to preserve their relative position on the
+slider; the old default 26 lands directly on the new default 2, otherwise people who never
+touched the slider would see 2.6 while fresh installs see 2.0.
+
+Also fixed `Number(null) === 0`: a saved `glassBlur: null` would convert to 0 (glass fully
+off), even though `coerceSettings` treats it as invalid. The two now agree.
+
+### 7. Tests and known limitations
+
+New `tests/i18n.test.js` (16 cases, plus 11 migration cases); the full suite is
+**197 / 197 passing**. The most valuable one asserts that the dictionary covers every
+Chinese UI string in the source — a single missing entry silently falls back to Chinese,
+and nobody is going to count 660 strings by hand, so only a machine can check it.
+
+**Not done in this release**:
+
+- Notification channel names do not follow the language (Android platform limitation, above).
+- Text inside the lyric surfaces (status-bar overlay / desktop lyric window) is **not
+  translated** — it renders lyric content itself, which is remote data.
+- Lyric blur applies to the **expanded** view only. The collapsed three-line view has just
+  three lines with the current one in the middle, so stepped blur shows no hierarchy there —
+  it only makes the lines above and below harder to read, and those are exactly the
+  "what's coming next" preview.
+- On desktop only the window buttons are localised. Tauri runs a `decorations: false`
+  window, so the title bar is drawn by the page and there is no native menu to translate.
+- Chinese exception messages inside `ApkProvider` / `NeteaseClient` are not translated —
+  they travel internal error paths and never reach the user.
+
+---
+
 ## 1.3.4 — Eleventh Version
 
 > **Basis**: the 1.3.3 code review report from Deepseek V4.1 Flash 1017 (Hy4 Flash).
