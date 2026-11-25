@@ -42,8 +42,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  *      让服务端注销会话再清 cookie）；桥上的这个只清本地 cookie，语义还不完整。
  *    · mediaStop —— 撤通知的收尾由 MainActivity.onDestroy 兜住（前端从不调它，
  *      这是当初 E-06 那条「服务被 FGS 白养」的成因之一）。
- *    · lockLyricOverlay —— 浮层锁定状态由 showLyricOverlay 一次带下去，前端没有
- *      「运行中改锁定」的需求，MainActivity 侧也无内部调用方。
+ *    · lockLyricOverlay —— 桥上的入口删了（前端不需要），但**能力保留在原生内部**：
+ *      LyricOverlay.setLocked() 仍然存在且可用（H-14 修复后它是「改锁定」的
+ *      语义化入口）。前端改锁定走的是 showLyricOverlay 带 locked 参数那条路，
+ *      原生把它当「configure 后按 locked 重算窗口 flags」处理。
  *    · login / loginClose / loginFinish —— 1.3.0 起三端统一走扫码登录
  *      （普通命令通道 login_qr_key / login_qr_check），不再需要内嵌 WebView
  *      登录页；前端 Netease.login() 也已无调用方。详见下面那段说明。
@@ -62,8 +64,12 @@ public class HttpBridge {
      * Application.onCreate 里跑的，两者的初始化顺序不受我们控制；一旦常量先于
      * init 求值，渠道名就会永远钉死在中文。方法则每次建渠道时才取当前语言。
      *
-     * 注意：渠道名只在**首次创建**时生效（ensureChannel 里见已存在就 return），
-     * 所以切换语言后系统设置里旧渠道名不会跟着变 —— 这是 Android 的行为，不是漏改。
+     * H-8：切语言后**能**更新渠道名 —— 只要每次调 createNotificationChannel()。
+     * 官方文档写明它对已存在的渠道是「更新 name / description / group」，
+     * 只有 importance / sound / vibration 这些用户可改项会被忽略。
+     * 以前 ensureChannel 里写着 `if (ch != null) return;`，渠道存在就早退，
+     * 根本走不到 createNotificationChannel()，于是切语言后系统设置里的渠道名
+     * 永远是首次创建时那个语言。真正阻止更新的不是平台，就是那行 return。
      */
     private static String nameQuiet() {
         return L10n.t("Ripple 通知", "Ripple notifications");
@@ -201,10 +207,17 @@ public class HttpBridge {
      * quiet=true  → 低优先级 + 无声 + 不震动（不打断播放）
      * quiet=false → 默认重要度，会有提示音（对应设置里关掉「通知不打断播放」）
      * 之前这个开关只存在于 UI 上，原生侧永远是静默的，怎么点都没区别。
+     *
+     * L-16：Android 13+ 没授 POST_NOTIFICATIONS 时**返回 false**。
+     * NotificationManager.notify() 在没权限时不会抛异常，只是静默丢弃 ——
+     * 以前这里照样 return true，前端就弹「通知已发送 · 静默通道」，
+     * 而通知栏里什么都没有，用户完全不知道是自己没授权。
+     * 让返回值说实话，前端才能提示「去开通知权限」。
      */
     @JavascriptInterface
     public boolean notify(String title, String body, boolean quiet) {
         try {
+            if (!canPostNotifications()) return false;
             NotificationManager nm =
                     (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return false;
@@ -238,9 +251,17 @@ public class HttpBridge {
 
     /**
      * 把异常信息塞进一段手写的 JSON 字符串里。
+     *
      * 只替换反斜杠/引号/换行还不够：制表符、\u0000 之类的控制字符
      * 同样会让 JSON.parse 失败，于是「接口报错」变成「返回内容不是 JSON」，
      * 排查时看不到真正原因。这里把所有控制字符一起转义掉。
+     *
+     * M-13：U+2028 / U+2029 也必须转义。
+     * 它们在 JSON 规范里是合法字符串字符，但在 JavaScript 字符串字面量里
+     * 是**行终止符** —— 而这段文本后续会被 MainActivity.replyToWeb() 拼成
+     * JS 字面量交给 evaluateJavascript。只要错误消息里含这两个字符，
+     * 整段脚本就是语法错误 → 回调永远不会触发 → 前端只能干等到超时，
+     * 报的还是「请求超时」而不是真实原因。
      */
     private static String safe(Exception e) {
         String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
@@ -250,6 +271,7 @@ public class HttpBridge {
             if (c == '"') b.append("\\\"");
             else if (c == '\\') b.append("\\\\");
             else if (c < 0x20 || c == 0x7f) b.append(' ');
+            else if (c == '\u2028' || c == '\u2029') b.append(c == '\u2028' ? "\\u2028" : "\\u2029");
             else b.append(c);
         }
         return b.toString();
@@ -257,14 +279,22 @@ public class HttpBridge {
 
     private void ensureChannel() { ensureChannel(true); }
 
+    /**
+     * 建 / 更新通知渠道（幂等）。
+     *
+     * H-8：**不能**因为渠道已存在就 return。
+     * createNotificationChannel() 对已存在渠道的语义是「更新 name / description」，
+     * 这正是「切语言后渠道名跟着变」唯一的实现手段；只要提前 return，渠道名
+     * 就会永远停在首次创建时那个语言，且只有清数据/重装才能自愈。
+     * 每次调用的成本只是几次字符串拼接 + 一次 binder 调用，可以忽略。
+     */
     private void ensureChannel(boolean quiet) {
         if (Build.VERSION.SDK_INT < 26) return;
         NotificationManager nm =
                 (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return;
         String id = quiet ? CH_QUIET : CH_ALERT;
-        NotificationChannel ch = nm.getNotificationChannel(id);
-        if (ch != null) return;
+        NotificationChannel ch;
         if (quiet) {
             ch = new NotificationChannel(id, nameQuiet(), NotificationManager.IMPORTANCE_LOW);
             ch.setDescription(descQuiet());
@@ -275,7 +305,7 @@ public class HttpBridge {
             ch = new NotificationChannel(id, nameAlert(), NotificationManager.IMPORTANCE_DEFAULT);
             ch.setDescription(descAlert());
         }
-        nm.createNotificationChannel(ch);
+        nm.createNotificationChannel(ch);   // ← 每次都调：对已存在渠道即「改名」
     }
 
     /* ================= 多语言（1.3.5） ================= */
@@ -296,6 +326,23 @@ public class HttpBridge {
     public void setLang(String code) {
         try {
             L10n.setLang(ctx, code);
+            /*
+             * H-8：语言一变就立刻把两个渠道名/描述刷一遍。
+             *
+             * 不刷的话，系统设置 → 通知 → Ripple 里那三个渠道名会一直是旧语言，
+             * 而界面、Toast、通知栏按钮都已经切过去了 —— 同一个 App 里中英混排，
+             * 且这个状态永远不会自愈（除非清数据/重装）。
+             * ensureChannel 现在是幂等更新（见它的注释），重复调是安全的。
+             */
+            ensureChannel(true);
+            ensureChannel(false);
+            /*
+             * 播放通知的动作按钮标题（上一首/暂停/下一首/喜欢）不在渠道里，
+             * 而在 PlaybackService 的 MediaStyle 上，由它自己根据 L10n 重建；
+             * 这里通知它一次，让常驻通知不用等下一首歌才换成新语言（M-12 的配合项）。
+             */
+            PlaybackService svc = PlaybackService.get();
+            if (svc != null) svc.onLangChanged();
         } catch (Throwable ignored) {
         }
     }
@@ -362,20 +409,29 @@ public class HttpBridge {
      */
     @JavascriptInterface
     public boolean notifyGranted() {
+        return canPostNotifications();
+    }
+
+    /**
+     * 真正能不能发出一条通知（权限 + 系统总开关）。
+     *
+     * 抽出来给两处共用（L-16）：
+     *   · notifyGranted() —— 网页查状态；
+     *   · notify() —— 发之前先自检，没有权限就返回 false。
+     * 两处共用一个判定，避免「状态页说已授权、发送却静默失败」这种自相矛盾。
+     */
+    private boolean canPostNotifications() {
         try {
-            if (Build.VERSION.SDK_INT < 33) {
-                // Android 13 以下没有运行时通知权限，看通知总开关
-                NotificationManager nm =
-                        (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
-                return nm != null && nm.areNotificationsEnabled();
+            NotificationManager nm =
+                    (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null || !nm.areNotificationsEnabled()) return false;
+            /* Android 13 起多了运行时权限 POST_NOTIFICATIONS，总开关之外还要看它 */
+            if (Build.VERSION.SDK_INT >= 33
+                    && ctx.checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                       != PackageManager.PERMISSION_GRANTED) {
+                return false;
             }
-            if (ctx.checkSelfPermission("android.permission.POST_NOTIFICATIONS")
-                    == PackageManager.PERMISSION_GRANTED) {
-                NotificationManager nm =
-                        (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
-                return nm != null && nm.areNotificationsEnabled();
-            }
-            return false;
+            return true;
         } catch (Throwable e) {
             return false;
         }

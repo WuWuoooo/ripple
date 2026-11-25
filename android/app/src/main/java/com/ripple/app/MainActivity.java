@@ -417,12 +417,49 @@ public class MainActivity extends Activity {
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                     Uri u = request.getUrl();
-                    String scheme = u.getScheme() == null ? "" : u.getScheme();
+                    String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.US);
                     if ("file".equals(scheme) || "about".equals(scheme)) return false;
                     if (scheme.startsWith("http") && "localhost".equals(u.getHost())) return false;
+                    /*
+                     * L-13：javascript: / data: 直接拦掉。
+                     *
+                     * ACTION_VIEW 本来也不会执行 javascript:（不是代码执行漏洞），
+                     * 但它会去匹配浏览器 → 抛 ActivityNotFoundException →
+                     * 弹一句「没有可以打开该链接的应用」，用户看到的是莫名其妙的
+                     * 提示。这类 scheme 在本应用里没有任何合法用途，静默吞掉最合适。
+                     * data: 同理：整个页面自己就能渲染，交给外部应用只会更危险。
+                     */
+                    if ("javascript".equals(scheme) || "data".equals(scheme)) return true;
                     try {
-                        Intent it = new Intent(Intent.ACTION_VIEW, u);
+                        Intent it;
+                        if ("intent".equals(scheme)) {
+                            /*
+                             * L-13：intent:// 必须用 Intent.parseUri 解析。
+                             *
+                             * 直接 new Intent(ACTION_VIEW, Uri.parse("intent://..."))
+                             * 在多数 ROM 上会抛 ActivityNotFoundException ——
+                             * 因为目标 scheme 是 "intent"，没有任何应用声明处理它。
+                             * parseUri(..., URI_INTENT_SCHEME) 才会解出真实的
+                             * scheme / package / 参数，从而正确拉起目标 App。
+                             * 解析失败就静默返回 true（拦截），不弹无意义提示。
+                             */
+                            try {
+                                it = Intent.parseUri(u.toString(), Intent.URI_INTENT_SCHEME);
+                            } catch (Throwable e) {
+                                LogBridge.add(MainActivity.this, "NAV", "bad intent uri: " + u);
+                                return true;
+                            }
+                        } else {
+                            it = new Intent(Intent.ACTION_VIEW, u);
+                        }
                         it.addCategory(Intent.CATEGORY_BROWSABLE);
+                        /*
+                         * 从 WebView 里跳外部 Activity 必须带 NEW_TASK：
+                         * 这里没有 Activity 栈上下文，不带会抛
+                         * AndroidRuntimeException: Calling startActivity() from
+                         * outside of an Activity context requires FLAG_ACTIVITY_NEW_TASK。
+                         */
+                        it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         startActivity(it);
                     } catch (android.content.ActivityNotFoundException e) {
                         // 没有任何应用能打开这个链接：明确告诉用户，而不是点了没反应
@@ -791,6 +828,16 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 把字符串转成 JS 字面量。
+     *
+     * M-13：U+2028 / U+2029 必须显式转义。
+     * 它们在 JSON 里是合法字符，但在 **JavaScript 字符串字面量**里是行终止符 ——
+     * 直接原样写进 evaluateJavascript 的脚本就是语法错误，整段脚本不执行，
+     * 于是 window.__rippleNativeResult 永远不会被调用，前端只能等到超时，
+     * 而且报的是「请求超时」而不是真实原因。
+     * 网易云的错误消息里带上这两个字符并非不可能（内容字段来自上游）。
+     */
     private static String quote(String s) {
         if (s == null) return "null";
         StringBuilder b = new StringBuilder(s.length() + 16);
@@ -803,6 +850,8 @@ public class MainActivity extends Activity {
                 case '\n': b.append("\\n"); break;
                 case '\r': b.append("\\r"); break;
                 case '\t': b.append("\\t"); break;
+                case '\u2028': b.append("\\u2028"); break;
+                case '\u2029': b.append("\\u2029"); break;
                 default:
                     if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
                     else b.append(c);
@@ -1337,12 +1386,12 @@ public class MainActivity extends Activity {
         /*
          * 通知状态栏歌词浮层「App 已切到后台」。
          *
-         * 它必须知道这件事，因为驱动方式要换：
-         *   · 前台 → Choreographer（对齐 vsync，最顺）
-         *   · 后台 → Handler.postDelayed（不受 vsync 影响，照样跑）
-         * Choreographer 靠 vsync 驱动，而后台进程收不到 vsync，
-         * 不切的话外推会彻底停摆 —— 用户看到的就是
-         * 「只有换句那一下才填充」。
+         * 现在前后台**都用 Handler 驱动**（Choreographer 已在早期重构中删除，
+         * 见 LyricOverlay 里那句「Choreographer 相关字段已全部删除」）。
+         * 那为什么还要告诉浮层前后台？因为它在切驱动点会做一次
+         * stopTick() + scheduleTick()：重新排一次帧，顺带把可能已经断掉的
+         * 驱动链（例如暂停期间 return false 停掉的那条）拉起来。
+         * 这是浮层自己决定的，App 侧只负责把这个状态变化告诉它。
          */
         try {
             LyricOverlay o = LyricOverlay.peek();
@@ -1376,7 +1425,11 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         isForeground = true;
-        /* 回到前台：切回 Choreographer 驱动（见 onPause 里的说明） */
+        /*
+         * 回到前台：把状态同步给歌词浮层，让它重排一次驱动
+         * （前后台都用 Handler 驱动，Choreographer 已在早期重构中删除；
+         *   这个回调的实际作用是「重新 scheduleTick，把可能断掉的驱动链拉起来」）。
+         */
         try {
             LyricOverlay o = LyricOverlay.peek();
             if (o != null) o.setAppBackground(false);

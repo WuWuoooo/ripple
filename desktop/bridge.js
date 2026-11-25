@@ -34,6 +34,31 @@
    */
   const pending = new Map();
 
+  /* ================= 原生日志的 JS 侧缓冲 =================
+   *
+   * LOG_BUF 只保留**本次会话**（最多 400 行，与 app/js/log.js 的 MAX 一致）。
+   * 它是 logDump() 的返回值，用来在不碰文件系统的情况下让前端拿到
+   * 「刚才发生了什么」；完整历史在 Rust 写的 Ripple-log.txt 里。
+   *
+   * logFilePath 是启动时异步取回、之后缓存的路径：logPath() 必须同步返回
+   * （前端直接把返回值当结果用），所以不能现 invoke。
+   */
+  const LOG_BUF = [];
+  const LOG_MAX = 400;
+  let logFilePath = '(日志路径尚未就绪)';
+
+  function pushLog(line) {
+    LOG_BUF.push(line);
+    while (LOG_BUF.length > LOG_MAX) LOG_BUF.shift();
+  }
+
+  /* 启动时取一次日志路径。失败不抛 —— logPath 会返回占位串。 */
+  try {
+    invoke('log_path').then(function (p) {
+      if (p && typeof p === 'string') logFilePath = p;
+    }).catch(function () {});
+  } catch (e) {}
+
   const bridge = {
     /**
      * 网易云命令通道（与 Java 的 HttpBridge.netease 同签名）
@@ -71,8 +96,84 @@
     /** 系统通知：桌面端暂不支持，返回 false 让前端走降级路径 */
     notify: function () { return false; },
 
-    /** 是否提供通知能力（前端用 typeof 判断，这里给一个恒 false 的实现即可） */
-    mediaState: function () { return false; },
+    /*
+     * ===== 这里**故意没有** mediaState =====
+     *
+     * 以前这里有一个 `mediaState: function () { return false; }` 的占位实现，
+     * 看似「无害」，实际是个骗局：
+     *
+     *   · app/js/app.js 用 `typeof N.mediaState === 'function'` 判断
+     *     「有没有原生媒体通知能力」，占位实现让这个判定恒为 true；
+     *   · 于是设置页显示「通知栏 / 锁屏 / 耳机键可控」——
+     *     而桌面端根本没有 PlaybackService + MediaSession 这套东西，
+     *     用户去按耳机键、看锁屏，一个都不会动；
+     *   · 更糟的是它把真正的调用点也骗进去了：pushMediaState() 开头就是
+     *     这个 typeof 判定，通过之后会一路调到 N.mediaState(6 个参数)，
+     *     而占位实现是 0 参 —— 形状对不上，将来补真实现时会被这层假皮掩盖。
+     *
+     * 这与本文件末尾那段注释的告诫是同一句话：
+     * 「多造一个假实现反而会让 UI 显示支持但点下去没反应 —— 比不支持更糟」。
+     * 所以直接不提供：typeof 判定自然为 false，前端走它自己的降级文案，
+     * 桌面端也不再虚假承诺。
+     */
+
+    /* ================= 原生日志（桌面端排障的唯一取证手段） =================
+     *
+     * 为什么必须补：app/js/log.js 里所有原生调用都是 typeof 判空的，
+     * 桌面端以前五个方法一个都没有 → 全部走内存兜底 → 日志只活在页面里，
+     * **关掉窗口就没了**，用户报障时说「卡了一下」「刚才报错了」，
+     * 我们手上什么都没有。Android 那边有 LogBridge 写文件，桌面端不该是个黑洞。
+     *
+     * 实现分工（重要）：
+     *   · 落盘由 Rust 侧负责（invoke('log_write') 追加到 app_log_dir 下的
+     *     Ripple-log.txt）—— 这样窗口崩了、被强杀了，文件还在。
+     *   · logPath() / logDump() 必须是**同步返回**的（log.js 直接把返回值
+     *     当结果用，不是 await），所以这两个不能 invoke。这里的做法是：
+     *     logPath 返回启动时向 Rust 取回并缓存下来的路径；
+     *     logDump 返回本会话累积在 JS 里的文本。
+     *     换句话说：文件里是全量历史，logDump 是「本次会话」——
+     *     这个差别在 README 的「日志」一节里写明了，不假装两者等价。
+     */
+    log: function (tag, msg) {
+      const line = String(tag == null ? '' : tag) + ': ' + String(msg == null ? '' : msg);
+      pushLog(line);
+      invoke('log_write', { line: line }).catch(function () {});
+    },
+    logFlush: function () {
+      /* Rust 侧每行都是 append + 立即落盘，没有用户态缓冲要刷。
+         保留这个方法是为了满足前端的形状（它会 typeof 判空后调用），
+         返回 true 表示「确实没有待刷内容」，而不是假装刷了。 */
+      invoke('log_flush').catch(function () {});
+      return true;
+    },
+    logPath: function () { return logFilePath; },
+    logDump: function () { return LOG_BUF.join('\n'); },
+    jsError: function (msg, stack) {
+      const line = 'JS-ERROR: ' + String(msg == null ? '' : msg)
+        + (stack ? '\n' + String(stack) : '');
+      pushLog(line);
+      invoke('log_write', { line: line }).catch(function () {});
+    },
+
+    /**
+     * 系统是否处于深色外观（1.3.5 · 桌面端「跟随系统」主题）。
+     *
+     * 前端 app.js 用 N.systemDark() 读系统开关，拿不到就退回 CSS 媒体查询——
+     * 而 Tauri 的 WebView 里 prefers-color-scheme **不跟系统设置走**
+     * （Linux 上取决于 GTK 主题、Windows 上取决于 WebView2 的默认值），
+     * 所以桌面端以前选「跟随系统」实际永远是浅色。
+     *
+     * 这里直接问 WebView 的媒体查询：Tauri 2 的 WebView 会把它桥接到
+     * 系统外观（Windows WebView2 与 Linux WebKitGTK 都支持），
+     * 比在 Rust 侧读注册表 / gsettings 更少平台分支，也没有新依赖。
+     */
+    systemDark: function () {
+      try {
+        return !!(g.matchMedia && g.matchMedia('(prefers-color-scheme: dark)').matches);
+      } catch (e) {
+        return false;
+      }
+    },
 
     /* ================= 歌词窗（状态栏歌词的桌面端对等物） =================
      *

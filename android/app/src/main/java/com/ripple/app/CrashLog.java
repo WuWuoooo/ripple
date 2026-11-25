@@ -75,6 +75,13 @@ final class CrashLog {
      *
      * 现在错误日志用 err- 前缀、独立保留 ERR_KEEP_FILES 份，
      * 两套配额互不侵占；崩溃文件永远留着。
+     *
+     * H-16：**下载目录那份当时没跟着改**（这一版补上）。
+     * 下载目录里错误日志与真崩溃共用 "Ripple-crash-" 前缀和同一个 10 份配额，
+     * 而下载目录才是用户/排查者真正翻得到的那份（/sdcard/Download 直接可见）——
+     * 一次歌词浮层的持续报错就能把真崩溃现场挤出去。
+     * 现在下载目录用 "Ripple-err-" 独立前缀、独立 ERR_KEEP_FILES 配额，
+     * 与私有目录的模式完全一致（见 writeDownloads / pruneDownloadFiles）。
      */
     private static final int ERR_KEEP_FILES = 20;
     /** 幂等标记：装过就不再装第二次（否则会形成链式 handler + 重复写文件） */
@@ -266,9 +273,9 @@ final class CrashLog {
         }
         post(() -> {
             try {
-                /* AND-04：非崩溃错误用 err- 前缀，与真崩溃的配额隔离 */
+                /* AND-04 / H-16：非崩溃错误在**两个落点**都用 err 前缀，与真崩溃的配额隔离 */
                 writePrivate(app, tag, text, "err-");
-                writeDownloads(app, tag, text, false);
+                writeDownloads(app, tag, text, false, "Ripple-err-");
             } catch (Throwable ignored) {
             }
         });
@@ -288,7 +295,7 @@ final class CrashLog {
          */
         synchronized (IO_LOCK) {
             writePrivate(ctx, tag, text);
-            writeDownloads(ctx, tag, text, false);
+            writeDownloads(ctx, tag, text, false, "Ripple-crash-");
         }
         return text;
     }
@@ -307,7 +314,7 @@ final class CrashLog {
          * "version: x.y.z (" + NNN + ")"：android/sync-version.sh 用 sed 同步它，
          * CI 也用 grep -F 校验这一串，改成别的写法会让构建直接失败。
          */
-        String fallbackVersion = "version: 1.3.5 (" + 135 + ")";
+        String fallbackVersion = "version: 1.3.6 (" + 136 + ")";
         String realVersion = versionOf(ctx);
         pw.println(realVersion == null ? fallbackVersion : "version: " + realVersion);
         pw.println();
@@ -415,9 +422,23 @@ final class CrashLog {
      * @param overwrite true 时固定文件名并覆盖（轨迹 / 退出原因只留最新一份）
      */
     private static void writeDownloads(Context ctx, String tag, String text, boolean overwrite) {
+        writeDownloads(ctx, tag, text, overwrite, "Ripple-crash-");
+    }
+
+    /**
+     * 写下载目录。
+     *
+     * @param prefix 非覆盖写时的文件名前缀（H-16）：
+     *               "Ripple-crash-" = 真崩溃（配额 MAX_CRASH_FILES=10）；
+     *               "Ripple-err-"   = 非崩溃错误（配额 ERR_KEEP_FILES=20，独立清理）。
+     *               前缀是清理逻辑唯一的判据，所以两套配额互不侵占 ——
+     *               与私有目录那份（crash- / err-）保持同一套设计。
+     */
+    private static void writeDownloads(Context ctx, String tag, String text,
+                                       boolean overwrite, String prefix) {
         String name = overwrite
                 ? "Ripple-" + safe(tag) + ".txt"
-                : "Ripple-crash-" + stamp() + "-" + safe(tag) + ".txt";
+                : prefix + stamp() + "-" + safe(tag) + ".txt";
         byte[] data;
         try {
             data = text.getBytes("UTF-8");
@@ -427,8 +448,19 @@ final class CrashLog {
         // 落点逻辑收敛到 PublicFile（以前和 LogBridge 各抄一份）
         PublicFile.write(ctx, name, data, overwrite);
         if (!overwrite) {
-            prunePrivateCrashFiles(ctx);
-            pruneDownloadCrashFiles(ctx);
+            /*
+             * H-16：按前缀走各自的淘汰逻辑。
+             * 以前这里无条件同时清 crash 相关的两个池子，而下载目录里
+             * 错误日志也带 "Ripple-crash-" 前缀 → 两者挤同一个 10 份配额。
+             * 现在错误日志写 "Ripple-err-"，只清错误池；崩溃只清崩溃池。
+             */
+            if ("Ripple-err-".equals(prefix)) {
+                prunePrivateErrFiles(ctx);
+                pruneDownloadFiles(ctx, "Ripple-err-", ERR_KEEP_FILES);
+            } else {
+                prunePrivateCrashFiles(ctx);
+                pruneDownloadFiles(ctx, "Ripple-crash-", MAX_CRASH_FILES);
+            }
         }
     }
 
@@ -487,14 +519,20 @@ final class CrashLog {
     }
 
     /**
-     * 下载目录里的崩溃文件同样只留最近 MAX_CRASH_FILES 份。
+     * 下载目录里的取证文件按前缀分池清理（H-16）。
      *
      * 私有目录那份清掉了，但这才是用户真正能翻到、也真正会越攒越多的那份
      * （proot 里 /sdcard/Download 直接可见）。以前一个都不会删。
      * 用 MediaStore 按 DISPLAY_NAME 前缀查询，取出来按名字排序后删最老的。
+     *
+     * @param prefix 文件名前缀，同时也是**配额的作用域**：
+     *               "Ripple-crash-" 留 keep 份真崩溃、"Ripple-err-" 留 keep 份错误日志。
+     *               两池互不侵占 —— 故障期的错误刷屏不会再把真崩溃报告挤出去。
+     * @param keep   该池保留份数
      */
-    private static void pruneDownloadCrashFiles(Context ctx) {
-        if (Build.VERSION.SDK_INT < 29) return;   // 29 以下兜底目录由 prunePrivateCrashFiles 思路覆盖
+    private static void pruneDownloadFiles(Context ctx, String prefix, int keep) {
+        if (Build.VERSION.SDK_INT < 29) return;   // 29 以下兜底目录由私有目录那套思路覆盖
+        if (prefix == null || prefix.isEmpty()) return;
         try {
             android.content.ContentResolver cr = ctx.getContentResolver();
             android.database.Cursor c = cr.query(
@@ -503,7 +541,7 @@ final class CrashLog {
                             android.provider.MediaStore.MediaColumns._ID,
                             android.provider.MediaStore.MediaColumns.DISPLAY_NAME},
                     android.provider.MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?",
-                    new String[]{"Ripple-crash-%"}, null);
+                    new String[]{prefix + "%"}, null);
             if (c == null) return;
             // (名字, id) 收起来一次处理，别在游标打开时做删除
             java.util.List<String[]> rows = new java.util.ArrayList<>();
@@ -514,13 +552,13 @@ final class CrashLog {
             } finally {
                 c.close();
             }
-            if (rows.size() <= MAX_CRASH_FILES) return;
+            if (rows.size() <= keep) return;
             rows.sort((a, b) -> {
                 String na = a[0] == null ? "" : a[0];
                 String nb = b[0] == null ? "" : b[0];
                 return nb.compareTo(na);      // 新 → 旧
             });
-            for (int i = MAX_CRASH_FILES; i < rows.size(); i++) {
+            for (int i = keep; i < rows.size(); i++) {
                 try {
                     android.net.Uri u = android.content.ContentUris.withAppendedId(
                             android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,

@@ -314,8 +314,19 @@ final class UpdateChecker {
                 /*
                  * 大小校验：弱网下截断的 APK 装上去会直接崩，
                  * 而用户只会觉得「更新完就坏了」。这一步不能省。
+                 *
+                 * H-15：错误文案里的字节数**必须用删除之前的真实值**。
+                 * 以前写的是 dst.length() != expectSize → delete() → 文案里
+                 * 再读一次 dst.length()，而 File.length() 对已删除的文件返回 0 ——
+                 * 用户看到的永远是「下载不完整（0/12345678 字节）」，
+                 * 「实际收到多少」这个唯一有用的诊断信息被代码自己抹掉了。
+                 * 这个 bug 从 1.3.4 就在，1.3.5 只在外面套了 L10n.t 没修根因。
+                 *
+                 * 这里直接用循环里累计的 got（实际写进文件的字节数）——
+                 * 它比 dst.length() 更准：既反映真实收到量，又不依赖文件系统
+                 * 在这一刻把数据刷到磁盘（fuse / 某些 ROM 上 length 可能滞后）。
                  */
-                if (expectSize > 0 && dst.length() != expectSize) {
+                if (expectSize > 0 && got != expectSize) {
                     //noinspection ResultOfMethodCallIgnored
                     dst.delete();
                     /*
@@ -324,8 +335,8 @@ final class UpdateChecker {
                      * 数字和单位保持阿拉伯数字，中英两版都读得通。
                      */
                     throw new java.io.IOException(L10n.t(
-                            "下载不完整（" + dst.length() + "/" + expectSize + " 字节）",
-                            "Download incomplete (" + dst.length() + "/" + expectSize + " bytes)"));
+                            "下载不完整（" + got + "/" + expectSize + " 字节）",
+                            "Download incomplete (" + got + "/" + expectSize + " bytes)"));
                 }
                 /* 至少得比一个正常 APK 大，防止下到错误页面（比如 HTML 错误页） */
                 if (dst.length() < 100 * 1024) {

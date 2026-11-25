@@ -37,7 +37,19 @@ jobs:
       - name: JS 语法检查
         run: |
           fail=0
-          for f in app/js/*.js app/sw.js server.js; do
+          # M-7：glob 必须覆盖**子目录**与根目录的其它脚本。
+          #
+          # 以前只写 app/js/*.js app/sw.js server.js，漏了两类：
+          #   · app/js/lang/*.js —— 语言包在子目录里，* 不跨目录。
+          #     它是 1.3.5 新增的 700+ 行词典，英文界面的单点。
+          #     一个语法错误会让整个英文界面失效，而 CI 当时是绿的。
+          #   · server-security.js —— Host 白名单 / 同源判定 / 令牌有效期的
+          #     唯一实现，server.js require 它；它有语法错误时 server.js
+          #     在 require 阶段直接崩，而 CI 同样不会红。
+          # 加新脚本时如果放在别的目录，记得同步这一行（或者改成 find）。
+          for f in app/js/*.js app/js/lang/*.js app/sw.js server.js server-security.js \
+                   desktop/bridge.js scripts/*.js tests/*.js; do
+            [ -f "$f" ] || continue
             echo "→ $f"
             node --check "$f" || fail=1
           done

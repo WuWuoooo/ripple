@@ -66,9 +66,31 @@ bash android/build-apk.sh
 | `android/app/src/main/java/com/ripple/app/RippleApp.java` | 启动日志里的 `version=$VN($VC)` | `version.json` |
 | `app/js/version.js` | `{ code: $VC, name: '$VN' }`（「关于」弹窗显示） | `version.json` |
 | `app/sw.js` | 第一行 `const CACHE = 'ripple-$VC';`（注意**没有 v 前缀**） | `version.json` 的 `versionCode` |
+| `desktop/src-tauri/tauri.conf.json` | Tauri 配置的 `version` | `version.json` |
+| `desktop/src-tauri/Cargo.toml` | `[package]` 段里的 `version`（**不是文件第一处** `version =`，见下） | `version.json` |
+| `desktop/src-tauri/Cargo.lock` | `ripple-desktop` 那个 `[[package]]` 块的 `version` | `version.json` |
+
+共 **8 处副本**。这份清单在三个地方必须一致，`node scripts/check-manifest-consistency.js`
+的 `[G]` 项会逐一比对：
+
+1. 本表（文档侧）
+2. `android/sync-version.sh` 的 `SYNC_TARGETS` 数组（同步侧：真正被写的是哪些文件）
+3. `scripts/version-facts.js` 的 `COPIES`（检查侧：真正被解析的是哪些文件）
+
+加新副本时三处都要改。只改一处会让 `[G]` 直接红 —— 这正是 1.3.5 的 H-5
+（checker 查 4 处、同步脚本写 8 处，名单漂移了也没人发现）的机器防护。
+
+> **`Cargo.toml` 的坑（1.3.5 的 B-1）**：`version` 是 TOML 里**任何表**都合法的键，
+> 所以「文件里第一处 `^version =`」不一定是 `[package].version`。
+> 只要在 `[package]` 之前多一个带 `version` 的表，按第一处同步就会静默写到错误的表，
+> 而 `[package].version` 永远停在旧值 —— 桌面安装包的版本号就是旧的，
+> 而三处检查会**同时报绿**（因为检查和写共用同一个错误判据）。
+> 现在解析统一走 `scripts/version-facts.js`，它先切 `[package]` 段再取 `version`。
 
 这些替换都带断言：锚点找不到或替换后对不上就直接报错退出，不会静默产出一个
-版本号不一致的包。CI 也会再校验一遍，不一致直接失败。
+版本号不一致的包。同步脚本收尾还会调 `node scripts/version-facts.js --assert`
+做一次**独立实现**的复核（独立才叫外部校验：判据本身错了时才查得出来）。
+CI 也会再校验一遍，不一致直接失败。
 
 ### 改了前端之后...
 

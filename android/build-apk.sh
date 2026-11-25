@@ -103,12 +103,21 @@ if ! "$BT/aapt2" dump packagename "$OUT/base.apk" 2>/dev/null | grep -q "$PKG"; 
 fi
 
 echo "[4/7] javac"
+# L-8：用 mapfile 读成数组再展开，不用裸露的 $(find ...)。
+#
+# 裸命令替换会做 word splitting + glob 展开，路径里只要有空格（Windows 上
+# "C:\\Program Files\\..." 很常见）就会被拆成多个参数，编译报一堆
+# "file not found"。当前仓库路径没空格所以不触发，但这是一枚埋着的雷 ——
+# 而踩到它的人会在完全无关的报错里迷路。
+# -print0 + read -d '' 是 bash 里唯一对任意文件名都安全的写法。
+mapfile -d '' JAVA_SRCS < <(find "$HERE/app/src/main/java" "$OUT/gen" -name '*.java' -print0)
 javac -encoding UTF-8 -nowarn -source 17 -target 17 -classpath "$JAR" -d "$OUT/classes" \
-  $(find "$HERE/app/src/main/java" "$OUT/gen" -name '*.java')
+  "${JAVA_SRCS[@]}"
 
 echo "[5/7] d8"
+mapfile -d '' CLASS_FILES < <(find "$OUT/classes" -name '*.class' -print0)
 "$D8BT/d8" --lib "$JAR" --min-api 24 --output "$OUT/dex" \
-  $(find "$OUT/classes" -name '*.class')
+  "${CLASS_FILES[@]}"
 
 echo "[6/7] 合并 dex + zipalign"
 cd "$OUT"
@@ -138,6 +147,27 @@ fi
 "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
   --ks-key-alias androiddebugkey --out "Ripple-$VN-debug.apk" aligned.apk
 "$BT/apksigner" verify --print-certs "Ripple-$VN-debug.apk" | head -3
+
+# ---------- M-3：校验产物里的版本号 == version.json ----------
+#
+# 为什么必须查：aapt2 link 是拿 --version-code/--version-name 传进去的，
+# 正常情况下当然一致。但这里以前**从不回读产物**，于是任何一处参数传错、
+# 或者将来加了混淆/多 ABI 分包之类的改动，产物版本号错了 CI 也全绿。
+# 用户装上去的后果是 INSTALL_FAILED_UPDATE_INCOMPATIBLE（versionCode 变低）
+# 或者「装了但没更新」——两种都极难从现象倒推。
+#
+# 这是「断言与写入共用同一判据」的又一处：链接参数是我们传的，
+# 所以必须从**产物**里读回来比，而不是相信我们传对了。
+BADGING="$("$BT/aapt2" dump badging "Ripple-$VN-debug.apk" 2>/dev/null | head -1)"
+if ! printf '%s' "$BADGING" | grep -q "versionCode='$VC'"; then
+  echo "❌ 产物 versionCode 不是 $VC（实际：$BADGING）" >&2
+  exit 1
+fi
+if ! printf '%s' "$BADGING" | grep -q "versionName='$VN'"; then
+  echo "❌ 产物 versionName 不是 $VN（实际：$BADGING）" >&2
+  exit 1
+fi
+echo "[ok] 产物版本校验通过：versionCode=$VC versionName=$VN"
 
 echo
 echo "✅ 完成：$OUT/Ripple-$VN-debug.apk  ($(du -h "Ripple-$VN-debug.apk" | cut -f1))"

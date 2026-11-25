@@ -58,9 +58,8 @@ final class NeteaseClient {
     /**
      * 请求锁：**整条 POST 串行化**。
      *
-     * 以前 post() 只在 setCookie 里加了 synchronized，而
      * 「带上当前 cookie 发请求 → 读响应头里的 Set-Cookie → 合并回 cookie」
-     * 这一整段在锁外 —— 两个并发请求各自拿到旧 cookie 快照，
+     * 这一整段必须串行，否则两个并发请求各自拿到旧 cookie 快照，
      * 后写回的会把另一个刚更新的会话 cookie（比如 MUSIC_U 刷新）整个盖掉。
      * 网页侧一次刷新会同时打 status / likelist / playlist 好几个命令，
      * 撞上的概率不低。
@@ -73,14 +72,14 @@ final class NeteaseClient {
     /**
      * cookie 字段的轻量锁 —— 只保护「赋值」这几纳秒，**绝不包裹网络 I/O**。
      *
-     * 为什么必须分开：post() 持 REQ_LOCK 最长 30 秒（connect 12s + read 18s），
-     * 而 setCookie() 是从**主线程**调进来的（MainActivity.harvestLogin 拿到
-     * MUSIC_U 后立刻调）。如果 setCookie 也要抢 REQ_LOCK，网络一慢主线程就
-     * 被冻住几十秒 —— 直接 ANR。
+     * 当前唯一的写入口是 clearCookie()（登出）；读侧 isLoggedIn / getCookie
+     * 直接读 volatile 字段，不进锁。与 REQ_LOCK 分开是为了让主线程上的
+     * 「清登录态」不必等一条最长 30 秒的 POST（connect 12s + read 18s）——
+     * 那会直接 ANR。
      *
-     * 两者的一致性：cookie 是 volatile 的，赋值本身原子；setCookie 每次
-     * 递增 cookieGen，absorbCookies 合并前先比对，发现期间有更新的登录态
-     * 就放弃这次合并（让 setCookie 赢，那才是真正来自登录页的新 cookie）。
+     * 两者的一致性：cookie 是 volatile 的，赋值本身原子；写 cookie 时递增
+     * cookieGen，absorbCookies 合并前先比对，发现期间有更新的登录态
+     * 就放弃这次合并（让更新的那份赢，避免用旧响应把新会话盖回去）。
      */
     private final Object COOKIE_LOCK = new Object();
     private volatile int cookieGen = 0;
@@ -92,13 +91,6 @@ final class NeteaseClient {
 
     String getCookie() {
         return cookie;
-    }
-
-    void setCookie(String raw) {
-        synchronized (COOKIE_LOCK) {
-            cookieGen++;
-            applyCookie(raw == null ? "" : raw);
-        }
     }
 
     /**
@@ -238,8 +230,8 @@ final class NeteaseClient {
      * 把响应里的 Set-Cookie（登录成功后就是 MUSIC_U 等）合并进本地 cookie。
      *
      * 调用时已经持有 REQ_LOCK（所以不会有第二个 post 并发合并），
-     * 但主线程的 setCookie（登录页收割）可能中途插进来 ——
-     * 那种情况必须让 setCookie 赢：它带的是用户刚登录成功的新 cookie。
+     * 但主线程的 clearCookie（登出）可能中途插进来 ——
+     * 那种情况必须让清空赢：用户刚点了退出，不能拿旧响应把会话写回来。
      * 所以这里先记一个 cookieGen 快照，合并完发现变了就整段丢弃。
      */
     private void absorbCookies(HttpURLConnection conn) {
@@ -265,7 +257,7 @@ final class NeteaseClient {
         }
         if (!changed) return;
         synchronized (COOKIE_LOCK) {
-            // 期间有登录页写入了更新的 cookie：放弃这次合并，别把它盖回旧值
+            // 期间 cookie 被清空/更新过：放弃这次合并，别把旧会话盖回去
             if (cookieGen != gen) return;
             applyCookie(joinCookie(jar));
         }
@@ -438,7 +430,17 @@ final class NeteaseClient {
             // 原 raw 命令（网页可传任意 /weapi/ 路径）已删除：前端从未使用，留着等于
             // 一旦页面被注入就能以用户身份调用任意接口（含改歌单、改资料等写操作）。
             default:
-                return "{\"code\":-2,\"msg\":\"未知命令 " + cmd + "\"}";
+                /*
+                 * L-17：用 JSONObject 构造，不要手拼字符串。
+                 * cmd 来自网页（HttpBridge.netease 的第一个参数），**没有任何转义** ——
+                 * 以前 `"未知命令 " + cmd + "\""` 只要 cmd 里带一个引号或反斜杠，
+                 * 返回的就是非法 JSON → 前端 JSON.parse 抛「返回内容不是 JSON」，
+                 * 真正的「未知命令」原因被掩盖。JSONObject.put 会正确转义。
+                 */
+                JSONObject unknown = new JSONObject();
+                unknown.put("code", -2);
+                unknown.put("msg", "未知命令 " + cmd);
+                return unknown.toString();
         }
     }
 

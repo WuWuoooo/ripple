@@ -19,7 +19,10 @@
    *
    * 为什么在这里再包一层而不是到处写 window.I18n.T：
    *   ① app.js 里 20 多处要带插值拼串，每次都写 window.I18n 太长，
-   *      写成 TT('共 {n} 首', {n: 3}) 才读得下去；
+   *      写成 TT('新增 {n} 首', {n: 3}) 才读得下去；
+   *      （示例里的键必须是 en.js 里真有的条目 —— 拿一个不存在的键举例，
+   *       照着写的人会得到一个「整串不命中 → 回落中文」的中英混排文案，
+   *       而且从界面上根本看不出是漏了词条还是写错了模板。）
    *   ② i18n.js 有可能加载失败（将来被某个构建剪掉、或者离线缓存缺文件），
    *      这时 TT 必须退化成「原样返回中文」而不是抛异常 ——
    *      一个翻译模块的问题不该让整个播放器白屏。
@@ -963,7 +966,13 @@
     updateDock();
     renderNP();
     const mb = (Store.localTracks.reduce((a, t) => a + (t.size || 0), 0) / 1048576).toFixed(1);
-    $('#storageHint').textContent = Store.localTracks.length + ' 首 · ' + mb + ' MB';
+    /*
+     * 整串走 TT() 模板，不要用「数量 + 中文片段」拼出来。
+     *
+     * i18n 的片段匹配只做首尾两端，而「 首」在这种拼接里落在串中间，
+     * 整串在词典里又命中不了 → English 下这一行仍是「12 首 · 3.5 MB」。
+     */
+    $('#storageHint').textContent = TT('{n} 首 · {mb} MB', { n: Store.localTracks.length, mb });
     updateAccountCard();
   }
 
@@ -3339,7 +3348,17 @@
       const prevFocus = _lyricFocusNode;
       if (prevFocus && prevFocus !== rows[focus]) clearKaraoke(prevFocus);
       _lyricFocusNode = rows[focus];
-      setKaraoke(rows[focus], LF.lineProgress(lyricLines, i, t, Player.duration()));
+      /*
+       * 先判 !LF，与 applyMiniKaraoke 开头、状态栏那处保持同一条口径。
+       *
+       * 这里以前是全文件三个 LF 调用点里唯一没判空的那个：lyricfill.js
+       * 加载失败时（离线首开、缓存缺文件）LF 是 null（见文件顶部 const LF
+       * 的注释），而 syncLyric 每 100ms 被 Player.on('time') 调一次 ——
+       * 于是歌词染色不是优雅降级，而是每 100ms 一条 TypeError，还连带
+       * 让本函数后面的模糊标记与滚动校正都跑不到。
+       * 只跳过染色这一句：换句高亮、模糊深度、滚动都不依赖 LF。
+       */
+      if (LF) setKaraoke(rows[focus], LF.lineProgress(lyricLines, i, t, Player.duration()));
     }
     /*
      * 歌词模糊（1.3.5）：每一行按「离当前句多远」标深度。
@@ -4469,7 +4488,7 @@
       Player.queueSet(queue, 0);
       renderQueue();
       syncModeButtons();
-      toast('心动模式已开启', queue.length + ' 首 · 按口味生成', 'heart');
+      toast('心动模式已开启', TT('{n} 首 · 按你的口味生成', { n: queue.length }), 'heart');
     } catch (e) {
       /*
        * 失败时**不能**硬把 playMode 改成 'list'。
@@ -4735,7 +4754,7 @@
         <div class="bd">
           <b>${esc(c.user)}</b>
           <p>${esc(c.content)}</p>
-          <small>${fmtN(c.liked)} 赞</small>
+          <small>${esc(TT('{n} 赞', { n: fmtN(c.liked) }))}</small>
         </div>
       </div>`;
     const hot = data.hot.length
@@ -5166,6 +5185,17 @@
     syncSegAria('#themeSeg', s.theme, 'theme');
     $$('#fadeSeg button').forEach((b) => b.classList.toggle('on', +b.dataset.fade === +s.fade));
     syncSegAria('#qualitySeg', s.quality, 'q');
+    /*
+     * 「界面语言」分段控件也归这里管。
+     *
+     * 它是 renderLangSeg() 按 I18n.list() 动态生成的，以前只有
+     * applyLangSetting() / setLang() 这两个「语言变更」入口会调它 ——
+     * 于是任何整体替换 settings 的路径（典型是「恢复默认设置」）都会留下一份
+     * 与实际语言不一致的控件状态。syncSettingsUI 本来就是「把设置值落到 DOM」
+     * 的唯一入口，这条最该在这里，而不是要求每个调用方自己记得补一刀。
+     * renderLangSeg 内部按签名短路，签名没变时一次 DOM 都不碰。
+     */
+    renderLangSeg();
     /* 画面性能档位：读 RipplePerf 的真实状态（它还有一档是「实测帧率后自动降级」，
        所以不能只看 localStorage，要看 html 上实际挂着的类）。 */
     const perfMode = (window.RipplePerf && RipplePerf.mode()) || 'auto';
@@ -5209,17 +5239,36 @@
     syncSbOverlay();
     syncNotifyPermUI();
     /*
+     * 桌面端（Windows / Linux）的显式平台标记。
+     *
+     * 这个常量必须定义在**用到它的第一处之前**（const 有 TDZ，写在后面会抛
+     * ReferenceError），而且整个 syncSettingsUI 里只做这一次判定 —— 下面
+     * 三处「桌面端不该有的东西」都复用它，避免各写各的判据漂移。
+     *
+     * 判据用 bridge.js 显式给的 platform 标记，不做能力探测：
+     * 桌面桥为了「前端零改动」把方法都造出来了（只是返回 false / 空实现），
+     * 探测会被占位实现骗到。Android 侧没有这个字段 → undefined → 不隐藏。
+     */
+    const isDesktop = !!(window.RippleNative && window.RippleNative.platform === 'desktop');
+    /*
      * APK 内的媒体通知由原生 PlaybackService 提供（前台服务 + MediaSession），
      * 跟浏览器的 navigator.mediaSession 是两套东西。
      * 之前这里只看网页 API，于是在 APK 里也显示「此浏览器不支持」，
      * 而实际上通知栏控件一直是好的。
+     *
+     * 但光看 typeof 也不够：桌面桥曾经也提供过一个恒返回 false 的 mediaState
+     * 占位实现，typeof 判定会被它骗到 → 桌面端显示「通知栏 / 锁屏 / 耳机键可控」，
+     * 而桌面端根本没有 PlaybackService + MediaSession，按媒体键、锁屏都没有
+     * 任何控件可动。承诺一个不存在的能力比老实说不支持更糟，所以先按显式
+     * platform 排除桌面端，再判 typeof。
      */
-    const hasNativeMedia = !!(window.RippleNative && typeof window.RippleNative.mediaState === 'function');
+    const hasNativeMedia = !isDesktop
+      && !!(window.RippleNative && typeof window.RippleNative.mediaState === 'function');
     $('#mediaHint').textContent = hasNativeMedia
       ? '通知栏 / 锁屏 / 耳机键可控'
       : (('mediaSession' in navigator) ? '锁屏 / 通知中心显示' : '此环境不支持');
     /*
-     * 桌面端（Windows / Linux）隐藏「通知与后台」里只能手机上用的几项。
+     * 桌面端隐藏「通知与后台」里只能手机上用的几项。
      *
      * 这几项都依赖 Android 的原生能力：
      *   · 通知栏播放控件 —— 靠 PlaybackService 的前台服务 + MediaSession
@@ -5229,11 +5278,8 @@
      * 桌面端浏览器/WebView 里它们要么无效、要么永远显示「未授权」，
      * 留着只会让人以为坏了。
      *
-     * 判据用 bridge.js 显式给的 platform 标记，不做能力探测：
-     * 桌面桥为了「前端零改动」把方法都造出来了（只是返回 false），
-     * 探测会被占位实现骗到。Android 侧没有这个字段 → undefined → 不隐藏。
+     * 判据见上面 isDesktop 的定义（显式 platform 标记，不做能力探测）。
      */
-    const isDesktop = !!(window.RippleNative && window.RippleNative.platform === 'desktop');
     [
       'rowMediaSession',   // 通知栏播放控件
       'rowNotifyQuiet',    // 通知不打断播放
@@ -5490,7 +5536,7 @@
         App.context = queue;
         playTrack(queue[0], queue);
         openNP();
-        toast('漫游已开启', queue.length + ' 首 · 会一直续下去', 'infinite');
+        toast('漫游已开启', TT('{n} 首 · 会一直续下去', { n: queue.length }), 'infinite');
       } catch (e) {
         toast('漫游开启失败', e.message, 'warn');
         Log.err('ROAM', e, 'hero play');
@@ -6232,6 +6278,25 @@
       toast(m === 'high' ? '已切到高画质' : m === 'low' ? '已切到省电' : '已交给自动判断',
         low ? '当前：关闭毛玻璃、减少模糊' : '当前：毛玻璃与模糊全部开启', 'info');
     });
+    /*
+     * 画面档位变化的被动通知（perf.js 的 apply() 翻转 perf-low 时发）。
+     *
+     * 为什么要单独一条通路：上面 perfSeg 的 handler 只覆盖「用户在设置页手动改」，
+     * 而 perf.js 还有一条**自动降级**的路径（measure() 实测帧率偏低，
+     * 启动几秒后自己把 perf-low 挂上，不经过任何设置页交互）。
+     * 那条路径以前谁都不通知，于是低配已经生效、html.lyr-blur 却还挂着 ——
+     * 每一行歌词仍是一个独立合成层，正是低配本该省掉的那笔开销。
+     *
+     * 这里只做两件事，不重建任何列表（自动降级发生在播放中，
+     * 重建队列/歌词列表会打断正在看的界面）：
+     *   · applyLyricBlur()：按新档位挂/撤 lyr-blur 并重标模糊深度；
+     *   · syncSettingsUI()：低配相关行的显隐、档位提示文案与分段控件状态。
+     * 两条都各自幂等，重复触发没有副作用。
+     */
+    document.addEventListener('ripple:perf', () => {
+      try { applyLyricBlur(); } catch (e) { Log.err('PERF', e, 'applyLyricBlur'); }
+      try { syncSettingsUI(); } catch (e) { Log.err('PERF', e, 'syncSettingsUI'); }
+    });
     $$('[data-set]').forEach((el) => {
       if (el.classList.contains('sw')) {
         el.addEventListener('click', () => {
@@ -6352,10 +6417,26 @@
       const keepTrack = S().lastTrackId;
       const keepPos = S().lastPosition;
       const keepQueue = S().lastQueue;
+      /*
+       * 语言**不属于**「主题与播放选项」，不能跟着一起重置。
+       *
+       * 以前整份 settings 换成 DEFAULTS 时把 lang 也带回了 'zh'，而这条路径
+       * 既没通知 I18n 引擎、也没重建「界面语言」分段控件，于是留下两种互斥的
+       * 错误状态：界面还停在 English，存档里已经是 zh —— 用户当下看不出异常，
+       * 要等下次启动才突然变中文，属于无法解释的现象。
+       *
+       * 这里先保住语言值，让它和续播位置一样穿过这次重置；末了再统一走一遍
+       * applyLangSetting() 收尾（原因见那个调用点的注释）。
+       * 分段控件本身由 syncSettingsUI() 负责 —— renderLangSeg() 已经收进
+       * 那个函数，它本来就是「把设置值落到 DOM」的唯一入口，
+       * 语言控件以前唯独漏在它外面，才让这类路径出现「设置已变、控件不动」。
+       */
+      const keepLang = S().lang;
       Store.state.settings = Object.assign({}, DEFAULTS);
       S().lastTrackId = keepTrack;
       S().lastPosition = keepPos;
       S().lastQueue = keepQueue;
+      S().lang = keepLang;
       Store.save();
       applyTheme(); applyVars();
       Player.setVolume(S().volume);
@@ -6379,6 +6460,18 @@
       document.body.classList.toggle('compact', !!S().compactList);
       applyVars();
       syncSettingsUI(); renderAll();
+      /*
+       * 末尾再走一遍 applyLangSetting()：语言值上面已经保住，这里不是为了
+       * 「改语言」，而是把引擎 / 原生层 / 分段控件三处**拉回同一个事实**。
+       *
+       * 恢复默认顺手回滚了主题、玻璃强度、动效速度等一大堆设置，其中若干项
+       * 会重建 DOM（applyTheme / renderAll），重建出来的节点是全中文的；
+       * 英文用户此时会看到一屏中文，直到下次切页。applyLangSetting 内部的
+       * I18n.setLang(code, true) 会整页重翻一次，正好收尾。
+       * 三处都幂等（silent 不落盘、语言没变时 renderLangSeg 走签名短路），
+       * 所以这段在中文环境下等于什么都没做。
+       */
+      applyLangSetting();
       /*
        * toast 文案以前写死「液态玻璃 · 深色」，而 DEFAULTS.theme 其实是 'auto'。
        * 按实际值说，别再给用户一个错误的结论。
@@ -6833,7 +6926,8 @@
         };
         let html = '';
         if (pls.list.length) {
-          html += `<div class="sec-head"><span class="n">PL</span><h2>歌单 · ${pls.list.length}</h2></div>
+          /* 与下一行的「单曲 · {n}」一致：整串 TT 模板，别让数量夹在中文里 */
+          html += `<div class="sec-head"><span class="n">PL</span><h2>${esc(TT('歌单 · {n}', { n: pls.list.length }))}</h2></div>
             <div class="list">${pls.list.map(plRowHTML).join('')}</div>`;
         }
         html += `<div class="sec-head"><span class="n">NE</span><h2>${esc(TT('单曲 · {n}', { n: songs.total || songs.list.length }))}</h2></div>`;
@@ -6856,7 +6950,7 @@
     if (my !== _searchSeq) return;
     App.onlineResults = null;
     body.innerHTML = res.length
-      ? `<div class="sec-head"><span class="n">LOCAL</span><h2>本机 · ${res.length} 个结果</h2></div>
+      ? `<div class="sec-head"><span class="n">LOCAL</span><h2>${esc(TT('本机 · {n} 个结果', { n: res.length }))}</h2></div>
          <div class="list">${res.map((t, i) => rowHTML(t, i, false)).join('')}</div>`
       : `<div class="empty"><b>没有找到</b><p>试试切到「网易云」范围搜在线曲目</p></div>`;
   }
@@ -8557,9 +8651,9 @@
      * 高度上限用 vh，保证小屏也不会把按钮顶出可视区。
      */
     modal(`
-      <h3>发现新版本</h3>
+      <h3>${esc(TT('发现新版本'))}</h3>
       <p style="font-size:12px;opacity:.8;margin-bottom:8px">
-        当前 ${cur} → 最新 <b>${esc(d.version || '')}</b>
+        ${esc(TT('当前 {cur} → 最新', { cur }))} <b>${esc(d.version || '')}</b>
       </p>
       ${notes ? `<div style="max-height:34vh;overflow:auto;font-size:11px;line-height:1.7;
         background:rgba(255,255,255,.04);border-radius:10px;padding:10px 12px;
@@ -8569,11 +8663,11 @@
           <i id="updateProgressBar" style="display:block;height:100%;width:0;
             background:var(--accent);transition:width .2s"></i>
         </div>
-        <div id="updateProgressTx" style="font-size:11px;opacity:.7;margin-top:6px">准备下载…</div>
+        <div id="updateProgressTx" style="font-size:11px;opacity:.7;margin-top:6px">${esc(TT('准备下载…'))}</div>
       </div>
       <div class="modal-btns">
-        <button class="btn ghost" data-cancel>以后再说</button>
-        <button class="btn solid" id="updateGo">${isDesktop ? '前往下载' : '下载并安装'}</button>
+        <button class="btn ghost" data-cancel>${esc(TT('以后再说'))}</button>
+        <button class="btn solid" id="updateGo">${isDesktop ? esc(TT('前往下载')) : esc(TT('下载并安装'))}</button>
       </div>
     `, { confirm: true });
 

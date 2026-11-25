@@ -40,14 +40,22 @@ function hostKey(host) {
   return h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0];
 }
 
-/** Host 是否被接受。hostSet 由调用方传（server.js 那边是 5 秒实时网卡缓存） */
-function hostIsAllowed(host, hostSet) {
+/**
+ * Host 是否被接受。hostSet 由调用方传（server.js 那边是 5 秒实时网卡缓存）。
+ *
+ * @param {boolean} [allowMdns=true]
+ *   `.local` 要不要放行。默认放行（本模块的纯函数语义）；但 server.js 在
+ *   **没开 `--lan`** 时传 false —— 那种模式下服务只监听回环，任何外部主机名
+ *   都不该被当成合法来源，放行它只会让 421 名单和实际可达性对不上（H-9）。
+ */
+function hostIsAllowed(host, hostSet, allowMdns) {
   const raw = String(host || '').toLowerCase().trim();
   if (!raw) return false;
   const set = hostSet || LOCAL_HOST_NAMES;
   if (set.has(raw)) return true;
   const bare = hostKey(raw);
   if (set.has(bare)) return true;
+  if (allowMdns === false) return false;
   return MDNS_HOST_RE.test(bare);
 }
 
@@ -55,10 +63,10 @@ function hostIsAllowed(host, hostSet) {
  * 请求的 Host 头是否在白名单里（DNS rebinding 就挡在这里）。
  * HTTP/1.1 必须有 Host，空 Host 一律拒。
  */
-function hostAllowed(req, hostSet) {
+function hostAllowed(req, hostSet, allowMdns) {
   const raw = String((req && req.headers && req.headers.host) || '').toLowerCase().trim();
   if (!raw) return false;
-  return hostIsAllowed(raw, hostSet);
+  return hostIsAllowed(raw, hostSet, allowMdns);
 }
 
 /**
@@ -72,7 +80,7 @@ function hostAllowed(req, hostSet) {
  *  ③ 再要求它与本次请求的 Host 完全一致 —— 同一个服务同时被 localhost 与网卡 IP
  *    访问时，Origin 指向另一个地址也算跨源，不该放行。
  */
-function hostMatches(req, candidate, hostSet) {
+function hostMatches(req, candidate, hostSet, allowMdns) {
   if (!candidate) return false;
   try {
     const u = new URL(candidate);
@@ -83,7 +91,7 @@ function hostMatches(req, candidate, hostSet) {
      */
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
     const host = String(u.host || '').toLowerCase();
-    if (!hostIsAllowed(host, hostSet)) return false;
+    if (!hostIsAllowed(host, hostSet, allowMdns)) return false;
     const reqHost = String((req && req.headers && req.headers.host) || '').toLowerCase();
     return !!reqHost && host === reqHost;
   } catch (e) {
@@ -97,31 +105,44 @@ function hostMatches(req, candidate, hostSet) {
  * 没有 Origin 时不再直接放行（那是旧漏洞：curl 不带 Origin 即可打 /ncm/*），
  * 只接受 Sec-Fetch-Site 为 same-origin / none —— 前者是同源 fetch，
  * 后者是用户在地址栏直接打开，两者都不是「别的站点发起的跨站请求」。
+ *
+ * 这一层不是安全边界（H-9）：Sec-Fetch-* 无头客户端随便填，真正的边界是
+ * 「默认只监听回环」这件事本身，见 server.js 的 LISTEN_HOST 与 SECURITY.md。
  */
-function originAllowed(req, hostSet) {
+function originAllowed(req, hostSet, allowMdns) {
   const h = (req && req.headers) || {};
   const org = h.origin;
-  if (org) return hostMatches(req, org, hostSet);
+  if (org) return hostMatches(req, org, hostSet, allowMdns);
   const site = String(h['sec-fetch-site'] || '').toLowerCase();
   return site === 'same-origin' || site === 'none';
 }
 
 /**
- * 「浏览器信号」判定：这一层挡的是**盲发**的跨站请求，不是「无头请求一律 403」。
+ * 「浏览器信号」判定：签发令牌前的最后一道门。
  *
- * 看清楚它的边界（S-02）：Sec-Fetch-* 对浏览器是强制头、网页 JS 改不了，
- * 所以它能挡住「别的网站偷偷 fetch 你的 /ripple-token.js」；
- * 但同机上能执行程序的人可以随便伪造这些头（实测同时带 same-origin + no-cors
- * 就能签出令牌）—— 那不是这一层能解决的，真正的约束是令牌的 TTL + IP 绑定 + 轮换，
- * 以及「同机程序本来就能读你的 cookie」这个前提（见 SECURITY.md 的威胁模型）。
+ * 判断依据是 **Origin / Referer 必须有一个真的对得上本站**（H-9 的 B 项）。
+ * 为什么必须这么严：
+ *   · `Sec-Fetch-Site` / `Sec-Fetch-Mode` 这类头对同机（以及同网段）能执行
+ *     程序的客户端是可以随便填的 —— 只把它们当判据等于没有门槛；
+ *   · 相反 `Origin` 与 `Referer` 是浏览器的**禁止修改头**：网页 JS 设不了，
+ *     只有同源页面自己发出去才会带上能对上本站的值。所以「对得上」这件事
+ *     能区分「同源页面发起的请求」与「网页偷偷 fetch」。
+ *
+ * 早期的实现只要 `Sec-Fetch-Mode: no-cors` 就放行（连来源都不看），
+ * 于是 `curl -H` 两行头就能签出令牌。现在收紧为：来源对不上就拒。
+ *
+ * 对正常页面加载是否有影响：`<script src="/ripple-token.js">` 是同源子资源，
+ * 浏览器必带 `Referer: http://<本站>/`（默认 referrer policy 下同源请求发完整
+ * URL）。所以真浏览器不受影响 —— 这一点在 tests/server-http.test.js 里有 e2e 用例守着。
  */
-function browserSignalOk(req, hostSet) {
+function browserSignalOk(req, hostSet, allowMdns) {
   const h = (req && req.headers) || {};
   const site = String(h['sec-fetch-site'] || '').toLowerCase();
   const mode = String(h['sec-fetch-mode'] || '').toLowerCase();
-  const sameOriginRef = hostMatches(req, h.origin, hostSet) || hostMatches(req, h.referer, hostSet);
-  /* 三者全无 —— 既不是浏览器导航/子资源加载，也没有来源，拒绝 */
-  if (!site && !mode && !sameOriginRef) return false;
+  /* 唯一可信的判据：Origin 或 Referer 解析出来必须就是本次请求的 Host */
+  const sameOriginRef = hostMatches(req, h.origin, hostSet, allowMdns)
+    || hostMatches(req, h.referer, hostSet, allowMdns);
+  if (!sameOriginRef) return false;
   /* 有 Sec-Fetch-Site 就必须是 same-origin（cross-site/same-site 都不行） */
   if (site && site !== 'same-origin') return false;
   /*
@@ -134,16 +155,27 @@ function browserSignalOk(req, hostSet) {
    * iframe 加载（mode: navigate）同理由 site 那一关约束。
    */
   if (mode && mode !== 'navigate' && mode !== 'no-cors' && mode !== 'cors') return false;
-  /* <script src> 加载是 no-cors，fetch() 是 cors，地址栏直开是 navigate；三者都不看来源 */
-  if (mode === 'no-cors' || mode === 'cors' || mode === 'navigate') return true;
-  return sameOriginRef;
+  return true;
 }
+
 
 /** loopback 的 IPv4 映射写法会以 ::ffff: 前缀出现，统一成同一个键 */
 function normIp(ip) {
   /* 先转小写再去前缀：::FFFF:127.0.0.1 这种大写写法的 socker 地址也见过，不归一就会
      让「签发时是一个键、校验时是另一个键」，表现为令牌莫名失效 */
   return String(ip || '').toLowerCase().replace(/^::ffff:/, '') || 'unknown';
+}
+
+/**
+ * 是不是回环地址（本机自己）。
+ *
+ * 单列的用途：H-9 的告警日志只在**非回环**来源签发令牌时才吵 ——
+ * 用户自己开页面不该被安全警告刷屏，而陌生来源来了必须看得见。
+ * 注意 `unknown`（取不到 remoteAddress）也按「不是本机」处理：宁可疑。
+ */
+function isLoopbackIp(ip) {
+  const v = normIp(ip);
+  return v === '127.0.0.1' || v === '::1' || v === 'localhost' || /^127\./.test(v);
 }
 
 /** 丢掉过期令牌；没变化就原样返回（调用方据此决定要不要写盘） */
@@ -223,6 +255,7 @@ module.exports = {
   originAllowed,
   browserSignalOk,
   normIp,
+  isLoopbackIp,
   pruneTokens,
   tokenValid,
   badRequest,

@@ -21,6 +21,8 @@ import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * 媒体播放通知（前台服务）。
@@ -78,6 +80,29 @@ public class PlaybackService extends Service {
     private boolean playing = false;
     private Bitmap coverBmp;
     private String coverLoadedFor = "";
+    /*
+     * ===== L-14：封面下载的并发与代次 =====
+     *
+     * 旧实现每次换歌都 `new Thread(...).start()`，没有并发上限；
+     * 快速切歌（连播/电台/随机）会同时拉起十几条线程，每条做一次 HTTPS
+     * + 一次**不限尺寸**的 decodeStream（上游给 2000x2000 就照着分配 16MB），
+     * 而最后只有最后一张留下来，其余全白做 —— 峰值内存被抬得很高，低端机直接 LMK。
+     *
+     * 现在：
+     *   · 固定 2 条 daemon 线程：同时最多两张大图在解，排队的不占内存；
+     *   · coverGen 代次号：每次换歌 +1，在飞的任务回主线程后发现代次变了就丢弃，
+     *     连 updateMetadata/pushNotification 都不必做；
+     *   · decode 用 inSampleSize 限到 1024px 以内，够通知栏/锁屏用（系统自己还会再缩）。
+     * releaseCover() 也会推进代次，让在飞结果失效（否则「刚释放又写回来」）。
+     */
+    private static final int COVER_MAX_PX = 1024;
+    private static final ExecutorService COVER_POOL =
+            Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "ripple-cover");
+                t.setDaemon(true);
+                return t;
+            });
+    private volatile int coverGen = 0;
     private boolean foregroundStarted = false;
 
     /*
@@ -193,13 +218,21 @@ public class PlaybackService extends Service {
         if (s != null) s.onMediaCommand(cmd);
     }
 
+    /**
+     * 建 / 更新播放通知渠道（幂等）。
+     *
+     * H-8：**不能**写成「渠道已存在就 return」。
+     * createNotificationChannel() 对已存在的渠道是「更新 name / description」——
+     * 这正是切语言后渠道名能跟着变的唯一手段。以前这里有一句
+     * `if (ch != null) return;`，于是系统设置里的渠道名永远是首次创建时那个语言。
+     * 现在的调用时机：onCreate（首次）、onLangChanged（切语言）、
+     * update()（每次状态上报，成本只是几次字符串拼接，但能兜住漏网的路径）。
+     */
     private void createChannel() {
         if (Build.VERSION.SDK_INT < 26) return;
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return;
-        NotificationChannel ch = nm.getNotificationChannel(CH_PLAYING);
-        if (ch != null) return;
-        ch = new NotificationChannel(CH_PLAYING,
+        NotificationChannel ch = new NotificationChannel(CH_PLAYING,
                 // 1.3.5 多语言：渠道名/描述用户在系统设置里能直接看到，必须跟着语言走
                 L10n.t("正在播放", "Now playing"), NotificationManager.IMPORTANCE_LOW);
         ch.setDescription(L10n.t("媒体播放控制，不发声",
@@ -208,7 +241,28 @@ public class PlaybackService extends Service {
         ch.enableVibration(false);
         ch.setShowBadge(false);
         ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
-        nm.createNotificationChannel(ch);
+        nm.createNotificationChannel(ch);   // 每次都调：已存在时即「改名」
+    }
+
+    /**
+     * 语言切换回调（由 HttpBridge.setLang 调用，H-8 / M-12）。
+     *
+     * 做两件事：
+     *   ① 刷新渠道名（系统设置里那一条）；
+     *   ② 让常驻通知按新语言重建一次 —— 动作按钮标题（上一首/暂停/下一首/喜欢）
+     *      是 buildNofitication() 里用 L10n.t 现取的，而 notifKey 现在含语言位
+     *      （见 notifKey），所以只要把指纹清掉再 push 一次就会重建，
+     *      不用等下一首歌。
+     */
+    void onLangChanged() {
+        main.post(() -> {
+            try {
+                createChannel();
+                lastNotifKey = null;
+                if (foregroundStarted) pushNotification();
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     /* ================= 网页上报 ================= */
@@ -357,6 +411,14 @@ public class PlaybackService extends Service {
     public void releaseCover() {
         main.post(() -> {
             try {
+                /*
+                 * L-14：推进代次，让**已经在飞**的封面任务失效。
+                 * 只把 coverBmp 置空是不够的：那些线程手里已经下载/解码好的图
+                 * 会在回到主线程时发现 `want.equals(coverUrl)` 仍然成立
+                 * （coverUrl 没变，只是我们要释放内存），于是又把图写回来 ——
+                 * 表现就是「系统内存吃紧 → 释放封面 → 一下子又占回去」。
+                 */
+                coverGen++;
                 coverBmp = null;
                 coverLoadedFor = "";
                 // 通知里还挂着这张图，重画一次去掉它
@@ -591,7 +653,15 @@ public class PlaybackService extends Service {
         if (!url.startsWith("http://") && !url.startsWith("https://")) return;
         if (url.equals(coverLoadedFor)) return;
         final String want = url;
-        new Thread(() -> {
+        /*
+         * L-14：代次号必须在这里**递增并捕获**。
+         * 调用点都在主线程（update → main.post），所以 ++ 是安全的；
+         * 任务回到主线程时比对 gen != coverGen 就能判断「期间又换歌了」。
+         * 旧代码只比 want.equals(coverUrl)，但同一张图被重新上报时
+         * coverUrl 不变，旧结果会被当成有效 —— 代次更严格。
+         */
+        final int gen = ++coverGen;
+        COVER_POOL.execute(() -> {
             Bitmap bmp = null;
             HttpURLConnection c = null;
             try {
@@ -599,24 +669,65 @@ public class PlaybackService extends Service {
                 c.setConnectTimeout(6000);
                 c.setReadTimeout(8000);
                 c.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) RippleApp");
+                byte[] raw;
                 try (InputStream in = c.getInputStream()) {
-                    bmp = BitmapFactory.decodeStream(in);
+                    raw = readAll(in);
                 }
+                bmp = decodeCover(raw);
             } catch (Throwable e) {
-                /* 静默失败 */
+                /* 静默失败：封面缺失不影响任何控件 */
             } finally {
                 if (c != null) c.disconnect();
             }
             final Bitmap got = bmp;
             main.post(() -> {
                 if (got == null) return;
-                if (!want.equals(coverUrl)) return;   // 期间又换歌了，丢弃
+                /* 代次变了（期间又换歌 / releaseCover）→ 这张已经没用了，直接丢 */
+                if (gen != coverGen) return;
+                if (!want.equals(coverUrl)) return;
                 coverBmp = got;
                 coverLoadedFor = want;
                 updateMetadata();
                 pushNotification();
             });
-        }, "ripple-cover").start();
+        });
+    }
+
+    /**
+     * 按上限采样解码封面（L-14）。
+     *
+     * 为什么先读成 byte[] 再解两次：
+     * 量尺寸要用 inJustDecodeBounds，而它会把流消费掉；重开一次 HTTPS 连接
+     * 只为再解一次不划算，也不利于复用 keep-alive。把原始字节留在内存里
+     * （封面通常 50~300KB）比「按原图尺寸解码出一张 2000x2000 = 16MB 的位图」便宜得多。
+     *
+     * inSampleSize 只需保证「最长边 <= COVER_MAX_PX」：通知栏/锁屏最终
+     * 只渲染一两百 px，1024px 已经绰绰有余，而每翻一倍采样就省 4 倍内存。
+     */
+    private static Bitmap decodeCover(byte[] raw) {
+        if (raw == null || raw.length == 0) return null;
+        try {
+            BitmapFactory.Options probe = new BitmapFactory.Options();
+            probe.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(raw, 0, raw.length, probe);
+            int side = Math.max(probe.outWidth, probe.outHeight);
+            int sample = 1;
+            while (side > 0 && side / sample > COVER_MAX_PX) sample *= 2;
+            BitmapFactory.Options dec = new BitmapFactory.Options();
+            dec.inSampleSize = sample;
+            return BitmapFactory.decodeByteArray(raw, 0, raw.length, dec);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /** 读满一个流（封面体积有上限，不设额外限制；异常时返回已读部分） */
+    private static byte[] readAll(InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(64 * 1024);
+        byte[] buf = new byte[16 * 1024];
+        int n;
+        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        return bos.toByteArray();
     }
 
     private PendingIntent contentIntent() {
@@ -707,11 +818,19 @@ public class PlaybackService extends Service {
      * R-06：只有它变化时才重建通知。位置/时长**故意不进指纹** ——
      * 进度条由系统根据 PlaybackState 插值，重建通知并不能让它更流畅，
      * 反而每秒都新建一次 MediaStyle + 4 个 Action + 4 个 PendingIntent。
+     *
+     * M-12：语言必须进指纹。
+     * 四个动作按钮的标题是 buildNofitication() 里用 L10n.t 现取的中英文案；
+     * 语言变了但 title/artist/playing 都没变时，指纹一样 → pushNotification
+     * 早退 → 通知栏按钮还是旧语言，要等下一首歌才自愈。
+     * 把语言位掺进来，切语言那一下就会判定「内容变了」而立即重建。
+     * 顺带也让 L10n.isEnglish()（原先是零调用的死方法）在真实逻辑里生效。
      */
     private String notifKey() {
         return title + "\u0001" + artist + "\u0001" + album
                 + "\u0001" + (playing ? "1" : "0")
-                + "\u0001" + (coverBmp != null ? System.identityHashCode(coverBmp) : 0);
+                + "\u0001" + (coverBmp != null ? System.identityHashCode(coverBmp) : 0)
+                + "\u0001" + (L10n.isEnglish() ? "en" : "zh");
     }
 
     private PendingIntent cmdIntent(String cmd) {

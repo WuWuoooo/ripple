@@ -31,8 +31,12 @@ const sec = require('./server-security');
  * 但允许 --data-dir <路径> 指到别处。默认目录在 /sdcard 这类 fuse 挂载上
  * chmod 是空操作（实测 0660），想真正 0600 就得把数据放进私有目录。
  * 解析放在最前面：后面的 COOKIE_FILE / TOKEN_FILE 都依赖它。
+ *
+ * H-9：同时解析 --lan（局域网开关）。理由见下面 LAN_ENABLED 的注释。
  */
 let DATA_DIR = __dirname;
+/* 显式开启局域网监听（`--lan` 或 RIPPLE_LAN=1）；默认只监听回环 */
+let LAN_ENABLED = process.env.RIPPLE_LAN === '1' || process.env.RIPPLE_LAN === 'true';
 const POSITIONAL = [];
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -46,6 +50,20 @@ for (let i = 2; i < process.argv.length; i++) {
     DATA_DIR = path.resolve(v);
   } else if (a.startsWith('--data-dir=')) {
     DATA_DIR = path.resolve(a.slice('--data-dir='.length));
+  } else if (a === '--lan' || a === '--lan=1' || a === '--lan=true') {
+    LAN_ENABLED = true;
+  } else if (a === '--no-lan' || a === '--lan=0' || a === '--lan=false') {
+    /* 显式关掉：RIPPLE_LAN=1 但想临时只监听本机时，命令行能覆盖环境变量 */
+    LAN_ENABLED = false;
+  } else if (a === '--help' || a === '-h') {
+    console.log('\n  用法：node server.js [PORT] [--data-dir <目录>] [--lan]\n'
+      + '\n    PORT          监听端口，默认 8080\n'
+      + '    --data-dir    数据目录（.ripple-cookie / .ripple-token 放这里）\n'
+      + '    --lan         允许同一局域网内的设备访问（默认只监听 127.0.0.1）\n'
+      + '                  等价于环境变量 RIPPLE_LAN=1\n'
+      + '\n  为什么默认只监听本机：令牌的签发门槛只有可伪造的请求头，\n'
+      + '  对同网段的设备不构成防线。详见 SECURITY.md。\n');
+    process.exit(0);
   } else {
     POSITIONAL.push(a);
   }
@@ -56,6 +74,20 @@ try {
   console.error('\n  数据目录不可用：' + DATA_DIR + '\n  ' + (e && e.message) + '\n');
   process.exit(1);
 }
+
+/*
+ * H-9：监听地址。
+ *
+ * 以前无条件 listen(PORT, '0.0.0.0')，配合「Host 白名单包含本机所有网卡 IP」
+ * 与「令牌签发只看可伪造的 Sec-Fetch-* 头」，构成一条完整的越权链：
+ * 同网段任何设备 → Host 用 192.168.x.x 过白名单 → 伪造 Sec-Fetch 头签令牌
+ * → 令牌绑定的是它自己的 IP，恰好能用 → 带着 .ripple-cookie 的 MUSIC_U
+ * 调用 /ncm/like、/ncm/comment_add、/ncm/logout。
+ *
+ * 所以默认收窄到回环（127.0.0.1 + ::1），局域网访问变成**用户主动开启**的行为。
+ * 开启后仍然有上述限制，SECURITY.md 的威胁模型按实际能力写。
+ */
+const LISTEN_HOST = LAN_ENABLED ? '0.0.0.0' : '127.0.0.1';
 
 /*
  * 端口必须是 1-65535 的纯数字。
@@ -200,8 +232,11 @@ const TOKEN_ISSUE_PER_MIN = 30;     // 每个 IP 每分钟最多签发多少个�
  * 这种自相矛盾的状态。鉴权时按请求来源 IP 直接查自己的桶。
  */
 let tokenMap = new Map();
+/** 已经告过警的来源 IP（H-9 的 D 项：每个来源只吵一次，别刷屏） */
+const seenIssueIps = new Set();
 
 const normIp = sec.normIp;
+const isLoopbackIp = sec.isLoopbackIp;
 
 /**
  * 丢掉所有桶里的过期令牌；只在真的清掉了东西时才重建 Map，
@@ -269,6 +304,10 @@ function saveTokenStore() {
  *
  * 这是 S-01 的核心修复：以前是全局 unshift + slice，任何来源刷 6 次就能
  * 把别人的令牌全部挤掉。现在每个 IP 有自己的窗口，A 刷爆只影响 A 自己。
+ *
+ * H-9 的 D 项：**首次见到某个来源 IP 时打一行醒目日志**。
+ * 开了 `--lan` 之后，令牌机制对同网段主动攻击不构成防线（见 SECURITY.md），
+ * 所以至少要让用户能「看见」有陌生设备来签过令牌，而不是毫无痕迹。
  */
 function issueToken(ip) {
   const now = Date.now();
@@ -279,6 +318,16 @@ function issueToken(ip) {
   bucket.unshift({ t: t, exp: now + TOKEN_TTL_MS });
   tokenMap.set(me, bucket.slice(0, TOKEN_PER_IP));
   saveTokenStore();
+  if (!seenIssueIps.has(me)) {
+    seenIssueIps.add(me);
+    /* 回环地址是用户自己，不用吵；其余来源都值得看一眼 */
+    if (!isLoopbackIp(me)) {
+      console.log('\n  ⚠️  有非本机来源签发了访问令牌：' + me
+        + (LAN_ENABLED ? '（服务已用 --lan 对外监听）' : '（服务只监听本机，这不该出现）') + '\n'
+        + '     如果这不是你自己的设备，请立刻 Ctrl+C 停掉服务，'
+        + '并检查 .ripple-cookie 是否已泄露（登录态可能已被使用）。\n');
+    }
+  }
   return t;
 }
 
@@ -343,33 +392,49 @@ const HOST_CACHE_MS = 5 * 1000;
 
 let hostCache = { at: 0, set: new Set(LOCAL_HOST_NAMES) };
 
-/** 当前本机可达的 Host 集合（5 秒缓存） */
+/**
+ * 当前本机可达的 Host 集合（5 秒缓存）。
+ *
+ * H-9：**没开 `--lan` 时只放回环地址，不枚举网卡。**
+ * 以前无条件把 os.networkInterfaces() 里所有非内部 IP 都加进白名单，
+ * 于是局域网设备用 `Host: 192.168.x.x:8080` 就能过这一关 —— 而服务当时
+ * 也确实监听 0.0.0.0，于是「Host 白名单」这道 DNS rebinding 防线对同网段
+ * 完全失效。现在收窄监听地址的同时，白名单也同步收窄，两边口径一致：
+ * 服务听不到的地方，就不该出现在「允许的 Host」名单里。
+ */
 function allowedHosts() {
   const now = Date.now();
   if (now - hostCache.at < HOST_CACHE_MS) return hostCache.set;
   const set = new Set(LOCAL_HOST_NAMES);
-  try {
-    const ifs = os.networkInterfaces();
-    Object.keys(ifs).forEach((name) => {
-      (ifs[name] || []).forEach((i) => {
-        if (!i || !i.address) return;
-        const a = String(i.address).toLowerCase();
-        set.add(a);
-        /*
-         * 审查 S-06：IPv6 必须同时收**带方括号**的形式。
-         *
-         * 白名单以前只存裸 IPv6（240e:565:...），而浏览器/客户端发来的 Host
-         * **一定带方括号**（[240e:565:...]:18080）。hostKey 对 [..] 保留方括号，
-         * 与集合里的裸地址永远不相等 → 双栈环境下 IPv6 访问一律 421，
-         * 而 421 正文里拼出来的 URL 用的是带方括号的正确写法、照着点还是 421。
-         * 表现就是「地址明明在允许列表里，就是进不去，而且无法自救」。
-         */
-        if (a.includes(':')) set.add('[' + a + ']');
+  if (LAN_ENABLED) {
+    try {
+      const ifs = os.networkInterfaces();
+      Object.keys(ifs).forEach((name) => {
+        (ifs[name] || []).forEach((i) => {
+          if (!i || !i.address) return;
+          const a = String(i.address).toLowerCase();
+          set.add(a);
+          /*
+           * 审查 S-06：IPv6 必须同时收**带方括号**的形式。
+           *
+           * 白名单以前只存裸 IPv6（240e:565:...），而浏览器/客户端发来的 Host
+           * **一定带方括号**（[240e:565:...]:18080）。hostKey 对 [..] 保留方括号，
+           * 与集合里的裸地址永远不相等 → 双栈环境下 IPv6 访问一律 421，
+           * 而 421 正文里拼出来的 URL 用的是带方括号的正确写法、照着点还是 421。
+           * 表现就是「地址明明在允许列表里，就是进不去，而且无法自救」。
+           */
+          if (a.includes(':')) set.add('[' + a + ']');
+        });
       });
-    });
-  } catch (e) {}
+    } catch (e) {}
+  }
   hostCache = { at: now, set: set };
   return set;
+}
+
+/** `.local` 只在开了 `--lan` 时才有意义（只监听回环时解析不到本机） */
+function mdnsAllowed() {
+  return LAN_ENABLED;
 }
 
 /**
@@ -378,7 +443,7 @@ function allowedHosts() {
  * 否则又会出现「页面能开、令牌能签，但 API 全 403」那种两边口径不一致的问题。
  */
 function hostAllowed(req) {
-  return sec.hostAllowed(req, allowedHosts());
+  return sec.hostAllowed(req, allowedHosts(), mdnsAllowed());
 }
 
 /** 421 响应体：把当前允许的 Host 列表带上，用户自己就能判断该怎么访问 */
@@ -426,26 +491,29 @@ function hostRejectBody(req) {
 
 /** 同源判定：Origin 与本机白名单 + 本次请求的 Host 比对（判定逻辑见 server-security.js） */
 function originAllowed(req) {
-  return sec.originAllowed(req, allowedHosts());
+  return sec.originAllowed(req, allowedHosts(), mdnsAllowed());
 }
 
 /*
- * R-13：/ripple-token.js 现在的门槛是三段。
+ * R-13：/ripple-token.js 的门槛。
  *
  *  ① Host 白名单 —— DNS rebinding 挡在这里（Sec-Fetch-Site 在那种场景下必然是
  *     same-origin，所以它只能当辅助，不能当判据）；
- *  ② 浏览器信号 —— Sec-Fetch-Site 必须是 same-origin，Sec-Fetch-Mode 必须是
- *     浏览器会用的那几个值，或者 Origin/Referer 至少有一个能对上本站。
- *     它挡的是**盲发**的跨站请求（别的网站的 JS 无法自定这几个头）；
- *     对同机上能执行程序的伪造请求头只算礼貌层，别把它当安全边界。
- *  ③ 令牌本身是短期 + IP 绑定 + 每次加载轮换（见 issueToken），
- *     所以即便有人把① ② 都伪造齐了，拿到的也只是一份很短命的令牌。
+ *  ② 浏览器信号 —— **Origin 或 Referer 必须真的对得上本站**（H-9 的 B 项）。
+ *     这两个头是浏览器的禁止修改头，同源页面发出去的才有能对上的值；
+ *     Sec-Fetch-* 只能当辅助（无头客户端随便填）。改前只要 no-cors 就放行，
+ *     更早的版本连来源都不看 —— 那种门槛对 `curl -H` 等于没有。
+ *  ③ 令牌本身是短期 + IP 绑定 + 每次加载轮换（见 issueToken）。
+ *
+ * 最关键的一层其实不在这个函数里，而是「默认只监听 127.0.0.1」：
+ * 上面这些头判定对**能执行程序**的客户端永远只是礼貌层，把服务收在回环里
+ * 才是真正的边界（见 LISTEN_HOST 与 SECURITY.md 的威胁模型）。
  *
  * 注意：这里不做「只允许一次」——index.html 与 SW 都可能重复取同一个脚本，
  * 一次性会导致页面刷新后立刻失效。用 TTL + 轮换达到同样的目标。
  */
 function browserSignalOk(req) {
-  return sec.browserSignalOk(req, allowedHosts());
+  return sec.browserSignalOk(req, allowedHosts(), mdnsAllowed());
 }
 
 function tokenEndpointAllowed(req) {
@@ -938,6 +1006,22 @@ function json(res, code, obj) {
   res.end(body);
 }
 
+/**
+ * 体积超限时的 413 响应（H-7）。
+ *
+ * 以前这里只写 `json(res, 413, …)` 然后 `req.destroy()`：响应头里没有
+ * Connection: close，客户端于是认为这条 keep-alive 连接还可以复用，把它放回
+ * 全局 agent 的空闲池 —— 而服务端紧接着就把 socket 销毁了。**下一个请求
+ * 复用这条已死的 socket → ECONNRESET**，前端表现为「偶发点了没反应」。
+ *
+ * 修法：先声明 Connection: close（客户端收到后直接把连接标成不可复用），
+ * 再写响应，最后才 destroy。顺序不能反 —— 反过来写响应时会撞上已销毁的 socket。
+ */
+function jsonTooLarge(res) {
+  res.setHeader('Connection', 'close');
+  json(res, 413, { code: 413, msg: 'body too large' });
+}
+
 /* 代码类资源必须每次回源校验（配 ETag 走 304），否则改了前端 24 小时不生效 */
 const CODE_EXT = new Set(['.html', '.js', '.css', '.json', '.webmanifest', '.txt']);
 /* 图片/字体这类内容基本不变，可以放心长缓存 */
@@ -1153,7 +1237,12 @@ function handleRequest(req, res) {
       if (bodyBytes > MAX_BODY) {
         tooBig = true;
         body = '';
-        try { json(res, 413, { code: 413, msg: 'body too large' }); } catch (e) {}
+        /*
+         * H-7：先 Connection: close 再写 413，最后才 destroy。
+         * 少了这一步，客户端会把这条即将被销毁的连接放回空闲池，
+         * 紧接着的下一个请求复用它就 ECONNRESET（实测修前 30 次里失败 13 次）。
+         */
+        try { jsonTooLarge(res); } catch (e) {}
         try { req.destroy(); } catch (e) {}
       }
     });
@@ -1299,12 +1388,15 @@ function reportDataDir() {
     }
   });
   if (!bad) return;
-  console.warn('\n  ⚠️⚠️  权限告警：数据文件的权限不是 0600，服务却在 0.0.0.0 上监听。\n'
+  console.warn('\n  ⚠️⚠️  权限告警：数据文件的权限不是 0600。\n'
     + '     这通常是因为数据目录在 /sdcard 这类 fuse 挂载上 —— chmod 在那里是空操作。\n'
     + '     同机的其它应用可能读到你的网易云登录态与访问令牌。\n'
     + '     想真正收紧权限，把数据目录指到应用私有目录：\n'
     + '       node server.js ' + PORT + ' --data-dir /data/data/<pkg>/files/ripple\n'
-    + '     （详见 README 的「安全与隐私」一节。）\n');
+    + '     （详见 README 的「安全与隐私」一节。）\n'
+    + (LAN_ENABLED
+      ? '     另外：当前已用 --lan 对外监听，上述权限问题在局域网里同样成立。\n'
+      : ''));
 }
 
 /*
@@ -1323,7 +1415,7 @@ function reportDataDir() {
  */
 const IS_MAIN = require.main === module;
 
-if (IS_MAIN) server.listen(PORT, '0.0.0.0', () => {
+if (IS_MAIN) server.listen(PORT, LISTEN_HOST, () => {
   const nets = os.networkInterfaces();
   const ips = [];
   for (const k of Object.keys(nets)) {
@@ -1333,7 +1425,20 @@ if (IS_MAIN) server.listen(PORT, '0.0.0.0', () => {
   }
   console.log('\n  Ripple 涟漪 · 本地服务已启动\n');
   console.log('  电脑访问   http://localhost:' + PORT);
-  ips.forEach((ip) => console.log('  手机访问   http://' + ip + ':' + PORT + '   （需同一 Wi-Fi）'));
+  if (LAN_ENABLED) {
+    ips.forEach((ip) => console.log('  手机访问   http://' + ip + ':' + PORT + '   （需同一 Wi-Fi）'));
+    /*
+     * H-9：对外监听时**必须**把能力边界说清楚。
+     * 用户看到「手机访问 http://192.168.x.x:8080」很容易以为这条通道是有防护的，
+     * 而实际上令牌签发门槛只挡得住网页 JS，挡不住同网段能执行程序的设备。
+     */
+    console.log('\n  ⚠️  --lan 已开启：同网段的其它设备可以访问本服务。'
+      + '\n     令牌的签发门槛只防网页跨站，不防同网段主动请求；'
+      + '\n     用完请关掉，或用完后 Ctrl+C 停止服务。');
+  } else {
+    console.log('  监听地址   ' + LISTEN_HOST + ':' + PORT + '（只允许本机访问）');
+    console.log('  手机访问   需加 --lan 才会对外监听，例如：node server.js ' + PORT + ' --lan');
+  }
   console.log('\n  网易云真接口已就绪：POST /ncm/<cmd>（weapi 加密，可带登录态）');
   console.log('  未登录也能搜索/试听；登录请用 APK，或在 .ripple-cookie 里放 MUSIC_U');
   console.log('  访问令牌  每次页面加载轮换，绑定来源 IP，有效期 '
@@ -1354,6 +1459,9 @@ module.exports = {
   DATA_DIR: DATA_DIR,
   ROOT: ROOT,
   SEC: sec,
+  /* H-9：监听地址与局域网开关也是被测对象（默认必须收在回环里） */
+  LISTEN_HOST: LISTEN_HOST,
+  LAN_ENABLED: LAN_ENABLED,
   /* 几个测试要直接断言的内部函数（纯读，不改变状态） */
   allowedHosts: allowedHosts,
   tokenStats: tokenStats,

@@ -103,11 +103,22 @@ Also in **[Releases](../../../releases)**, next to the APK:
 ### Browser / PWA
 
 ```bash
-node server.js          # port 8080 by default
+node server.js          # port 8080, loopback only by default
+node server.js --lan    # add this when a phone needs to connect
 ```
 
-The terminal prints your LAN address. Point the phone at `http://<your-ip>:8080` on the same
-Wi-Fi and use "Add to Home Screen" for a fullscreen experience.
+By default it listens on `127.0.0.1` only; open `http://localhost:8080` in a local browser.
+
+To let a **phone** connect, add `--lan` (or set `RIPPLE_LAN=1`). The terminal then prints your
+LAN address; point the phone at `http://<your-ip>:8080` on the same Wi-Fi and use
+"Add to Home Screen" for a fullscreen experience.
+
+> **Why LAN is off by default**: this service acts with your NetEase login state — it can read
+> and write the account (change likes, post comments, log out). Token issuance can only be
+> gated on headers like `Sec-Fetch-*` that **any client can forge**, and since tokens are bound
+> to the source IP, a device on the same network can both obtain and use one. Exposing the
+> service beyond this machine therefore has to be your explicit choice.
+> See [SECURITY.md](SECURITY_en.md) for details.
 
 > When served by `server.js` the page automatically uses the same-origin `/ncm/*` proxy, so
 > **no API address needs to be filled in**. That is only needed if you want to point at a

@@ -188,9 +188,13 @@ test('originAllowed：无 Origin 时只看 Sec-Fetch-Site（same-origin / none�
 test('browserSignalOk：真浏览器的两种典型组合放行', () => {
   const set = hostSet();
   const host = '127.0.0.1:' + PORT;
-  // <script src="/ripple-token.js"> 的加载
+  /*
+   * <script src="/ripple-token.js"> 的加载：Referer 是同源页面地址。
+   * H-9 起这里是硬要求 —— 只有 Sec-Fetch-* 不再够（那两组头无头客户端随便填）。
+   */
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors',
+    referer: 'http://' + host + '/index.html',
   }), set), true);
   // 只带 Origin（SW / 某些老浏览器不带 Sec-Fetch-*）
   assert.equal(sec.browserSignalOk(req({
@@ -200,6 +204,32 @@ test('browserSignalOk：真浏览器的两种典型组合放行', () => {
   assert.equal(sec.browserSignalOk(req({
     host: host, referer: 'http://' + host + '/index.html',
   }), set), true);
+});
+
+test('H-9 browserSignalOk：只有可伪造的 Sec-Fetch-* 没有真实来源 → 拒', () => {
+  /*
+   * 这是 H-9 的核心改动，修前这一组**全部放行**（只要 mode 是 no-cors/cors/navigate
+   * 就直接 return true，连来源都不看）。现在必须来源对得上。
+   */
+  const set = hostSet();
+  const host = '127.0.0.1:' + PORT;
+  const forged = [
+    { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors' },
+    { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors' },
+    { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'navigate' },
+    { 'sec-fetch-site': 'none', 'sec-fetch-mode': 'navigate' },
+    { 'sec-fetch-mode': 'no-cors' },
+    { 'sec-fetch-site': 'same-origin' },
+  ];
+  forged.forEach((extra) => {
+    assert.equal(sec.browserSignalOk(req(Object.assign({ host: host }, extra)), set), false,
+      '只有 Sec-Fetch 头（' + JSON.stringify(extra) + '）时必须拒绝');
+  });
+  // 来源对得上但站点跨站：仍然拒（两道都要过）
+  assert.equal(sec.browserSignalOk(req({
+    host: host, 'sec-fetch-site': 'cross-site',
+    referer: 'http://' + host + '/',
+  }), set), false);
 });
 
 test('browserSignalOk：什么都不齐时拒绝（含只带 Sec-Fetch-Site: none 的直开）', () => {
@@ -222,10 +252,12 @@ test('browserSignalOk：什么都不齐时拒绝（含只带 Sec-Fetch-Site: non
   // 跨站
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'no-cors',
+    referer: 'http://' + host + '/',
   }), set), false);
   // 伪造的杂值 Mode
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'websocket',
+    referer: 'http://' + host + '/',
   }), set), false);
   // Referer 指向外部站点
   assert.equal(sec.browserSignalOk(req({
@@ -233,17 +265,18 @@ test('browserSignalOk：什么都不齐时拒绝（含只带 Sec-Fetch-Site: non
   }), set), false);
 });
 
-test('S-02 现状固化：Sec-Fetch 全套伪造能过这一层（安全边界不在这里）', () => {
+test('H-9 回归：S-02 的伪造姿势（same-origin + no-cors）已经不成立', () => {
   /*
-   * 报告 S-02 实测：同机程序同时发 Sec-Fetch-Site: same-origin + Mode: no-cors
-   * 就能签出令牌。这里把这个**已知现状**固化成用例，避免以后有人误以为
-   * 「加了这套头校验 = 同机伪造被挡住了」。真正起作用的是 TTL + IP 绑定 + 轮换。
+   * 1.2.2 的 S-02 曾把这个**已知现状**固化成「能过」的用例：
+   * 只发 `Sec-Fetch-Site: same-origin` + `Sec-Fetch-Mode: no-cors` 就能签出令牌。
+   * H-9 之后这条通道被关掉（要求真实 Origin/Referer），这里改成反向断言 ——
+   * 以后谁把来源检查去掉，这条会立刻红。
    */
   const set = hostSet();
   const host = '127.0.0.1:' + PORT;
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors',
-  }), set), true);
+  }), set), false, '只有可伪造的 Sec-Fetch 头时必须拒绝（H-9）');
 });
 
 test('S-06 现状固化：Sec-Fetch-Mode: cors 放行（它是同源 fetch()，不是「跨域」）', () => {
@@ -254,16 +287,19 @@ test('S-06 现状固化：Sec-Fetch-Mode: cors 放行（它是同源 fetch()，�
    */
   const set = hostSet();
   const host = '127.0.0.1:' + PORT;
-  // 同源 fetch()：放行
+  // 同源 fetch()：放行（前提是来源对得上，H-9）
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors',
+    origin: 'http://' + host,
   }), set), true);
   // 跨站 fetch()：site 那一关就拒了，cors 本身不放水
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'cors',
+    origin: 'http://' + host,
   }), set), false);
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-site', 'sec-fetch-mode': 'cors',
+    origin: 'http://' + host,
   }), set), false);
 });
 
@@ -272,11 +308,21 @@ test('browserSignalOk：.local 站点同样能通过（S-01 的签发端回归�
   const host = 'dshgo.local:' + PORT;
   assert.equal(sec.browserSignalOk(req({
     host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors',
+    referer: 'http://' + host + '/index.html',
   }), set), true);
   assert.equal(sec.browserSignalOk(req({
     host: host, origin: 'http://' + host,
   }), set), true);
 });
+
+test('H-9 签发端：.local 也必须带真实来源（不能再靠 Sec-Fetch 头混过去）', () => {
+  const set = hostSet();
+  const host = 'dshgo.local:' + PORT;
+  assert.equal(sec.browserSignalOk(req({
+    host: host, 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'no-cors',
+  }), set), false);
+});
+
 
 /* ---------------------------------------------------------------- 令牌有效性 */
 

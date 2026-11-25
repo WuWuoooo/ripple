@@ -29,6 +29,31 @@ if [ "${SKIP_VERSION_SYNC:-0}" = "1" ]; then
   exit 0
 fi
 
+# ---------- 版本副本清单（单一来源的「同步侧声明」）----------
+#
+# 审查 1.3.5 的 H-5 / M-6：checker 查 4 处、本脚本写 8 处 ——
+# 「检查器与被检查对象之间的名单漂移」本身就是本仓库头号缺陷模式的一种。
+#
+# 现在这份清单在三个地方必须一致：
+#   ① 这里（同步侧：真正被写的是哪些文件）
+#   ② scripts/version-facts.js 的 COPIES（检查侧：真正被解析的是哪些文件）
+#   ③ CONTRIBUTING.md 的「版本同步清单」表格（文档侧：人看到的是哪些文件）
+# scripts/check-manifest-consistency.js 的 [G] 项逐一比对这三方，
+# 任何一处漂移都直接红 —— 不靠「下次记得同步改」。
+#
+# 加新副本时：本数组加一行 + version-facts.js 的 COPIES 加一条 + 文档表格加一行。
+# 只改这里的后果是 checker 报「检查了却没人同步」；只改 facts 的后果是反过来。
+SYNC_TARGETS=(
+  'android/app/build.gradle'
+  'android/app/src/main/java/com/ripple/app/CrashLog.java'
+  'android/app/src/main/java/com/ripple/app/RippleApp.java'
+  'app/js/version.js'
+  'app/sw.js'
+  'desktop/src-tauri/tauri.conf.json'
+  'desktop/src-tauri/Cargo.toml'
+  'desktop/src-tauri/Cargo.lock'
+)
+
 # ---------- 读 version.json ----------
 VER_FILE="$ROOT/version.json"
 if [ ! -f "$VER_FILE" ]; then
@@ -261,5 +286,18 @@ else:
     echo "❌ Cargo.lock 里找不到 ripple-desktop 的 [[package]] 块" >&2
     exit 1
   }
+fi
+
+# ---------- 收尾：用唯一解析器复核一遍 ----------
+#
+# 为什么写完还要再查一次：本脚本的每个分支都内联了自己的断言，
+# 而那些断言与「写」共用同一个判据 —— 一旦判据本身就错了（B-1 就是这种），
+# 写完+自检会一起报绿。scripts/version-facts.js 是**独立实现**
+# （尤其 Cargo.toml 走段内定位），用它复核才是真正的外部校验。
+if [ -f "$ROOT/scripts/version-facts.js" ] && command -v node >/dev/null 2>&1; then
+  if ! node "$ROOT/scripts/version-facts.js" --assert; then
+    echo "❌ 版本副本复核失败（scripts/version-facts.js --assert）" >&2
+    exit 1
+  fi
 fi
 exit 0

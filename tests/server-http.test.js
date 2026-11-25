@@ -132,9 +132,17 @@ test('S-13-e2e Host 白名单：本机地址放行、外部域名 421', async ()
  * 盲区 2：令牌签发 → 使用 → 换 IP
  * --------------------------------------------------------------- */
 test('S-13-e2e 令牌：签发可用、同 IP 有效、换 IP 401、无令牌 401', async () => {
+  /*
+   * H-9：签发端现在要求真实 Origin/Referer（可伪造的 Sec-Fetch-* 不再够）。
+   * 这里模拟真浏览器的子资源加载：同源页面带 Referer。
+   */
   const tk = await request(port, {
     path: '/ripple-token.js',
-    headers: { 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'no-cors' },
+    headers: {
+      Referer: 'http://localhost:' + port + '/',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'no-cors',
+    },
   });
   assert.strictEqual(tk.status, 200, '正常浏览器信号应能签出令牌');
   const m = tk.body.match(/["']([a-f0-9]{32})["']/);
@@ -238,7 +246,11 @@ test('S-13-e2e 请求体上限：300KB 必须先 413', async () => {
    */
   const tk = await request(port, {
     path: '/ripple-token.js',
-    headers: { 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'no-cors' },
+    headers: {
+      Referer: 'http://localhost:' + port + '/',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'no-cors',
+    },
   });
   const token = (tk.body.match(/["']([a-f0-9]{32})["']/) || [])[1];
   assert.ok(token, '需要先拿到令牌');
@@ -271,7 +283,11 @@ test('S-13-e2e 退出登录：磁盘上的 cookie 被清空', async () => {
 
   const tk = await request(port, {
     path: '/ripple-token.js',
-    headers: { 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'no-cors' },
+    headers: {
+      Referer: 'http://localhost:' + port + '/',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'no-cors',
+    },
   });
   const token = (tk.body.match(/["']([a-f0-9]{32})["']/) || [])[1];
   assert.ok(token, '需要先拿到令牌');
@@ -312,4 +328,142 @@ test('S-13-e2e 启动参数非法时退出码非 0', () => {
     const code = run([bad]);
     assert.notStrictEqual(code, 0, `端口参数 ${bad} 应当拒绝并退出非 0`);
   }
+});
+
+/* ---------------------------------------------------------------
+ * H-7 [high]：413 之后的下一个请求不能被 keep-alive 池毒化（ECONNRESET）
+ *
+ * 修前：413 响应没有 Connection: close，随后 req.destroy() 硬断 socket；
+ * 客户端仍以为这条连接可复用，把它放回空闲池 → 下一个请求复用它就 ECONNRESET。
+ * 报告实测 30 次失败 4 次，本机实测修前 30 次失败 13 次。
+ *
+ * 这条用例用**单连接池化 agent**（maxSockets=1）放大问题：如果 413 不声明
+ * close，下一个请求必然尝试复用那条已死的 socket。
+ * --------------------------------------------------------------- */
+test('H-7 413 必须声明 Connection: close，且不毒化下一个请求', async () => {
+  const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const viaAgent = (opts) => new Promise((resolve, reject) => {
+    const o = {
+      host: '127.0.0.1',
+      port: port,
+      method: opts.method || 'GET',
+      path: opts.path || '/',
+      agent: keepAliveAgent,
+      headers: Object.assign({ Host: 'localhost:' + port }, opts.headers || {}),
+    };
+    const req = http.request(o, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => (body += c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: body }));
+    });
+    req.on('error', reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+
+  try {
+    const tk = await viaAgent({
+      path: '/ripple-token.js',
+      headers: {
+        Referer: 'http://localhost:' + port + '/',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'no-cors',
+      },
+    });
+    const token = (tk.body.match(/["']([a-f0-9]{32})["']/) || [])[1];
+    assert.ok(token, '需要先拿到令牌');
+    const authHeaders = {
+      Origin: 'http://localhost:' + port,
+      Referer: 'http://localhost:' + port + '/',
+      'X-Ripple-Token': token,
+      'Content-Type': 'application/json',
+    };
+
+    const big = 'x'.repeat(300 * 1024);
+    const r413 = await viaAgent({
+      method: 'POST',
+      path: '/ncm/search',
+      headers: Object.assign({ 'Content-Length': Buffer.byteLength(big) }, authHeaders),
+      body: big,
+    });
+    assert.strictEqual(r413.status, 413, '300KB 请求体应 413');
+    /* 关键断言：必须让客户端知道这条连接不可复用 */
+    assert.strictEqual(String(r413.headers.connection || '').toLowerCase(), 'close',
+      '413 响应必须带 Connection: close —— 否则客户端会把即将销毁的 socket 放回池子');
+
+    /*
+     * 紧接着在同一池化 agent 上发下一个请求。修前这里会随机 ECONNRESET（不是 4xx/5xx，
+     * 而是连接层错误），所以这里断言「必须拿到一个 HTTP 响应」。
+     */
+    const next = await viaAgent({
+      method: 'POST',
+      path: '/ncm/song_detail',
+      headers: authHeaders,
+      body: '{"ids":"abc"}',   // 参数非法 → 400，不依赖外网
+    });
+    assert.strictEqual(next.status, 400,
+      '413 之后的下一个请求必须正常拿到 HTTP 响应（400），实际 ' + next.status);
+  } finally {
+    keepAliveAgent.destroy();
+  }
+});
+
+/* ---------------------------------------------------------------
+ * H-9 [high]：默认必须只监听回环，并拒绝靠伪造 Sec-Fetch 头签发令牌
+ *
+ * 这条防的是「同一局域网内任何设备无需凭据就能操作用户网易云账号」：
+ *   0.0.0.0 监听 → Host 白名单含网卡 IP → 伪造 Sec-Fetch 头签令牌
+ *   → 令牌绑定攻击者自己的 IP 恰好可用 → 带用户的 MUSIC_U 打 /ncm/*。
+ * --------------------------------------------------------------- */
+test('H-9 默认只监听 127.0.0.1，局域网访问需显式 --lan', () => {
+  /* 默认（不带 --lan）：监听地址必须是回环，而不是 0.0.0.0 */
+  const out = execFileSync(process.execPath, ['-e', `
+    const s = require(${JSON.stringify(path.join(ROOT, 'server.js'))});
+    console.log('LISTEN_HOST=' + s.LISTEN_HOST);
+    console.log('LAN_ENABLED=' + s.LAN_ENABLED);
+  `], { cwd: ROOT, encoding: 'utf8', timeout: 15000 });
+  assert.match(out, /LISTEN_HOST=127\.0\.0\.1/,
+    '默认必须只监听 127.0.0.1（H-9：局域网访问要用户显式开启）。实际输出：' + out);
+  assert.match(out, /LAN_ENABLED=false/, '默认不该开启局域网模式。实际输出：' + out);
+
+  /* 带 --lan：才允许对外监听 */
+  const outLan = execFileSync(process.execPath, ['-e', `
+    process.argv = [process.argv[0], 'x', '--lan'];
+    const s = require(${JSON.stringify(path.join(ROOT, 'server.js'))});
+    console.log('LISTEN_HOST=' + s.LISTEN_HOST);
+    console.log('LAN_ENABLED=' + s.LAN_ENABLED);
+  `], { cwd: ROOT, encoding: 'utf8', timeout: 15000 });
+  assert.match(outLan, /LISTEN_HOST=0\.0\.0\.0/, '--lan 时必须对外监听。实际输出：' + outLan);
+  assert.match(outLan, /LAN_ENABLED=true/, '--lan 必须开启局域网模式。实际输出：' + outLan);
+});
+
+test('H-9 令牌签发：伪造 Sec-Fetch 头不再能拿令牌（必须有真实来源）', async () => {
+  /* 报告里的越权链第 2 步：只有 Sec-Fetch-Site + Sec-Fetch-Mode，没有 Origin/Referer */
+  const forged = await request(port, {
+    path: '/ripple-token.js',
+    headers: { 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'no-cors' },
+  });
+  assert.strictEqual(forged.status, 403,
+    '只有可伪造的 Sec-Fetch 头时必须 403（H-9 修前这里是 200，等于局域网设备可签令牌）');
+  assert.ok(!/[a-f0-9]{32}/.test(forged.body), '403 响应里不该漏出令牌');
+
+  /* 正常浏览器（同源页面 <script src> 带 Referer）仍然能签 —— 这条必须保持 200 */
+  const browser = await request(port, {
+    path: '/ripple-token.js',
+    headers: {
+      Referer: 'http://localhost:' + port + '/',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'no-cors',
+    },
+  });
+  assert.strictEqual(browser.status, 200, '正常浏览器页面加载必须仍能拿到令牌');
+  assert.ok(/[a-f0-9]{32}/.test(browser.body), '正常浏览器应拿到令牌');
+
+  /* 只带 Origin（没有 Sec-Fetch-*，某些浏览器/SW 场景）也要能签 */
+  const viaOrigin = await request(port, {
+    path: '/ripple-token.js',
+    headers: { Origin: 'http://localhost:' + port },
+  });
+  assert.strictEqual(viaOrigin.status, 200, '只带同源 Origin 时也必须能签令牌');
 });

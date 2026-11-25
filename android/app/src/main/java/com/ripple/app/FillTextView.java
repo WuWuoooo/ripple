@@ -253,12 +253,6 @@ public class FillTextView extends View {
         invalidate();
     }
 
-    public void resetFillCache() {
-        scrollX = 0f;
-        scrollAt = 0;
-        invalidate();
-    }
-
     /* ================= 测量 ================= */
 
     /** 文字实际宽度（px） */

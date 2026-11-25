@@ -6,6 +6,195 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.6 — Thirteenth Version
+
+> **Basis**: the 1.3.5 code review report from MiniMax M3.1 Flash
+> (`docs/code_review_record/代码审查_1.3.5.md`, 52 items: 2 blocker / 16 high / 16 medium / 18 low).
+> **Implementation and docs by**: Deepseek V4.1 Flash 1017.
+
+No new features — a pure remediation release. But almost everything it fixes is a
+**guardrail**, not a feature. The most striking items share one trait: read on their own,
+each looks fine; put together, they silently stop working.
+
+### 1. The two blockers: the guardrails themselves were broken
+
+**B-1 `[package] version` in Cargo.toml can be stale while three separate checks all report green**
+
+`version` is a legal key in **any** TOML table. The old implementation replaced and asserted
+on "the first `^version =` in the file" — the write and the assertion shared one wrong
+predicate, so the assertion was tautologically equal to the write. Add any table with a
+`version` key above `[package]` and the sync silently writes to the wrong table while the
+desktop installer version stays frozen at the old value.
+
+This is 1.3.0's D-02 recurring verbatim. **The real fix is removing the structure that
+allows one predicate to be copied into several places**:
+
+- A new `scripts/version-facts.js` is the **single version parser** (Cargo.toml is located
+  by `[package]` section, not by first occurrence)
+- `android/sync-version.sh` ends by calling it for an **independently implemented**
+  re-check — only an independent implementation can catch a wrong predicate
+- The checker and CI call the same parser
+- The copy list is declared in three places (parser / `SYNC_TARGETS` in the sync script /
+  the CONTRIBUTING.md table) and the checker's `[G]` section compares all three;
+  any drift turns it red
+
+**B-2 The i18n coverage test claimed "covers every Chinese UI string" while 3 were untranslated in English mode**
+
+The test asserted "this string is in the dictionary", but the real predicate should be
+"**the engine actually turns it into different text in English mode**". The two diverge
+exactly when a key exists but the whole string never matches — which is what those 3 cases were.
+The predicate is now `I.T(s) !== s`, and templated strings are split into static fragments
+for checking.
+
+### 2. The most user-damaging item: song titles and lyrics were being translated
+
+**H-1 `SKIP_SEL` only applied on insertion; the `textContent` and `setAttribute` paths bypassed it entirely**
+
+The i18n engine has three DOM-writing paths, and only the first (`walk()`, recursive
+insertion) consulted the skip list. Every `textContent = ` assignment in `app.js` (titles,
+lyric lines, comment counts) goes through the second, and `setAttribute('aria-label', …)`
+through the third — neither consulted it.
+
+Measured effect: any song whose title happens to hit a short dictionary entry
+(`全部`/`深`/`浅`/`自动`/`推荐`… several hundred of them) becomes `All`/`Dark`/`Auto` in the
+English UI, so **the title shown no longer matches the file being played**. A Chinese lyric
+line ending in a matched fragment (` 分钟` → ` min`) would become mixed Chinese/English.
+
+A shared `inSkip(node)` (walking ancestors) now guards all three paths.
+
+**H-2 `translateAttr` never refreshed its cached source text**
+
+The cache was written only once, and the attributes branch had no "this is our own write"
+predicate — so business code calling `setAttribute('aria-label', …)` got reverted to the old
+translation. In English mode the sidebar toggle's aria-label **read "Collapse" whether the
+nav was expanded or collapsed**. That is a real accessibility bug, not just copy.
+
+### 3. The status-bar lyric "unlock" button never worked (introduced in 1.2.3, carried two releases)
+
+**H-14** The overlay stayed permanently locked: it could not be dragged or tapped, and nothing
+was logged.
+
+The root cause was a call blocked by an early `return`:
+
+- `show()` **unconditionally** wrote `FLAG_NOT_TOUCHABLE`
+- the only code that clears it is `updateLayoutFlags()`, whose call sites all sit **after**
+  `configure()`'s `if (!added || view == null || lp == null) return;`
+- the frontend calls `configure()` → `show()`, so when `configure` runs the overlay has not
+  been `addView`-ed yet (`added == false`) and returns immediately
+
+Corroborating evidence: `setLocked()` has zero callers — when 1.2.3 removed the
+`lockLyricOverlay` bridge method it deleted the only runtime path for changing lock state,
+and the new path never picked that step back up.
+
+Everything now goes through `flagsFor(locked)`, the same algorithm as `updateLayoutFlags()`,
+so the two cannot drift again.
+
+### 4. LAN privilege escalation: default listen address is now loopback only
+
+**H-9** Three factors combined into a complete escalation chain:
+
+1. `listen(0.0.0.0)` → reachable from the whole LAN (and the README explicitly told users to do this)
+2. `allowedHosts()` allow-listed every NIC IP → Host validation defeated
+3. token issuance only inspected `Sec-Fetch-*` and friends, **headers the client can forge**
+4. tokens are bound to the source IP → a LAN device's own token is usable by that device
+5. so with the `MUSIC_U` in `.ripple-cookie` it could call `/ncm/like`, `/ncm/comment_add`, `/ncm/logout`
+
+**This is not a read-only exposure like "see the track title" — it is a writable account operation.**
+
+Now: **the default listen address is `127.0.0.1`**, and LAN access becomes an explicit action
+via `--lan` / `RIPPLE_LAN=1`; issuance fallback requires a real `Origin` / `Referer`; and a
+new IP issuing a token prints a prominent server log line. The "we defend against the LAN"
+wording in `SECURITY.md` was rewritten to match the implementation — documentation should
+not imply stronger guarantees than the code provides.
+
+### 5. Remaining high / medium / low, summarised
+
+| Item | Problem | Treatment |
+|---|---|---|
+| H-3 | "Reset to defaults" set `lang` back to Chinese without telling the engine → UI stayed English, save file said Chinese, next launch silently reverted | Language is excluded from reset; `applyLangSetting()` re-translates the page at the end |
+| H-4 | `sw.js` `SHELL` lacked `lyricfill.js` → offline first launch got 504, then `LF` was null and threw every 100ms | Added to SHELL + `!LF` guard at the call site + new `[F]` check comparing SHELL against index.html |
+| H-5 | `CrashLog`/`RippleApp` version copies were completely outside the checker | Copies went from 4 to 8, cross-checked against the sync script and docs |
+| H-6 | Upstream-path consistency covered only 13 of 17 commands | Extraction widened (block slicing, delegation expansion, local-variable paths); assertion now requires every command on all three ends |
+| H-7 | The 413 path `req.destroy()` poisoned the keep-alive pool → next request ECONNRESET (measured 26/30) | 413 now sends `Connection: close`; measured **30/30** |
+| H-8 | Notification channel names never updated on language switch | Removed the "already exists, return" guard; channels are rebuilt on language change (**and the incorrect "platform limitation" note in 1.3.5 was corrected**) |
+| H-10 | Desktop `mediaState` was a fake implementation → settings falsely promised "notification bar / lock screen / headset keys" | Placeholder removed so it degrades naturally |
+| H-11 | Desktop was missing 16 bridge methods (including `systemDark` and the whole `log*` family) | Added `systemDark` (desktop "follow system" always resolved to light before) and native file logging; every other method was judged individually and the reasoning recorded in comments |
+| H-12 | The lyric window never received command results | Results go to **all** webviews instead of a hard-coded `main` |
+| H-13 | Single-instance protection was vacuous (returned true even with a live instance) | Distinguishes "live instance → refuse" from "stale lock → take over" |
+| H-15 | `delete()` before reading `length()` → the byte count in the error was always 0 | Read first, then delete |
+| H-16 | Error logs in the Downloads folder still crowded out real crash reports | Separate prefix and separate quota for error logs |
+| M-1 | Concatenated strings starting with CJK were never translated | `T()` gained a "split on ` · `" level |
+| M-2 | Checker did not compare `sw.js`'s SHELL against `index.html` | New `[F]` section |
+| M-3 | `build-apk.sh` never verified the version inside the produced APK | Reads it back with `aapt2 dump badging` and asserts |
+| M-5 | The `build.gradle` sed had no anchor-uniqueness constraint | Converged on the shared helper |
+| M-6 | The `CONTRIBUTING.md` copy list named 5 places (there are 8) | Completed, and `[G]` now guards it |
+| M-7 | CI's `node --check` glob missed `app/js/lang/*.js` and `server-security.js` | Fixed (the language pack is the single point of failure for the English UI, yet a syntax error there left CI green) |
+| M-8 | `tests/heartmode.test.js` was a **tautological test**: it copied the implementation into the test and tested the copy | Now slices the function body out of the source and runs it via `new Function`; plus a **meta-test** proving the suite goes red when the implementation is broken |
+| M-9 | `perf.js` did not notify the frontend when auto-downgrading → lyric blur kept running on low-end | `perf.js` dispatches an event when the class actually flips; the frontend recomputes |
+| M-10 | Six runtime-concatenated counters/headings bypassed i18n | Unified on whole-string `TT()` templates |
+| M-11 | Source text was not refreshed in Chinese mode → copy changed in Chinese stayed Chinese after switching to English | The observer also runs in Chinese mode, refreshing source text without writing the DOM |
+| M-12 | After a language switch the three notification action titles stayed the same (language was not in the notification fingerprint) | Language added to `notifKey` |
+| M-13 | An error message containing U+2028/U+2029 made the whole response invalid JSON → the frontend waited 25s | Both escaping sites fixed |
+| M-14 | The status-bar lyric driver scheduled no frames when line duration was unknown, so resuming playback could stall it permanently | Gate removed |
+| M-15 | Desktop lyric window "first creation" and "reset to default position" landed in two different places | Extracted into one function with one coordinate convention; the reset position is written back |
+| M-16 | The lyric window's first frame lacked `lineDur`/`baseProgress` → the first line's fill was static | The two payloads now share one constructor |
+| L-1 | The CSS first-paint fallback for `--glass-strength` was `.65`, a leftover from the old value range (the new default should be `.5`) | Value corrected and stale comment rewritten |
+| L-8 | `javac`/`d8` in `build-apk.sh` used unquoted command substitution (breaks on paths containing spaces) | Switched to `mapfile -d` arrays |
+
+The remaining low items (desktop URL filtering, `intent://` scheme, cover-image thread pool,
+MediaStore owner check, notification-permission check, JSON construction, dead code and stale
+comments) were cleaned up as well.
+
+### 6. Two real bugs this release caught on its own (not in the report)
+
+After M-8 changed the tests to run the real source, they immediately caught two genuine
+defects — both **invisible** to the old "test the copy" approach:
+
+1. `netease.js`'s `mapSong(null)` threw `TypeError` outright. A single null in an upstream
+   list (delisted track, copyright placeholder, occasional empty element) aborts the whole
+   `.map()`, and the user sees "this playlist is entirely empty" while the log holds only one
+   context-free error line.
+2. `heartMode`'s `pick(x)` dereferenced `x.songInfo` on null, breaking the same chain.
+
+Fix: `mapSong` returns null for non-objects; a shared `mapSongs(arr, pick)` helper now keeps
+the filtering rule in one place (a dozen call sites used to each write their own `.map()`,
+and half forgot to filter empties).
+
+### 7. Tests and verification
+
+| Item | Result |
+|---|---|
+| Full unit suite | **204 / 204** |
+| Manifest-consistency checker | **All green** (sections A/B/C/D/E/F/G) |
+| B-1 mutation | "A version key above `[package]`" → checker **red** |
+| H-5 mutation | Breaking the `CrashLog`/`RippleApp` versions → red |
+| H-6 mutation | Three-end path mismatch → red (and the new rule caught a fourth command, `comments`, that was previously invisible) |
+| M-5 mutation | Two anchors in `build.gradle` → the script errors instead of silently rewriting both |
+| M-8 mutation | Deleting the real layer-probing logic → meta-test **red** |
+| M-3 artifact check | `[ok] 产物版本校验通过：versionCode=136 versionName=1.3.6` |
+| H-7 live test | 413 race reproduction script: 26/30 before, **30/30** after |
+| H-9 live test | Default startup binds `127.0.0.1`; the startup log states "add --lan for phone access" |
+| Android | `bash android/build-apk.sh` compiles for real |
+| Rust | `rustfmt --check` passes (**no cargo on this machine, so no full compile verification**) |
+
+### 8. Known limitations
+
+- **The desktop Rust changes are not fully compile-verified.** The local `--offline` crate
+  cache lacks `adler2`, so `cargo check` cannot complete; the changes went through
+  `rustfmt` syntax checks plus line-by-line review. The three riskiest spots are the
+  hand-written `WorkerPool`, the changed single-instance return semantics, and the lyric
+  window coordinate unification. CI (`.github/workflows/desktop-build.yml`) does compile them.
+- The other half of `H-9` — moving the HTTP request outside the lock — **was not done**:
+  `Client::call(&mut self)` reads cookies and merges `Set-Cookie` back into `self` during the
+  call, so splitting it needs a new API that cannot be compile-verified here. Redesigning the
+  core network and login-state path on an unverifiable design is a far worse risk than
+  "requests occasionally queue".
+- The desktop lyric-window result channel delivers to all webviews rather than tracking which
+  window issued each cbId. At two windows the former is simpler and harmless (a window
+  without that cbId is a no-op); it should become bookkeeping-based once the window count
+  grows or callbacks gain side effects.
+---
+
 ## 1.3.5 — Twelfth Version
 
 > **Basis**: six experience issues reported by the user (UI languages / lyric line
@@ -80,9 +269,14 @@ the "install unknown apps" guidance all live in Java, where the web layer cannot
 them. A new `L10n.java` (two-argument `t(zh, en)`, deliberately no key table) covers 31
 places, synced from the web layer via `RippleNative.setLang()`.
 
-> **Known limitation**: once an Android notification channel has been created, the system
-> does not allow renaming it — after switching language, an **already existing** channel
-> only updates on reinstall or clear-data. That is platform behaviour, not an oversight.
+> **That judgement was wrong (fixed in 1.3.6)**: this originally read "the Android platform
+> does not allow renaming an existing notification channel". It does — the official docs state
+> that `createNotificationChannel()` **updates the name and description** of an existing
+> channel (only user-editable settings such as importance / sound / vibration are ignored).
+> What actually blocked the update was the `if (ch != null) return;` guard: once the channel
+> existed the code returned before ever reaching the create call. Recording a code bug as a
+> platform limitation has one direct consequence: **the next maintainer will not fix it**.
+> 1.3.6 corrects the wording and the code; see the 1.3.6 section.
 
 **Adding a third language later**: create `app/js/lang/xx.js` calling
 `I18n.register('xx', 'self-name', dict)`, add one `<script>` line in `index.html`, add one

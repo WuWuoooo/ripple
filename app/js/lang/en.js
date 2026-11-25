@@ -18,6 +18,9 @@
     "同步收藏": "Sync favorites",
     "晚上好，欢迎回来": "Good evening, welcome back",
     "深夜的低频，": "Late-night basslines,",
+    /* index.html 的 hero 副标题是「前半句 <br> 后半句」—— 整串也要有词条，
+       否则带 <br> 的整串查不到词典，两半只各翻一半或者整句留中文 */
+    "深夜的低频，<br>和一点失真的暖意": "Late-night basslines,<br>and a little warm distortion",
     "和一点失真的暖意": "and a little warm distortion",
     "正在读取你的口味…": "Reading your taste…",
     "立即播放": "Play now",
@@ -249,6 +252,16 @@
     "<div class=\"plrow\"><div class=\"tx\"><b>读取中…</b></div></div>": "<div class='plrow'><div class='tx'><b>Loading…</b></div></div>",
     " 个": " playlists",
     "<div class=\"empty\" style=\"padding:26px 10px\"><b>没有歌单</b></div>": "<div class='empty' style='padding:26px 10px'><b>No playlists</b></div>",
+    /*
+     * 以下四条是歌手名 / 乐队名 / 乐器名，**有意保留原文**，不是漏译。
+     *
+     * 这些是「热搜」里给用户的搜索推荐词：译成 "Jay Chou" 之后用户点不到，
+     * 因为它最终会被塞进网易云的搜索框，而那个接口只认中文词。
+     * 「钢琴」作为曲风标签留中文同理（英文界面里它也是搜索入口）。
+     *
+     * 所以看到「值里还有汉字」不要顺手修掉 —— tests/i18n.test.js 的
+     * SAME_AS_KEY_OK 允许名单里也写死了这几条，两边必须同步。
+     */
     "周杰伦": "周杰伦",
     "草东没有派对": "草东没有派对",
     "陈粒": "陈粒",
@@ -721,5 +734,28 @@
     "歌词模糊": "Lyric blur",
     "非当前句越远越模糊": "Lines further from the current one blur more",
     "非当前句越远越模糊（需高画质）": "Lines further from the current one blur more (high quality only)",
+
+    /*
+     * ===== 运行时拼接的计数/标题文案（审查 1.3.5 的 M-10） =====
+     *
+     * 这几条以前是「中文片段 + 动态数字」直接拼在 app.js 里，整串查不到词典：
+     *   '12 首 · 3.5 MB'、'歌单 · 5'、'1.2 万 赞'、'30 首 · 会一直续下去'
+     * 英文界面下就整句是中文，或者两套机制各翻一半（'30 songs · 按口味生成'）。
+     *
+     * 现在 app.js 统一走 TT('{n} …', {n}) 整串模板。注意这里写的是**单花括号**
+     * {n} 而不是 ${n}：占位符由 i18n.js 的 T(s, vars) 做字符串替换，
+     * 这几个 key 不是 ES 模板串。
+     */
+    "{n} 首 · {mb} MB": "{n} songs · {mb} MB",
+    "{n} 赞": "{n} likes",
+    "{n} 首 · 会一直续下去": "{n} songs · it keeps going",
+    "歌单 · {n}": "Playlists · {n}",
+    "本机 · {n} 个结果": "Local · {n} results",
+    /* 更新弹层（1.3.5 的 M-10 附近遗漏）：正文 notes 是 CHANGELOG 原文、
+       由服务端提供，不翻；但这几处**界面自己的**文案必须翻。 */
+    "发现新版本": "Update available",
+    "当前 {cur} → 最新": "Current {cur} → latest",
+    "准备下载…": "Preparing download…",
+    "以后再说": "Not now",
   });
 })(window);

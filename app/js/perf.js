@@ -79,13 +79,31 @@
     try { return g.localStorage.getItem(KEY_AUTO) === '1'; } catch (e) { return false; }
   }
 
+  /*
+   * 把当前档位落到 <html> 上，并在**真的翻转**时广播一次。
+   *
+   * 为什么必须广播：低配判定有一条是运行时自动降级（measure() 实测帧率偏低），
+   * 那条路径不经过设置页，app.js 里那些「按档位决定要不要做某个效果」的开关
+   * （典型是歌词模糊的 html.lyr-blur 类）就永远收不到通知 ——
+   * 于是自动降级之后毛玻璃关了，但每一行歌词仍然是一个独立的 filter:blur
+   * 合成层，低配机照样掉帧，低配的全部意义落空。
+   *
+   * 只在类真的变化时发：apply() 在启动、手动切换、自动降级三处都会被调，
+   * 每次都发一遍事件会让设置页做无意义的整轮重算。
+   */
   function apply() {
     var m = mode();
     var low = m === 'low' || (m === 'auto' && (autoLow() || guessLow()));
     var root = document.documentElement;
+    var changed = root.classList.contains('perf-low') !== low;
     root.classList.toggle('perf-low', low);
     /* 顺手把选择广播出去，设置页/别的脚本想知道当前档位时读这个属性即可 */
     root.setAttribute('data-perf', low ? 'low' : 'high');
+    if (changed) {
+      try {
+        g.dispatchEvent(new g.CustomEvent('ripple:perf', { detail: { low: low } }));
+      } catch (e) {}
+    }
     return low;
   }
 

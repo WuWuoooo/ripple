@@ -56,15 +56,38 @@ final class PublicFile {
             ContentResolver cr = ctx.getContentResolver();
             Uri existing = null;
             if (overwrite) {
+                /*
+                 * L-15：查询必须同时限定 RELATIVE_PATH 与创建者。
+                 *
+                 * 以前只按 DISPLAY_NAME 全局查 —— 用户在公共下载目录里
+                 * 手工放一个同名文件（比如自己建的 Ripple-log.txt）也会被命中，
+                 * 于是 existing 指向**别人的文件**，openOutputStream 在
+                 * Android 11+ 抛 SecurityException，被最外层 catch(Throwable) 吞掉，
+                 * 返回空串 → 调用方以为写成功了，实际日志静默丢失。
+                 *
+                 * 现在多查一列 OWNER_PACKAGE_NAME：只有确实是本应用创建的文件
+                 * 才复用（覆盖写）；否则 existing 保持 null，走 insert ——
+                 * MediaStore 遇到同名会自动改名（如 Ripple-log (1).txt），
+                 * 既不碰别人的文件，自己的日志也一定落得下来。
+                 */
+                final String owner = ctx.getPackageName();
+                final String dir = Environment.DIRECTORY_DOWNLOADS;
                 Cursor c = cr.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                        new String[]{MediaStore.MediaColumns._ID},
-                        MediaStore.MediaColumns.DISPLAY_NAME + "=?",
-                        new String[]{name}, null);
+                        new String[]{
+                                MediaStore.MediaColumns._ID,
+                                MediaStore.MediaColumns.OWNER_PACKAGE_NAME},
+                        MediaStore.MediaColumns.DISPLAY_NAME + "=? AND "
+                                + MediaStore.MediaColumns.RELATIVE_PATH + "=?",
+                        new String[]{name, dir}, null);
                 if (c != null) {
                     try {
                         if (c.moveToFirst()) {
-                            existing = ContentUris.withAppendedId(
-                                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, c.getLong(0));
+                            String who = c.isNull(1) ? null : c.getString(1);
+                            /* null（老系统或非本应用写入的条目）一律不复用，宁可多建一个 */
+                            if (who != null && who.equals(owner)) {
+                                existing = ContentUris.withAppendedId(
+                                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, c.getLong(0));
+                            }
                         }
                     } finally {
                         c.close();

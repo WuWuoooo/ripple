@@ -107,8 +107,6 @@ public class LyricOverlay {
      * 改成让外推逻辑自己兑现这次重置，写入方就只剩一个。
      */
     private volatile boolean needResetBase = false;
-    /** 唱满后还能空转多少帧（见 pushFrame 末尾说明） */
-    private int fullHoldFrames = 0;
     private boolean tickScheduled = false;
     /*
      * 自驱动链路的诊断计数（定位「填充不动」到底断在哪一层）：
@@ -290,13 +288,27 @@ public class LyricOverlay {
                 final boolean reposition = (this.posX < 0 || this.posY < 0) || nx >= 0 || ny >= 0;
 
                 applyStyle();
-                if (!added || view == null || lp == null) return;
+                /*
+                 * H-14：这里本来是一句 `if (!added || view == null || lp == null) return;`，
+                 * 把下面三件本该「随时可做」的事全挡在门外。
+                 *
+                 * 三种状态的正确分工：
+                 *   · 浮层还没建（lp == null）：什么都做不了，改了字段等 show() 用 —— 直接 return；
+                 *   · lp 已建、还没 addView（added == false）：**flags 可以先算好写进 lp**，
+                 *     show() 拿到的就是对的；位置同理（applyPosition 只写 lp）。
+                 *     前端「configure → show」是正常时序，这条分支必须把 flags 落实，
+                 *     否则 updateLayoutFlags() 永远等不到 added（H-14 的第二个断点）；
+                 *   · 已 addView：三条全做，并让窗口真的重建（updateViewLayout）。
+                 */
+                if (lp == null) return;
                 if (reposition) {
                     applyPosition();
-                    try {
-                        wm.updateViewLayout(view, lp);
-                    } catch (Throwable e) {
-                        CrashLog.recordAsync(ctx, "lyric-move", e);
+                    if (added && view != null && wm != null) {
+                        try {
+                            wm.updateViewLayout(view, lp);
+                        } catch (Throwable e) {
+                            CrashLog.recordAsync(ctx, "lyric-move", e);
+                        }
                     }
                 }
                 updateLayoutFlags();
@@ -386,11 +398,28 @@ public class LyricOverlay {
         });
     }
 
+    /**
+     * 运行中切换「锁定 / 解锁」（H-14）。
+     *
+     * 审查报告说它「零调用方」—— 在当前代码里确实如此（前端改锁定走的是
+     * configure() 带 locked 参数那条路）。但它**不能删**：
+     *   · configure() 只在浮层已 addView 时才走 updateLayoutFlags()，
+     *     而 show() 之前调 configure() 是常态（MainActivity.showLyricOverlay
+     *     就是 configure → show）。删掉它之后，「运行中改锁定」就只剩
+     *     configure() 一条路，而那条路的 flags 生效依赖 added —— 语义太绕；
+     *   · 它是「改锁定」这个动作**唯一**的语义化入口，留着比让下一个维护者
+     *     再去 configure 里翻 flags 更不容易出错。
+     *
+     * 顺带修一个隐藏问题：原来 `if (locked == v && added) return;` 在
+     * 「值没变、但还没 added」时也会走到 `if (added) updateLayoutFlags()`，
+     * 等于什么都没做。现在只要 lp 已经建出来就重算 flags ——
+     * 这样即使浮层还没 addView，锁定态也已经落实到 lp 上，show() 会直接用它。
+     */
     public void setLocked(boolean v) {
         main.post(() -> {
-            if (locked == v && added) return;
             locked = v;
-            if (added) updateLayoutFlags();
+            /* lp 还没建（从未 show 过）时无事可做，show() 会按 locked 初始化 */
+            if (lp != null) updateLayoutFlags();
         });
     }
 
@@ -440,11 +469,28 @@ public class LyricOverlay {
                  */
                 lp.width = WindowManager.LayoutParams.WRAP_CONTENT;
                 lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-                // 默认不拦触摸：锁定态就是纯展示，绝不影响用户操作别的 App
-                lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+                /*
+                 * ===== H-14：flags 必须按 locked 决定，不能写死 =====
+                 *
+                 * 这里原本无条件写死 FLAG_NOT_TOUCHABLE（「锁定态就是纯展示」）——
+                 * 于是「解锁」按钮彻底失效：前端把 locked=false 推上来、
+                 * configure() 也把字段改成了 false，但窗口 flags 只有
+                 * updateLayoutFlags() 会按 locked 重算，而那个方法的调用点
+                 * 全在 configure() 里 `if (!added || view == null || lp == null) return;`
+                 * **之后** —— 前端走的是 configure() → show() 的顺序，
+                 * configure 执行时浮层还没 addView（added=false），当场 return，
+                 * updateLayoutFlags() 永远轮不到；接着 show() 又写死
+                 * NOT_TOUCHABLE。结果：锁定 → 解锁之后浮层依然收不到触摸，
+                 * bindTouch() 注册的 OnTouchListener 一次都不触发。
+                 * （1.2.3 删掉 HttpBridge.lockLyricOverlay 时丢的就是这条通路，
+                 *   拖到 1.3.5 一直没补回来。）
+                 *
+                 * 现在统一走 flagsFor(locked) —— 与 updateLayoutFlags() 同一个
+                 * 算法（见那个函数上方的注释），两边不可能再漂。
+                 * 于是无论「先 configure 后 show」还是「运行中 setLocked」，
+                 * 最终生效的 flags 都由 locked 决定。
+                 */
+                lp.flags = flagsFor(locked);
                 applyStyle();
                 // 把上次的歌词写进新 TextView（否则重开标签页后一直是空白）
                 /*
@@ -661,12 +707,6 @@ public class LyricOverlay {
             this.rate = fr;
             timingPlaying = fplay;
             progress = fp;
-            /*
-             * 新基准点到了：清掉「唱满后的空转计数」，
-             * 否则上一句遗留的 fullHoldFrames 会让这一句刚开始就被停掉
-             * （pushFrame 里 p>=1 分支用的就是它）。
-             */
-            fullHoldFrames = 0;
             needResetBase = false;
             dTimingRecv++;
             applyProgressFill();
@@ -770,9 +810,17 @@ public class LyricOverlay {
          * 现在：永远返回 true，驱动永不停歇。
          *   · 外推本身只是几次浮点运算，30fps 下耗电可以忽略；
          *   · 满格期间 p 恒为 1，FillTextView 的 hash 去重会走
-         *     「参数没变只 invalidate」的轻路径，不重建渐变；
-         *   · 真正的省电由 stopTick() 负责 —— 隐藏浮层、关掉填充、
-         *     暂停播放时都会停，那些才是该停的时刻。
+         *     「参数没变只 invalidate」的轻路径，不重建渐变。
+         *
+         * ⚠️ 别把「省电靠谁」想错了（审查报告 L-18）：
+         *   **暂停播放时并不会调 stopTick()** —— 暂停是在上面那个
+         *   `if (!timingPlaying) { ...; return false; }` 分支里，
+         *   靠「本帧不再排下一帧」间接把驱动停掉的。
+         *   stopTick() 的调用点只有三处：hide()（浮层隐藏）、
+         *   configure() 里关闭填充、setAppBackground()（切驱动前先停旧的）。
+         *   所以暂停期间的「省电」完全依赖上面那个 return false 分支，
+         *   而恢复播放依赖前端推 setTiming —— 这正是 M-14 那条的成因
+         *   （推送被前端去重挡掉时驱动就再也拉不起来了）。
          *
          * 冻结基准（baseProgress=1, baseAt=now）保留：
          * 这样 p 恒为 1 不会继续增长，算出来的值稳定，
@@ -781,8 +829,6 @@ public class LyricOverlay {
         if (p >= 1f) {
             baseProgress = 1f;
             baseAt = now;
-        } else {
-            fullHoldFrames = 0;
         }
         return true;
     }
@@ -936,8 +982,26 @@ public class LyricOverlay {
         }
     }
 
+    /**
+     * 排下一帧。
+     *
+     * M-14：这里曾经还有一条 `lineDurSec <= 0.01f` 的门禁 ——
+     * 「句长未知就别排帧」。它和 pushFrame 里那条同名判断叠加之后，
+     * 制造了一条**永久停摆**的路径：
+     *   ① 暂停 → pushFrame 的暂停分支 return false，驱动链断掉；
+     *   ② 恢复播放时前端推 setTiming，但纯音乐段 / 歌词未加载时
+     *      前端自己会把推送挡掉（lineDur=0 那条门禁在 app.js 里），
+     *      于是 setTiming 根本没被调用；
+     *   ③ 就算调到了，lineDurSec 仍是 0 → 这里直接 return，驱动拉不起来；
+     *   ④ 结果浮层填充永久停住，直到下一次换句（setText → scheduleTick）才复活。
+     *
+     * 现在只保留「开没开填充」和「是否已排过」两个判据：
+     * 句长未知时也要让驱动转起来，靠 pushFrame 里那条
+     * `if (lineDurSec <= 0.01f) return true;` 空转到新基准点到来 ——
+     * 那种情况本来就该空转（省电交给暂停分支的 return false，不在这里挡）。
+     */
     private void scheduleTick() {
-        if (!fillProgress || lineDurSec <= 0.01f) return;
+        if (!fillProgress) return;
         if (tickScheduled) return;
         tickScheduled = true;
         main.postDelayed(ticker, TICK_MS);
@@ -950,24 +1014,23 @@ public class LyricOverlay {
     }
 
     /**
-     * App 前后台状态变化（1.3.3 第六轮的关键修复）。
+     * App 前后台状态变化（历史遗留的回调，现在只剩「重排一次驱动」的作用）。
      *
-     * ⚠️ 为什么必须有这个回调：
-     *   上一轮为了解决「悬浮窗 invalidate 被吞」，把驱动从 Handler 换成了
-     *   Choreographer。前台时它确实更好（对齐 vsync、不漂），但
-     *   **Choreographer 的回调依赖 vsync 信号，而进程切到后台后
-     *   系统就不再给它分发 vsync 了**（省电策略，AOSP 与各 ROM 都这样）。
+     * ⚠️ 这里曾经是个关键修复，但**描述的机制已经不存在了**，别再照着它推演：
+     *   早期为了绕开「悬浮窗 invalidate 被吞」，驱动一度从 Handler 换成了
+     *   Choreographer。Choreographer 依赖 vsync，而进程切到后台后系统
+     *   不再分发 vsync，于是外推彻底停摆（症状是「只有换句那一下才填充」）。
+     *   于是加了这条回调：后台退回 Handler、前台切回 Choreographer。
      *
-     *   于是出现了用户这次报的症状：
-     *     「只会在一句播完的时候瞬间填充，然后到下一句」
-     *   —— 因为状态栏歌词的使用场景**就是切到别的 App 时看**，
-     *   此时 Choreographer 一帧不给，原生外推彻底停摆；
-     *   唯一还能画一帧的时刻，就是网页跨桥送来新基准点（换句）的那一下。
+     * 后来 Choreographer 分支被整段删除（见类里「Choreographer 相关字段
+     * 已全部删除」那句，以及 ticker 的注释），现在**前后台都用
+     * Handler.postDelayed**。所以切驱动已经没意义了，这个回调现在只做两件事：
+     *   · 记录前后台状态（日志与诊断用）；
+     *   · stopTick() + scheduleTick() 重排一次帧 —— 顺带能把「暂停期间
+     *     pushFrame return false 断掉」的驱动链重新拉起来。
      *
-     *   修法：后台自动退回 Handler.postDelayed。
-     *   Handler 消息由应用自己的 Looper 分发，**不受 vsync 影响**，
-     *   后台依然按 30fps 跑（实测 Android 对普通后台 Handler 没有额外节流，
-     *   只有 Doze/省电模式才会延迟，那种情况连播放都会断）。
+     * 保留它而不是删掉：它是 App 生命周期里唯一会主动「重排帧」的钩子，
+     * 在 M-14 那条「恢复播放推送被去重导致永久停摆」的场景里是兜底之一。
      *
      * @param bg true = App 已切到后台
      */
@@ -975,9 +1038,8 @@ public class LyricOverlay {
         main.post(() -> {
             if (appInBackground == bg) return;
             appInBackground = bg;
-            LogBridge.add(ctx, "LYRIC", "app background=" + bg
-                    + ", driver=handler");
-            /* 切换驱动前先停掉旧的，避免两套同时在跑 */
+            LogBridge.add(ctx, "LYRIC", "app background=" + bg + ", driver=handler");
+            /* 先停旧的再排新的：保证同一时刻只有一条 ticker 链在跑 */
             stopTick();
             scheduleTick();
         });
@@ -1154,22 +1216,47 @@ public class LyricOverlay {
         }
     }
 
-    /** 锁定 → 不拦触摸；未锁定 → 拦触摸以便拖动和点击 */
+    /*
+     * 窗口 flags 的公共部分（与 locked 无关的三件套）。
+     *
+     * 抽出来的理由（H-14 的根因就是这个算法存在**两份**）：
+     *   show() 建立 lp 时要写一次，updateLayoutFlags() 改锁定时又要写一次，
+     *   以前两处各抄一遍，show() 那份漏掉了「按 locked 选择触摸位」，
+     *   于是运行中解锁永远不生效。现在两边都调这个函数，不可能再漂。
+     */
+    private static int baseWindowFlags() {
+        return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+    }
+
+    /** 按 locked 算出完整的 flags：锁定 → 不拦触摸；未锁定 → 拦触摸以便拖动和点击 */
+    private static int flagsFor(boolean locked) {
+        return locked
+                ? (baseWindowFlags() | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+                : (baseWindowFlags() | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL);
+    }
+
+    /**
+     * 把当前锁定状态落实到窗口上。
+     *
+     * 允许在「还没 addView」时调用：那种情况下只更新 lp（show() 会直接用它），
+     * 不去碰 WindowManager。以前这里一上来就 `if (view == null || wm == null) return;`，
+     * 于是 configure() 在 show() 之前调它纯属空转 —— 这是 H-14 里
+     * 「configure 先 show 后」链路上的第二个断点。
+     */
     private void updateLayoutFlags() {
-        if (lp == null || view == null || wm == null) return;
+        if (lp == null) return;
         try {
-            int base = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-            if (locked) {
-                lp.flags = base | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-                view.setAlpha(alpha);
-            } else {
-                lp.flags = base | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
-                view.setAlpha(Math.min(1f, alpha + 0.06f));
+            lp.flags = flagsFor(locked);
+            if (view != null) {
+                /* 解锁态稍亮一点：让用户看得出「现在是可拖动的」 */
+                view.setAlpha(locked ? alpha : Math.min(1f, alpha + 0.06f));
             }
-            wm.updateViewLayout(view, lp);
-            LogBridge.add(ctx, "LYRIC", "flags updated locked=" + locked);
+            if (added && view != null && wm != null) {
+                wm.updateViewLayout(view, lp);
+                LogBridge.add(ctx, "LYRIC", "flags updated locked=" + locked);
+            }
         } catch (Throwable e) {
             CrashLog.recordAsync(ctx, "lyric-flags", e);
         }

@@ -57,17 +57,27 @@
    * 这些容器里装的是**远程数据**（歌名、歌词、评论、歌单名……），
    * 整棵子树跳过。用 id/class 精确列出而不是靠「看起来像不像」猜。
    *
+   * 两条维护规则（都是踩过的坑）：
+   *   ① 只写**真实存在**的选择器。之前这里挂着 #searchRes / #cmtList /
+   *      #queList / #queueList 四个 id，而 index.html 里一个都没有 ——
+   *      看着像有四道保护，实际是四道空气。写完必须回 index.html 核一遍。
+   *   ② 优先枚举「一行 = 一条远程数据」的**整个容器**，而不是逐个字段。
+   *      `.row`（曲库/搜索行）、`.qitem`（队列行）、`.plrow`（歌单行）都是这种
+   *      容器：行内新增任何一个显示远程数据的元素，只要容器整行跳过就天然安全，
+   *      不必再回来加一条规则。
+   *
    * data-i18n-skip 是给以后的动态内容留的显式逃生口。
    */
   var SKIP_SEL = [
-    '.lyric',            // 展开歌词（整篇 LRC）
-    '.np-lyric',         // 收起态三行歌词
+    '.lyric',            // 展开歌词（整篇 LRC，#npLyric）
+    '.np-lyric',         // 收起态三行歌词（#npLyricMini）
     '#npTitle', '#npArtist', '#npMeta',          // 播放页歌名/艺人
-    '.r-tx', '.r-fmt', '.r-du',                  // 列表行的歌名/艺人/音质/时长
+    '.row', '.qitem', '.plrow',                  // 一行 = 一首远程歌 / 一个歌单
+    '.r-tx', '.r-fmt', '.r-du',                  // 行内歌名/艺人/音质/时长（容器之外也兜一层）
     '.gcard', '.c-card', '.c-k',                 // 网格卡 / 首页卡片
-    '#plTracks', '#queList', '#queueList',       // 歌单曲目 / 队列
-    '#cmtBody', '#cmtList',                      // 评论
-    '#searchRes', '#searchBody',                 // 搜索结果
+    '#plTracks', '#npQueue',                     // 歌单曲目 / 播放队列
+    '#cmtBody',                                  // 评论列表（真 id）
+    '#searchBody',                               // 搜索结果
     '.cmt-body',
     '[data-i18n-skip]'
   ].join(',');
@@ -80,6 +90,34 @@
 
   /** 需要翻译的属性（都是「会被人读到」的那些） */
   var ATTRS = ['aria-label', 'title', 'placeholder', 'alt'];
+
+  /**
+   * 这个节点是否落在「不翻译」的容器里（含自身）。
+   *
+   * 为什么必须抽成一个函数、并且**三条通路共用**：
+   *   以前只有 walk()（innerHTML 插入）查了 SKIP_SEL，而运行时改 DOM 有三条
+   *   通路 —— innerHTML 插入、textContent 赋值（→ characterData）、
+   *   setAttribute（→ attributes）。后两条完全绕过剪枝，于是
+   *   `$('#npTitle').textContent = t.title` 把歌名「全部」写进去之后，
+   *   观察器接住 characterData 直接翻译，界面上歌名真的变成了 All。
+   *   这正是文件头承诺「不翻译用户在听的内容」被打脸的地方。
+   *
+   * 实现上向上遍历祖先而不是只看自身：`#cmtBody` 里的 `.cmt` 子节点自己
+   * 不命中任何 SKIP_SEL 规则，但它的祖先命中，所以必须往上找。
+   */
+  function inSkip(node) {
+    var el = node;
+    if (!el) return false;
+    if (el.nodeType !== 1) el = el.parentElement;   // 文本节点/属性节点都从父元素起算
+    while (el) {
+      if (el.nodeType === 1) {
+        if (SKIP_TAG[el.tagName]) return true;
+        if (el.matches && el.matches(SKIP_SEL)) return true;
+      }
+      el = el.parentElement;
+    }
+    return false;
+  }
 
   /* ---------- 含 HTML 的条目 → 内部文本段 ---------- */
 
@@ -149,12 +187,20 @@
       var d = DICT[CUR];
       if (d && has(d, s)) out = d[s];
       /*
-       * 整串没命中 → 试两端片段。
-       * 放在 T() 里面而不是只放在文本节点通路里，是为了让**两条通路**
+       * 整串没命中 → ① 按 ' · ' 切段逐段翻 → ② 两端片段。
+       *
+       * 这两级都放在 T() 里面而不是只放在文本节点通路里，是为了让**两条通路**
        * 都能用：'30 分钟' 这种拼接串既可能是 innerHTML 写进去的文本节点，
        * 也可能是显式 T(n + ' 分钟') 拼出来的，只覆盖一条就会有一半漏掉。
+       *
+       * 顺序不能反：先切段再片段。'主题 · 跟随系统' 两段都是完整的词条，
+       * 切段能整段换成 'Theme · Follow system'；若先走片段，只会在两端
+       * 找 ' 跟随系统' 这类片段，结果是半中半英。
        */
-      else out = translateByFragment(s);
+      else {
+        var bySep = translateBySeparator(s);
+        out = bySep !== s ? bySep : translateByFragment(s);
+      }
     }
     if (vars) {
       /*
@@ -166,6 +212,57 @@
       });
     }
     return out;
+  }
+
+  /*
+   * ---------- 分隔符切段 ----------
+   *
+   * 有一类拼接串是「完整词条 + ' · ' + 完整词条」：
+   *   '主题 · 跟随系统'、'歌单 · 12'、'本机 · 3 个结果'、'精彩评论 · 5'
+   * 每一段单独看都是词典里的键（或者能被片段匹配翻掉），但整串不是。
+   *
+   * 为什么片段匹配救不了它：片段规则要求**以非中文打头**（见
+   * fragmentsFor 里那段注释，防「深」误伤「深夜」）。而这类串开头是中文，
+   * 一个候选都进不去，整串原样返回 —— 英文界面里就露出这半截中文。
+   *
+   * 所以补这一级：按 ' · ' 切开，**逐段整串命中词典才替换**。
+   * 判据刻意保守：
+   *   · 只认 ' · '（带空格的间隔号）这一个分隔符，不去猜别的标点；
+   *   · 段内必须有词典条目（或片段可翻），否则那段原样留着；
+   *   · 全文一段都没换成 → 返回原串，让上层继续试片段匹配。
+   * 这样最坏情况是「没翻」，不会出现「翻坏」。
+   */
+  var SEP = ' · ';
+
+  function translateSegment(seg) {
+    var d = DICT[CUR];
+    if (!d) return seg;
+    if (has(d, seg)) return d[seg];
+    /* 段内也可能是「数字 + 量词」：'12' 翻不了，'3 个结果' 要能翻 */
+    var frag = translateByFragment(seg);
+    return frag;
+  }
+
+  function translateBySeparator(core) {
+    if (CUR === 'zh') return core;
+    if (!core || core.indexOf(SEP) < 0) return core;
+    var parts = core.split(SEP);
+    if (parts.length < 2) return core;
+    var changed = false;
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i];
+      /* 首尾空白不属于词条，剥掉再查；查不到就原样放回 */
+      var ws = splitWs(seg);
+      var got = translateSegment(ws[1]);
+      if (got !== ws[1]) {
+        changed = true;
+        out.push(ws[0] + got + ws[2]);
+      } else {
+        out.push(seg);
+      }
+    }
+    return changed ? out.join(SEP) : core;
   }
 
   /*
@@ -256,6 +353,24 @@
     return m ? [m[1], m[2], m[3]] : ['', txt, ''];
   }
 
+  /**
+   * 翻译一个文本节点。
+   *
+   * 两个状态变量：
+   *   · __i18nSrc  —— 这段文字的**原文**（中文）。切语言时靠它回到中文，
+   *                   而不是反向查词典（反向会撞上一词多译）。
+   *   · __i18nLast —— 我们上次写进 DOM 的值，用来认出「这条变更是我自己写的」。
+   *
+   * 源文本的刷新规则（修的是「记下就再也不变」那个 bug）：
+   *   当前 DOM 值 == __i18nLast → 说明这是我们自己写的译文，原文另存，不动；
+   *   当前 DOM 值 ≠ __i18nLast → 说明业务代码改了内容，那它**就是新原文**。
+   * 以前写的是「只有 __i18nSrc 不是字符串才赋值」，一旦记下就冻住 ——
+   * 于是中文态改过的文案切回英文时还是中文，英文态改过的文案会被翻回旧译文。
+   *
+   * 中文态也走这条路径，只是算出来的 next 就是原文本身，绝大多数情况下
+   * `full !== raw` 不成立 → 不写 DOM。所以「中文态零副作用」是自然结果，
+   * 不需要单独开一个 if 分支把它短路掉（短路掉反而会让源文本重新冻住）。
+   */
   function translateTextNode(node) {
     var raw = node.nodeValue;
     if (!raw) return;
@@ -263,16 +378,10 @@
     var core = parts[1];
     if (!core) return;
 
-    /*
-     * __i18nSrc 记住「原文」。切语言时靠它回到中文，
-     * 而不是靠反向查词典 —— 反向会撞上一词多译。
-     */
-    if (typeof node.__i18nSrc !== 'string') {
-      if (CUR === 'zh') return;          // 中文态什么都不用做，也无需记忆
-      node.__i18nSrc = core;
-    }
-    var next = T(node.__i18nSrc);
-    if (CUR === 'zh') next = node.__i18nSrc;
+    var mine = (typeof node.__i18nLast === 'string' && node.__i18nLast === raw);
+    if (!mine || typeof node.__i18nSrc !== 'string') node.__i18nSrc = core;
+
+    var next = CUR === 'zh' ? node.__i18nSrc : T(node.__i18nSrc);
     var full = parts[0] + next + parts[2];
     if (full !== raw) {
       node.__i18nLast = full;             // 标记「这是我们写的」，防止自激
@@ -280,6 +389,16 @@
     }
   }
 
+  /**
+   * 翻译一个属性。缓存/自激的规则与 translateTextNode 完全同构：
+   *   __i18nAttr[name]     原文
+   *   __i18nAttrLast[name] 我们上次写进去的值
+   *
+   * 修的原 bug：原文只在第一次缓存，且 attributes 通路没有自激判据 →
+   * 业务 setAttribute('aria-label', '展开导航') 之后，引擎拿着旧原文
+   * '收起导航' 翻出 'Collapse navigation' 又写回去，把新状态覆盖掉。
+   * 屏幕阅读器于是永远读同一个错误状态（折叠按钮不管展开还是收起都读「收起」）。
+   */
   function translateAttr(el, name) {
     var v = el.getAttribute(name);
     if (!v) return;
@@ -287,32 +406,38 @@
     var core = parts[1];
     if (!core) return;
     if (!el.__i18nAttr) el.__i18nAttr = {};
-    if (CUR === 'zh') {
-      if (has(el.__i18nAttr, name)) {
-        el.setAttribute(name, parts[0] + el.__i18nAttr[name] + parts[2]);
-        delete el.__i18nAttr[name];
-      }
-      return;
-    }
-    if (!has(el.__i18nAttr, name)) el.__i18nAttr[name] = core;
-    var next = T(el.__i18nAttr[name]);
+    if (!el.__i18nAttrLast) el.__i18nAttrLast = {};
+
+    var mine = has(el.__i18nAttrLast, name) && el.__i18nAttrLast[name] === v;
+    if (!mine || !has(el.__i18nAttr, name)) el.__i18nAttr[name] = core;
+
+    var src = el.__i18nAttr[name];
+    var next = CUR === 'zh' ? src : T(src);
     var full = parts[0] + next + parts[2];
-    if (full !== v) el.setAttribute(name, full);
+    if (full !== v) {
+      el.__i18nAttrLast[name] = full;
+      el.setAttribute(name, full);
+    }
   }
 
   /**
    * 翻译一棵子树（含自身）。
    * 用递归而不是 TreeWalker：需要「遇到 SKIP_SEL 就整棵不进去」，
    * TreeWalker 的 filter 只能按节点拒绝，剪枝要额外判断祖先，反而更绕。
+   *
+   * @param {Node} node
+   * @param {boolean} isRoot true = 这是遍历入口，需连**祖先**一起查跳过规则。
+   *   为什么不一律用 inSkip：递归里父节点已经验过了，每个子节点再向上爬一遍
+   *   就是 O(深度²)。入口要查祖先是因为 childList 通路会把「刚插进
+   *   #cmtBody 的一个节点」直接传进来 —— 它自己是干净的，祖先才是脏的。
    */
   function walk(node, isRoot) {
     if (!node) return;
     if (node.nodeType === 3) { translateTextNode(node); return; }
     if (node.nodeType !== 1) return;
 
-    var tag = node.tagName;
-    if (SKIP_TAG[tag]) return;
-    if (node.matches && node.matches(SKIP_SEL)) return;
+    if (isRoot ? inSkip(node) : (SKIP_TAG[node.tagName] ||
+        (node.matches && node.matches(SKIP_SEL)))) return;
 
     for (var i = 0; i < ATTRS.length; i++) translateAttr(node, ATTRS[i]);
 
@@ -325,9 +450,18 @@
   function applyAll() {
     if (!doc || !doc.body) return;
     walk(doc.body, true);
+    /*
+     * 标题同一套源文本规则：页面切换（发现/曲库/我的）会在中文态改
+     * document.title，若只记第一次的值，切英文后标题永远停在最初那一页。
+     */
     if (doc.title) {
-      if (!doc.__i18nTitle) doc.__i18nTitle = doc.title;
-      doc.title = CUR === 'zh' ? doc.__i18nTitle : T(doc.__i18nTitle);
+      var mineTitle = doc.__i18nTitleLast === doc.title;
+      if (!mineTitle || typeof doc.__i18nTitle !== 'string') doc.__i18nTitle = doc.title;
+      var wantTitle = CUR === 'zh' ? doc.__i18nTitle : T(doc.__i18nTitle);
+      if (wantTitle !== doc.title) {
+        doc.__i18nTitleLast = wantTitle;
+        doc.title = wantTitle;
+      }
     }
     var html = doc.documentElement;
     html.setAttribute('lang', CUR === 'zh' ? 'zh-CN' : CUR);
@@ -348,12 +482,24 @@
   };
 
   function onMutate(muts) {
-    if (CUR === 'zh') return;   // 中文态不需要翻译，也就不需要观察
+    /*
+     * 中文态也要处理，但只**记原文、不写 DOM**。
+     *
+     * 以前这里是 `if (CUR === 'zh') return;`，再配合 setLang 里中文态
+     * stopObserve() —— 中文态下业务代码改的文案永远进不了 __i18nSrc。
+     * 于是出现了「英文态打开评论 → 切回中文 → 换一首歌（评论数更新为中文）
+     * → 再切英文，评论数还是中文」这种夹生状态：源文本是旧的，翻出来当然不对。
+     *
+     * 代价要说清楚：中文态每一条文本变更都会多一次回调。所以这条分支里
+     * 只做「splitWs + 三行赋值」，不查词典、不碰 DOM、不建缓存 ——
+     * 比英文态轻得多，且不会引发新的 mutation（不写 DOM 就不会自激）。
+     */
+    var zh = (CUR === 'zh');
     /*
      * 先断开：我们接下来会写 DOM，写出来的变更又会触发回调（自激）。
      * disconnect() 会清空记录队列，之后再 observe() 就只收到新变更。
      */
-    obs.disconnect();
+    if (obs) obs.disconnect();
     try {
       for (var i = 0; i < muts.length; i++) {
         var m = muts[i];
@@ -361,20 +507,63 @@
           var t = m.target;
           /* 自己写的那一次：值等于我们上次写入的结果 → 跳过 */
           if (t.__i18nLast === t.nodeValue) continue;
+          /* 远程数据容器（歌名/歌词/评论）：一个字节都不要动 */
+          if (inSkip(t)) continue;
           t.__i18nSrc = null;          // 内容被业务代码改过，重新取原文
-          translateTextNode(t);
+          if (zh) {
+            /* 只刷新源文本，算出来的抄写值等于原值 → translateTextNode 不写 DOM */
+            refreshSrcOnly(t);
+          } else {
+            translateTextNode(t);
+          }
         } else if (m.type === 'childList') {
           for (var a = 0; a < m.addedNodes.length; a++) walk(m.addedNodes[a], true);
         } else if (m.type === 'attributes') {
-          translateAttr(m.target, m.attributeName);
+          var el = m.target, nm = m.attributeName;
+          /* 自己写的那一次：属性值等于我们上次写入的结果 → 跳过（自激保护） */
+          if (el.__i18nAttrLast && el.__i18nAttrLast[nm] === el.getAttribute(nm)) continue;
+          if (inSkip(el)) continue;
+          if (zh) refreshAttrSrcOnly(el, nm);
+          else translateAttr(el, nm);
         }
       }
     } catch (e) {
       if (g.Log) { try { g.Log.err('I18N', e, 'observer'); } catch (e2) {} }
     }
     /* 把这次自己写出的变更记录丢掉，再从干净的队列继续观察 */
-    obs.takeRecords();
-    obs.observe(doc.body, OBS_CFG);
+    if (obs) {
+      obs.takeRecords();
+      if (doc && doc.body) obs.observe(doc.body, OBS_CFG);
+    }
+  }
+
+  /**
+   * 中文态专用：只把当前 DOM 文本记成原文，不写回 DOM。
+   *
+   * 与 translateTextNode 的区别仅在于「不做翻译、不赋值」。
+   * 单独一个函数而不是给 translateTextNode 加参数，是为了让英文态那条
+   * 性能敏感路径保持原样（多一个布尔判断都不加）。
+   */
+  function refreshSrcOnly(node) {
+    var raw = node.nodeValue;
+    if (!raw) return;
+    var core = splitWs(raw)[1];
+    if (!core) return;
+    node.__i18nSrc = core;
+    /* 中文态的 DOM 值就是原文，让 __i18nLast 跟着走，别留下旧译文当判据 */
+    if (node.__i18nLast !== raw) node.__i18nLast = raw;
+  }
+
+  /** 中文态专用：刷新属性的原文缓存，不写回属性 */
+  function refreshAttrSrcOnly(el, name) {
+    var v = el.getAttribute(name);
+    if (!v) return;
+    var core = splitWs(v)[1];
+    if (!core) return;
+    if (!el.__i18nAttr) el.__i18nAttr = {};
+    el.__i18nAttr[name] = core;
+    if (!el.__i18nAttrLast) el.__i18nAttrLast = {};
+    el.__i18nAttrLast[name] = v;
   }
 
   function startObserve() {
@@ -439,7 +628,15 @@
       if (!I18n.has(code)) code = 'zh';
       var changed = code !== CUR;
       CUR = code;
-      if (CUR === 'zh') stopObserve(); else startObserve();
+      /*
+       * 观察器在**两种语言下都保持开启**。
+       *
+       * 中文态曾经是关掉的（“不翻译就不需要观察”），代价是中文态下业务改的
+       * 文案永远进不了源文本缓存 —— 见 onMutate 顶部的长注释。
+       * 现在中文态只做「记原文」，成本是每条文本变更一次回调，
+       * 不做词典查找、不写 DOM，不会再触发自身。
+       */
+      startObserve();
       applyAll();
       if (!silent) {
         /* Store 已经加载 → 走正常的设置写入（会落盘、会触发 onSettingChange） */
@@ -484,7 +681,8 @@
     var want = readLangFromStorage();
     if (want !== 'zh' && !has(DICT, want)) want = 'zh';
     CUR = want;
-    if (CUR === 'zh') stopObserve(); else startObserve();
+    /* 中文态也观察（只记原文不写 DOM），理由见 onMutate 顶部 */
+    startObserve();
     applyAll();
   }
 

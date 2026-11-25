@@ -364,7 +364,44 @@
 
     /* ================= 音乐数据 ================= */
 
+    /**
+     * 把上游列表映射成曲目列表，并丢掉无法映射的项。
+     *
+     * 为什么要有这个助手：mapSong 对 null/非对象返回 null（见它的注释），
+     * 而下面十几个调用点原本都是裸 `.map((s) => this.mapSong(s))` ——
+     * 那会把 null 留在数组里，上层拿到空对象后表现为「列表里有一行空白」。
+     * 统一走这里，过滤规则只有一处，不会有人忘。
+     *
+     * @param {Array} arr 上游原始数组（可能含 null / 非对象）
+     * @param {(x:any)=>any} [pick] 取真正的歌曲对象（如 x.songInfo || x.song || x）
+     */
+    mapSongs(arr, pick) {
+      if (!Array.isArray(arr)) return [];
+      const out = [];
+      for (const x of arr) {
+        /* 先挡掉非对象：pick 回调里会直接写 x.songInfo，
+           对 null 调用就是 TypeError（测试用真实源码跑这条路径时抓到了） */
+        if (!x || typeof x !== 'object') continue;
+        const raw = pick ? pick(x) : x;
+        const t = this.mapSong(raw);
+        if (t && t.neId) out.push(t);
+      }
+      return out;
+    },
+
     mapSong(s) {
+      /*
+       * 防御：上游返回的列表里**可能夹着 null / 非对象**（下架歌曲、
+       * 版权受限的占位项、接口偶发的空元素）。而 mapSong 是 30 处调用点
+       * 共用的映射器，它一旦在这里抛 TypeError，整个 .map() 就中断 ——
+       * 上层表现出来是「这张歌单/这个搜索结果整页空」，
+       * 而日志里只有一句读不到上下文的 'Cannot read properties of null'。
+       *
+       * 测试（tests/heartmode.test.js）用真实源码跑这条路径时抓到了它：
+       * data 里混一个 null 就直接崩。这里返回 null 让调用方的
+       * .filter(Boolean) 把它丢掉，与 heartMode 现有的过滤约定一致。
+       */
+      if (!s || typeof s !== 'object') return null;
       const ar = s.ar || s.artists || [];
       const al = s.al || s.album || {};
       const dt = s.dt || s.duration || 0;
@@ -404,7 +441,7 @@
     async searchSongs(kw, limit = 30, offset = 0) {
       const r = await this.call('search', { keywords: kw, type: 1, limit, offset });
       const songs = (r.result && r.result.songs) || [];
-      return { total: (r.result && r.result.songCount) || songs.length, list: songs.map((s) => this.mapSong(s)) };
+      return { total: (r.result && r.result.songCount) || songs.length, list: this.mapSongs(songs) };
     },
 
     async searchPlaylists(kw, limit = 20, offset = 0) {
@@ -416,7 +453,7 @@
     async songDetail(ids) {
       if (!ids || !ids.length) return [];
       const r = await this.call('song_detail', { ids: ids.join(',') });
-      return (r.songs || []).map((s) => this.mapSong(s));
+      return this.mapSongs(r.songs);
     },
 
     /** 取播放地址；取不到就抛错（会员/版权限制时明确告知，不做绕过） */
@@ -461,13 +498,13 @@
         cover: cover(pl.coverImgUrl, 600),
         desc: (pl.description || '').slice(0, 200),
         creator: (pl.creator && pl.creator.nickname) || '',
-        tracks: (pl.tracks || []).map((s) => this.mapSong(s)),
+        tracks: this.mapSongs(pl.tracks),
       };
     },
 
     async playlistTracks(id, limit = 200) {
       const r = await this.call('playlist_tracks', { id: String(id), limit });
-      return (r.songs || []).map((s) => this.mapSong(s));
+      return this.mapSongs(r.songs);
     },
 
     async toplist() {
@@ -487,9 +524,8 @@
       // 登录：v3/discovery/recommend/songs → data.dailySongs
       // 未登录：personalized/newsong → result[{song}]
       const daily = (r.data && r.data.dailySongs) || null;
-      if (daily) return daily.map((s) => this.mapSong(s));
-      const news = r.result || [];
-      return news.map((x) => this.mapSong(x.song || x)).filter((t) => t.neId);
+      if (daily) return this.mapSongs(daily);
+      return this.mapSongs(r.result, (x) => x.song || x);
     },
 
     async personalizedPlaylists(limit = 10) {
@@ -577,9 +613,7 @@
         Log.add('NCM', 'heartMode empty: code=' + (r && r.code)
           + ' msg=' + (r && r.message) + ' plId=' + (plId || '0'));
       }
-      return list
-        .map((x) => this.mapSong(x.songInfo || x.song || x))
-        .filter((t) => t && t.neId);
+      return this.mapSongs(list, (x) => x.songInfo || x.song || x);
     },
 
     /**
