@@ -68,15 +68,24 @@ fn is_safe_upstream_path(path: &str) -> Result<(), String> {
                 || c == '&'
         })
     {
-        return Err(i18n::tf("非法上游路径：{path}", "Invalid upstream path: {path}", &[("path", path.to_string())]));
+        return Err(i18n::tf(
+            "非法上游路径：{path}",
+            "Invalid upstream path: {path}",
+            &[("path", path.to_string())],
+        ));
     }
     Ok(())
 }
 
 impl Client {
     pub fn new(data_dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(data_dir)
-            .map_err(|e| i18n::tf("创建配置目录失败：{e}", "Failed to create config dir: {e}", &[("e", e.to_string())]))?;
+        fs::create_dir_all(data_dir).map_err(|e| {
+            i18n::tf(
+                "创建配置目录失败：{e}",
+                "Failed to create config dir: {e}",
+                &[("e", e.to_string())],
+            )
+        })?;
         let cookie_path = data_dir.join("netease-cookie");
         let cookie_jar = fs::read_to_string(&cookie_path).unwrap_or_default();
 
@@ -85,7 +94,13 @@ impl Client {
             .user_agent(UA)
             .gzip(true)
             .build()
-            .map_err(|e| i18n::tf("HTTP 客户端初始化失败：{e}", "Failed to init HTTP client: {e}", &[("e", e.to_string())]))?;
+            .map_err(|e| {
+                i18n::tf(
+                    "HTTP 客户端初始化失败：{e}",
+                    "Failed to init HTTP client: {e}",
+                    &[("e", e.to_string())],
+                )
+            })?;
 
         Ok(Self {
             http,
@@ -218,10 +233,19 @@ impl Client {
         }
 
         if !res.status().is_success() {
-            return Err(i18n::tf("上游返回 HTTP {code}", "Upstream returned HTTP {code}", &[("code", res.status().as_u16().to_string())]));
+            return Err(i18n::tf(
+                "上游返回 HTTP {code}",
+                "Upstream returned HTTP {code}",
+                &[("code", res.status().as_u16().to_string())],
+            ));
         }
-        res.text()
-            .map_err(|e| i18n::tf("读取响应失败：{e}", "Failed to read response: {e}", &[("e", e.to_string())]))
+        res.text().map_err(|e| {
+            i18n::tf(
+                "读取响应失败：{e}",
+                "Failed to read response: {e}",
+                &[("e", e.to_string())],
+            )
+        })
     }
 
     /// 命令分发 —— 20 个命令与 Java / Node 两侧一一对应。

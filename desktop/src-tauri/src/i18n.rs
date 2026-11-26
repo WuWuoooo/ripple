@@ -109,11 +109,19 @@ mod tests {
     #[test]
     fn tf_interpolates_each_language() {
         set_lang("zh");
-        let zh = tf("目录 {p} 创建失败", "Failed to create dir {p}", &[("p", "/tmp/x".into())]);
+        let zh = tf(
+            "目录 {p} 创建失败",
+            "Failed to create dir {p}",
+            &[("p", "/tmp/x".into())],
+        );
         assert_eq!(zh, "目录 /tmp/x 创建失败");
 
         set_lang("en");
-        let en = tf("目录 {p} 创建失败", "Failed to create dir {p}", &[("p", "/tmp/x".into())]);
+        let en = tf(
+            "目录 {p} 创建失败",
+            "Failed to create dir {p}",
+            &[("p", "/tmp/x".into())],
+        );
         assert_eq!(en, "Failed to create dir /tmp/x");
         set_lang("zh");
     }

@@ -175,10 +175,13 @@ fn get_or_init_client(
     state: &State<'_, AppState>,
     data_dir: &PathBuf,
 ) -> Result<Arc<Mutex<netease::Client>>, String> {
-    let mut guard = state
-        .client
-        .lock()
-        .map_err(|e| i18n::tf("状态锁被污染：{e}", "State lock poisoned: {e}", &[("e", e.to_string())]))?;
+    let mut guard = state.client.lock().map_err(|e| {
+        i18n::tf(
+            "状态锁被污染：{e}",
+            "State lock poisoned: {e}",
+            &[("e", e.to_string())],
+        )
+    })?;
     if let Some(c) = guard.as_ref() {
         return Ok(Arc::clone(c));
     }
@@ -643,7 +646,7 @@ fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), St
         tauri::WebviewUrl::App("lyric.html".into()),
     )
     /* 窗口标题是任务栏/窗口列表里能被看到的一处；歌词窗没有装饰（decorations(false)），
-       所以这行主要对「窗口列表」「无障碍接口」可见。仍跟语言走。 */
+    所以这行主要对「窗口列表」「无障碍接口」可见。仍跟语言走。 */
     .title(i18n::t("Ripple 歌词", "Ripple lyrics"))
     .inner_size(360.0, 64.0)
     .min_inner_size(120.0, 32.0)
@@ -699,7 +702,11 @@ fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), St
             }
             Ok(())
         }
-        Err(e) => Err(i18n::tf("歌词窗口创建失败：{e}", "Failed to create lyric window: {e}", &[("e", e.to_string())])),
+        Err(e) => Err(i18n::tf(
+            "歌词窗口创建失败：{e}",
+            "Failed to create lyric window: {e}",
+            &[("e", e.to_string())],
+        )),
     }
 }
 
