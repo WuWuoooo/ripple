@@ -78,6 +78,30 @@ pub fn tf(zh: &'static str, en: &'static str, args: &[(&str, String)]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /*
+     * 这三条测试都在改**同一个全局** `ENGLISH`，而 cargo test 默认并行跑
+     * 同一个二进制里的测试（线程数通常 = CPU 核心数）。
+     *
+     * 1.3.7 第一次提交时没加锁，CI 的 windows-latest 上直接红了：
+     *   lang_switches_both_ways 断言 "中文"，实际拿到 "English" ——
+     *   因为另一条测试恰好在它 set_lang("zh") 之后 set_lang("en") 了。
+     *
+     * 为什么只在一台机器上红：并行度不同，交错顺序就不同。ubuntu 上恰好
+     * 没撞上，windows 上撞上了。这类「本地绿、CI 红」的测试最消耗信任，
+     * 所以显式串行化，而不是让人记得加 `--test-threads=1`（那等于没护栏）。
+     *
+     * 用标准库 Mutex 而不是 `serial_test` crate：多一个 dev-dependency 就要
+     * 改 Cargo.lock，而本机构建是 `--offline --locked`。
+     */
+    static LANG_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 拿锁时忽略「上一个持锁线程 panic 导致锁中毒」——
+    /// 中毒只说明别的测试失败过，而这几条彼此独立，继续跑不会掩盖问题。
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        LANG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// 语言切换必须能来回切，且默认是中文。
     ///
@@ -87,6 +111,7 @@ mod tests {
     /// 只要语言状态是"每次现读"而不是"算一次存下来"，就不会有这个毛病。
     #[test]
     fn lang_switches_both_ways() {
+        let _g = guard();
         set_lang("zh");
         assert_eq!(t("中文", "English"), "中文");
         set_lang("en");
@@ -98,6 +123,7 @@ mod tests {
     /// 大小写与空白不该影响判定 —— 前端传的是 "en"，但万一哪天传 "EN" 也得认。
     #[test]
     fn lang_code_is_forgiving() {
+        let _g = guard();
         set_lang(" EN ");
         assert!(is_english());
         set_lang("zh");
@@ -108,6 +134,7 @@ mod tests {
     /// 插值要真的替换掉占位符，且两种语言都用**各自的**格式串。
     #[test]
     fn tf_interpolates_each_language() {
+        let _g = guard();
         set_lang("zh");
         let zh = tf(
             "目录 {p} 创建失败",
