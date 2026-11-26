@@ -33,6 +33,7 @@
 //! 而不是写死投给 main —— 哪个窗口发的请求就该收到结果。
 //! 前端那个回调表是 per-window 的，没有对应 cbId 的窗口会静默 no-op。
 
+use ripple_desktop::i18n;
 use ripple_desktop::netease;
 
 use std::path::PathBuf;
@@ -177,7 +178,7 @@ fn get_or_init_client(
     let mut guard = state
         .client
         .lock()
-        .map_err(|e| format!("状态锁被污染：{e}"))?;
+        .map_err(|e| i18n::tf("状态锁被污染：{e}", "State lock poisoned: {e}", &[("e", e.to_string())]))?;
     if let Some(c) = guard.as_ref() {
         return Ok(Arc::clone(c));
     }
@@ -223,7 +224,7 @@ fn netease(
             Err(e) => {
                 let bad = serde_json::json!({
                     "code": 400,
-                    "message": format!("参数不是合法 JSON：{e}"),
+                    "message": i18n::tf("参数不是合法 JSON：{e}", "Params are not valid JSON: {e}", &[("e", e.to_string())]),
                 });
                 let js = format!(
                     "if (typeof window.__rippleNativeResult === 'function') {{ window.__rippleNativeResult({}, {}); }}",
@@ -282,7 +283,7 @@ fn netease(
             // 但桌面端请求量本来就不高，且能保证 cookie 不被并发写坏。
             let result = match client.lock() {
                 Ok(mut c) => c.call(&cmd, &params_json),
-                Err(e) => Err(format!("状态锁被污染：{e}")),
+                Err(e) => Err(i18n::tf("状态锁被污染：{e}", "State lock poisoned: {e}", &[("e", e.to_string())])),
             };
             match result {
                 Ok(t) => t,
@@ -515,6 +516,20 @@ fn safe_mode() -> bool {
     false
 }
 
+/// 与 Android `HttpBridge.setLang` 同签名：前端切语言时把语言码推进原生层。
+///
+/// Android 那边是写进 SharedPreferences（重启后由 `L10n.init` 读回）；
+/// 桌面端没有等价的"启动时读设置"时机 —— Rust 进程比 WebView 早，
+/// 那时前端的 localStorage 还读不到。所以这里**只保存运行期状态**，
+/// 由 bridge.js 在每次启动后（前端 boot 完成、语言确定之后）再推一次。
+/// 结果就是：进程存活期间语言永远正确；重启后的第一次错误消息可能
+/// 用中文默认值 —— 这是已知的、可接受的边界（README 里会写明）。
+#[tauri::command]
+fn set_lang(code: String) -> bool {
+    i18n::set_lang(&code);
+    true
+}
+
 /* ================= 歌词窗（状态栏歌词的桌面端对等物） =================
  *
  * Android 那边是「盖在系统状态栏上的悬浮窗」（LyricOverlay.java），
@@ -627,7 +642,9 @@ fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), St
         LYRIC_WINDOW,
         tauri::WebviewUrl::App("lyric.html".into()),
     )
-    .title("Ripple 歌词")
+    /* 窗口标题是任务栏/窗口列表里能被看到的一处；歌词窗没有装饰（decorations(false)），
+       所以这行主要对「窗口列表」「无障碍接口」可见。仍跟语言走。 */
+    .title(i18n::t("Ripple 歌词", "Ripple lyrics"))
     .inner_size(360.0, 64.0)
     .min_inner_size(120.0, 32.0)
     .decorations(false)
@@ -682,7 +699,7 @@ fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), St
             }
             Ok(())
         }
-        Err(e) => Err(format!("歌词窗口创建失败：{e}")),
+        Err(e) => Err(i18n::tf("歌词窗口创建失败：{e}", "Failed to create lyric window: {e}", &[("e", e.to_string())])),
     }
 }
 
@@ -1183,6 +1200,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             netease,
             notify,
+            /* 原生层多语言：前端切语言时推进来，见 i18n 模块注释 */
+            set_lang,
             lyric_overlay_timing,
             open_external,
             safe_mode,

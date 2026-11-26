@@ -200,16 +200,23 @@ final class NeteaseClient {
      * 顺带把 ".." 这种目录穿越也挡掉（字符集里虽然有 '.'，但连续的点单独判）。
      */
     private static void assertSafePath(String path) throws Exception {
-        if (path == null || path.isEmpty()) throw new Exception("非法接口路径");
+        /*
+         * 1.3.7：这三处抛出的 message 会被 HttpBridge 原样塞进
+         * {"code":-1,"msg":...} 回给网页，前端再把它当 Error message
+         * toast 出来 —— 也就是说它**会出现在用户眼前**，必须跟语言走。
+         * 之前是硬编码中文，英文界面下用户会看到一句中文。
+         */
+        String bad = L10n.t("非法接口路径", "Illegal API path");
+        if (path == null || path.isEmpty()) throw new Exception(bad);
         for (int i = 0; i < path.length(); i++) {
             char c = path.charAt(i);
             boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
                     || (c >= '0' && c <= '9')
                     || c == '/' || c == '_' || c == '-' || c == '.' || c == '?'
                     || c == '=' || c == '&';
-            if (!ok) throw new Exception("非法接口路径");
+            if (!ok) throw new Exception(bad);
         }
-        if (path.contains("..")) throw new Exception("非法接口路径");
+        if (path.contains("..")) throw new Exception(bad);
     }
 
     private static String readBody(HttpURLConnection conn) throws Exception {
@@ -416,7 +423,15 @@ final class NeteaseClient {
                  */
                 String id = p.optString("id").trim();
                 if (!id.matches("^\\d+$")) {
-                    return "{\"code\":-1,\"msg\":\"歌曲 id 不合法\"}";
+                    /*
+                     * 1.3.7：这条 msg 会被前端原样 toast 出来（netease.js 把
+                     * json.msg 当 Error message 抛，app.js 再显示），所以必须跟语言走。
+                     * 之前它是硬编码中文 —— 英文界面下用户会看到一句中文。
+                     */
+                    JSONObject bad = new JSONObject();
+                    bad.put("code", -1);
+                    bad.put("msg", L10n.t("歌曲 id 不合法", "Invalid song id"));
+                    return bad.toString();
                 }
                 JSONObject o = new JSONObject();
                 o.put("rid", id);
@@ -439,7 +454,7 @@ final class NeteaseClient {
                  */
                 JSONObject unknown = new JSONObject();
                 unknown.put("code", -2);
-                unknown.put("msg", "未知命令 " + cmd);
+                unknown.put("msg", L10n.t("未知命令 ", "Unknown command ") + cmd);
                 return unknown.toString();
         }
     }

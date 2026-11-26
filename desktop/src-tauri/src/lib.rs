@@ -5,5 +5,6 @@
 //! `Cargo.toml` 里的 `[lib]` 声明，让 `cargo test` 能跑单元测试
 //! （`weapi`、`netease` 的测试都在这里被编到）。
 
+pub mod i18n;
 pub mod netease;
 pub mod weapi;

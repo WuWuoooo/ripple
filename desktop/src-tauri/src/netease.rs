@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::i18n;
 use crate::weapi;
 
 const HOST: &str = "https://music.163.com";
@@ -67,14 +68,15 @@ fn is_safe_upstream_path(path: &str) -> Result<(), String> {
                 || c == '&'
         })
     {
-        return Err(format!("非法上游路径：{path}"));
+        return Err(i18n::tf("非法上游路径：{path}", "Invalid upstream path: {path}", &[("path", path.to_string())]));
     }
     Ok(())
 }
 
 impl Client {
     pub fn new(data_dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(data_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+        fs::create_dir_all(data_dir)
+            .map_err(|e| i18n::tf("创建配置目录失败：{e}", "Failed to create config dir: {e}", &[("e", e.to_string())]))?;
         let cookie_path = data_dir.join("netease-cookie");
         let cookie_jar = fs::read_to_string(&cookie_path).unwrap_or_default();
 
@@ -83,7 +85,7 @@ impl Client {
             .user_agent(UA)
             .gzip(true)
             .build()
-            .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
+            .map_err(|e| i18n::tf("HTTP 客户端初始化失败：{e}", "Failed to init HTTP client: {e}", &[("e", e.to_string())]))?;
 
         Ok(Self {
             http,
@@ -160,7 +162,13 @@ impl Client {
             .header("Cookie", cookie)
             .body(form)
             .send()
-            .map_err(|e| format!("请求失败（{path}）：{e}"))?;
+            .map_err(|e| {
+                i18n::tf(
+                    "请求失败（{path}）：{e}",
+                    "Request failed ({path}): {e}",
+                    &[("path", path.to_string()), ("e", e.to_string())],
+                )
+            })?;
 
         // 并发请求可能同时收到 Set-Cookie；这里按行合并进 jar，
         // 值形如 deleted/null 的按「删除」处理（与 server.js 一致）
@@ -210,9 +218,10 @@ impl Client {
         }
 
         if !res.status().is_success() {
-            return Err(format!("上游返回 HTTP {}", res.status().as_u16()));
+            return Err(i18n::tf("上游返回 HTTP {code}", "Upstream returned HTTP {code}", &[("code", res.status().as_u16().to_string())]));
         }
-        res.text().map_err(|e| format!("读取响应失败：{e}"))
+        res.text()
+            .map_err(|e| i18n::tf("读取响应失败：{e}", "Failed to read response: {e}", &[("e", e.to_string())]))
     }
 
     /// 命令分发 —— 20 个命令与 Java / Node 两侧一一对应。
@@ -342,12 +351,14 @@ impl Client {
                         continue;
                     }
                     if !t.bytes().all(|b| b.is_ascii_digit()) {
-                        return Err("song_detail: ids 必须是数字逗号串".into());
+                        return Err(i18n::t("song_detail: ids 必须是数字逗号串",
+                            "song_detail: ids must be a comma-separated list of numbers").into());
                     }
                     items.push(format!("{{\"id\":{t}}}"));
                 }
                 if items.is_empty() {
-                    return Err("song_detail: ids 不能为空".into());
+                    return Err(i18n::t("song_detail: ids 不能为空",
+                            "song_detail: ids must not be empty").into());
                 }
                 self.post(
                     "v3/song/detail",
@@ -382,7 +393,13 @@ impl Client {
                 let detail: Value = serde_json::from_str(
                     &self.post("v6/playlist/detail", serde_json::json!({ "id": s("id"), "n": 300, "s": 8 }))?,
                 )
-                .map_err(|e| format!("歌单详情不是 JSON：{e}"))?;
+                .map_err(|e| {
+                    i18n::tf(
+                        "歌单详情不是 JSON：{e}",
+                        "Playlist detail is not JSON: {e}",
+                        &[("e", e.to_string())],
+                    )
+                })?;
                 let all: Vec<i64> = detail
                     .get("playlist")
                     .and_then(|x| x.get("trackIds"))
@@ -473,14 +490,17 @@ impl Client {
                 // 让前端能区分「参数不合法」和「上游失败」。
                 let cid = s("id");
                 if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err("comment_add: id 必须是数字".into());
+                    return Err(i18n::t("comment_add: id 必须是数字",
+                            "comment_add: id must be numeric").into());
                 }
                 let txt = s("content").trim().to_string();
                 if txt.is_empty() {
-                    return Err("comment_add: 内容不能为空".into());
+                    return Err(i18n::t("comment_add: 内容不能为空",
+                            "comment_add: content must not be empty").into());
                 }
                 if txt.chars().count() > 140 {
-                    return Err("comment_add: 最多 140 字".into());
+                    return Err(i18n::t("comment_add: 最多 140 字",
+                            "comment_add: at most 140 characters").into());
                 }
                 self.post(
                     "v1/resource/comments/add",
@@ -493,7 +513,8 @@ impl Client {
                 // `x/../../../../user/level` 能靠 WHATWG URL 的 .. 归一化跳出白名单。
                 let cid = s("id");
                 if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err("comments: id 必须是数字".into());
+                    return Err(i18n::t("comments: id 必须是数字",
+                            "comments: id must be numeric").into());
                 }
                 let path = format!("v1/resource/comments/R_SO_4_{cid}");
                 self.post(
@@ -509,7 +530,7 @@ impl Client {
 
             "personal_fm" => self.post("v1/radio/get", Value::Object(Default::default())),
 
-            other => Err(format!("未知命令：{other}")),
+            other => Err(i18n::tf("未知命令：{other}", "Unknown command: {other}", &[("other", other.to_string())])),
         }
     }
 }

@@ -147,6 +147,31 @@ Android 没有公开的「往状态栏里写东西」接口，所谓状态栏歌
 > 而同一篇文档上面列的「媒体控制（待做）」「系统通知不支持」就是未实现项 ——
 > 自相矛盾。现在改成如实清单，用户看文档时不会被误导。
 
+### ⚠️ 两条「已做但未在本机验证」的边界（1.3.7）
+
+如实写在这里，而不是等用户踩到再解释。
+
+**1. 安装向导的语言选择器**
+
+`tauri.conf.json` 的 `bundle.windows.nsis` 里配了
+`languages: ["SimpChinese", "English"]` + `displayLanguageSelector: true`。
+按 Tauri 的实现（`tauri-bundler` 的 `nsis.rs`：两个条件都满足才出选择器），
+Windows 安装包首次运行应该先弹一个语言选择。
+
+**但这台开发机是 Android proot 环境** —— 跑不了 NSIS 编译器，也没有 Windows
+可用来点一遍向导。配置的合法性靠 Tauri schema 与 CI 的 `cargo tauri build` 兜底，
+而「选择器真的弹出来了吗」只有装一次才知道。如果装完发现没有，请开 issue。
+
+**2. 重启后第一条错误消息的语言**
+
+原生层的错误串（网易云失败、参数解析失败等）现在跟界面语言走，语言由前端
+`setLang` 经 bridge 推到 Rust 的 `set_lang`。但 **Rust 进程比 WebView 早启动**，
+那一刻读不到前端的 localStorage，所以默认是中文。前端 boot 完成会立刻补推一次，
+之后整个会话都正确 —— 只有「刚启动那一小段时间内发生的错误」可能是中文。
+
+不改成「Rust 自己读一份配置」的理由：那需要在 Rust 侧再维护一份语言状态与写盘
+时机，等于把「同一份设置抄两份」这个项目反复踩过的坑再造一次。
+
 > **扫码登录已可用**（1.3.0 起）：`chooseLoginMode` 三端统一走扫码，
 > 底层 `login_qr_key` / `login_qr_check` 在 Rust 侧已实现，直接点界面上的
 > 「登录网易云」就能扫码。此处不再需要手写 cookie。

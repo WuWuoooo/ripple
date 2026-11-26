@@ -7,6 +7,158 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
 
 ---
 
+## 1.3.7 — 第十四个版本
+
+> **本次依据**：用户报的三个真机问题 —— ① 横屏 + 应用小窗下状态栏歌词位置漂移；
+> ② Windows 安装向导没有语言切换；③ 原生层错误串没跟界面语言走。
+> **实现与文档**：Deepseek V4.1 Flash 1017。
+
+这一版**改的是「三端同步」这句话本身**。1.3.5 宣称三端都上了多语言，但那只覆盖
+**过 DOM 的文案**。有两类字符串从来不经过 DOM：一类是原生代码里拼出来、又被前端
+`throw` 出去直接 toast 的**错误消息**；另一类是**安装向导**自己画的界面。
+前者在英文界面下显示中文，后者在中文用户面前显示英文 —— 方向正好相反，
+但根因是同一个：**「界面文案」的取样范围从来只算了网页那一层。**
+
+### 三端共同（共用前端 / 构建链）
+
+- **安装向导支持中英文 + 首次运行可选语言**（Windows NSIS）
+- **原生层错误串纳入 i18n 测试**，并新增元测试证明判据会红
+- 版本号 1.3.7
+
+### Android
+
+- **修横屏 + 应用小窗下状态栏歌词位置漂移**（本次最影响使用的一条）
+- `NeteaseClient` 的用户可见错误串接 `L10n.t`（含测试抓出的「非法接口路径」）
+
+### Windows
+
+- 安装向导语言选择（见下），Tauri 侧新增 `bundle.windows.nsis` 配置段
+- **桌面端原生错误串全部接入 i18n**：`netease.rs` 14 处 + `main.rs` 5 处
+
+### Linux
+
+- 与 Windows 共用同一份 Rust 与前端，上述原生错误串修复同样生效
+- 安装向导是 Windows 专属（`.deb` / AppImage 无向导），Linux 不受影响
+
+---
+
+### 一、状态栏歌词位置漂移（Android，真机复现）
+
+**症状**（用户原话）：横屏状态下把状态栏歌词位置调好，关掉应用小窗后，
+歌词到下一句就会自己跑回「状态栏居中下方」；再打开小窗，播完当前这句，
+下一句又回到设置的位置。来回折腾，永远停不住。
+
+**根因是三处叠加**，单看每一处都像是对的：
+
+1. `LyricOverlay` 用的是 `getApplicationContext()`，它的
+   `getDisplayMetrics()` 描述的是**设备整屏**，而不是浮层所在的那块区域。
+   真机横屏 + OriginOS 小窗下，这两者宽度并不相等 —— 于是「屏幕居中」这个
+   默认位置一开始就算偏。
+2. `clampX(posX)` 的上限是「当前屏宽 − 当前窗宽」，而窗口是 `WRAP_CONTENT`
+   （宽度包住文字）。**每换一句歌词窗宽就变**，上限跟着变，同一个保存值
+   在不同时刻被钳成不同的 x —— 这就是「下一句又跑回去」的直接来源。
+3. `setText()` 里重算位置的逻辑只写了 `if (posX < 0)`（只有「没拖过」才重居中）。
+   拖过的位置换句后**完全不动**，而窗宽已经变了，右半截就出屏被裁掉。
+
+**修法**：
+
+- 屏幕尺寸改从 `WindowManager.getCurrentWindowMetrics().getBounds()` 取（API 30+），
+  拿不到才退回 `DisplayMetrics` —— 取的是**本窗口可用区域**，不是设备整屏
+- 还原已保存位置用新的 `restoreX()`：判据只看「窗口左边缘是否已在屏幕外」，
+  **不再按窗宽卡上限**。合法位置原样还原，坏数据才拉回
+- 换句后对「拖过的位置」也做一次重排，但基准永远是 `posX`（用户存的那份），
+  不是上一帧的 `lp.x` —— 否则会单向左移、越走越偏
+
+### 二、安装向导没有语言切换（Windows）
+
+`tauri.conf.json` 里根本没有 `bundle.windows` 这一段，于是走 Tauri 的默认值：
+
+```rust
+let languages = nsis.languages.clone().unwrap_or_else(|| vec!["English".into()]);
+data.insert("display_language_selector", to_json(
+    nsis.map(|n| n.display_language_selector && languages.len() > 1).unwrap_or(false)));
+```
+
+两个条件都没满足 —— 单语言、无选择器。实测 `strings` 扒 v1.3.6 的 `setup.exe`，
+`下一步 / 安装 / 完成 / 取消` 在 UTF-8 与 UTF-16LE 两种编码下**都是 0 命中**，
+只有 `Next / Cancel / Browse / Complete` 这些英文向导词。
+
+现在补上：
+
+```json
+"windows": { "nsis": {
+  "languages": ["SimpChinese", "English"],
+  "displayLanguageSelector": true
+} }
+```
+
+Tauri 自带 `SimpChinese.nsh`（`tauri-bundler` 的 `get_lang_data` 里有这个分支），
+所以连翻译文件都不用自己写。
+
+> **未在本机验证**：这台机器是 Android proot，跑不了 NSIS 编译器，也看不到向导界面。
+> 配置合法性靠 Tauri 的 schema 与 CI 的 `cargo tauri build` 兜，但**「选择器真的出现了吗」
+> 只有等 Windows 用户装一次才知道**。这一条已如实写进 `desktop/README.md` 的已知限制。
+
+### 三、原生层错误串不跟语言走（三端都有，方向相反）
+
+前端 i18n 引擎只管 DOM。但有一类字符串**从不经过 DOM**：
+
+```text
+原生代码 Err("song_detail: ids 不能为空")
+  → __rippleNativeResult → netease.js 的 throw new Error(msg)
+  → app.js 的 toast('这首歌放不了', e.message)
+```
+
+Android 1.3.5 就用 `L10n.t(zh, en)` 包了 31 处，**桌面端一处都没有** ——
+于是英文界面下桌面端所有网络错误都是中文。这次补齐：
+
+| 位置 | 数量 | 处理 |
+|---|---|---|
+| `netease.rs` | 14 处调用 | 全部接 `i18n::t` / `i18n::tf` |
+| `main.rs` | 5 处调用 | 同上（参数解析、状态锁、歌词窗创建、歌词窗标题） |
+| `NeteaseClient.java` | 3 个调用点 | 接 `L10n.t`（「非法接口路径」三处复用同一个串） |
+
+新增 `desktop/src-tauri/src/i18n.rs`：**不引第三方 crate** —— 只有几十条、两种语言，
+一个 `AtomicBool` + `match` 足够，还能避免 `--offline --locked` 构建时多拉依赖树。
+语言由前端 `setLang` 经 `bridge.js` 推到 Rust 的 `set_lang` 命令。
+
+> **已知边界**：Rust 进程比 WebView 早，启动时读不到前端的 localStorage，
+> 所以重启后的**第一条**错误消息可能用中文默认值。前端 boot 完成会立刻补推一次，
+> 之后整个会话都正确。这条已写进 `desktop/README.md`。
+
+### 四、这一版最重要的不是修了什么，而是**测试为什么以前没抓到**
+
+1.3.6 的 i18n 覆盖率测试是绿的，判据 `I.T(s) !== s` 也没错 —— 错的是**取样范围**：
+
+```js
+const files = [
+  'app/js/app.js', 'app/js/store.js', 'app/js/player.js', 'app/js/netease.js',
+  'app/js/log.js', 'app/js/perf.js', 'app/js/qrcode.js', 'app/js/lrc.js',
+];
+```
+
+`L10n.java`、`NeteaseClient.java`、`bridge.js`、`netease.rs` **一个都不在**。
+判据再严，看不见那一半代码，结论就比看起来窄。
+
+现在补了两条：
+
+- `原生层：会被用户看到的中文文案都已包 L10n.t` —— 扫 Java，排除注释/日志/内部异常
+- `原生层判据有效：未包 L10n.t 的中文串会被抓出` —— **元测试**，证明上一条真的会红
+
+第二条是关键：没有它，「断言通过」可能只是因为它什么都没看见。
+这条测试**当场抓出了「非法接口路径」三处漏翻**，已一并修掉。
+
+### 五、顺带修正的一处文档错误
+
+1.3.5 的 CHANGELOG 写「三端同步」时，读者会以为多语言覆盖了全部界面。
+实际是：**前端文案三端同步；原生层只有 Android 翻了；安装向导完全没翻。**
+这一版把这句话拆开说清楚，而不是继续用一个笼统的「三端同步」覆盖三种不同状态。
+
+### 六、已知限制（如实列出）
+
+1. **安装向导语言未在本机验证** —— 无 NSIS 编译器、无 Windows 环境，见上文。
+2. **桌面端重启后第一条错误消息可能是中文** —— Rust 早于 WebView 启动，见上文。
+
 ## 1.3.6 — 第十三个版本
 
 > **本次依据**：来自 MiniMax M3.1 Flash 的 1.3.5 代码审查报告

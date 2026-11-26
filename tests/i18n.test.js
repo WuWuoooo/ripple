@@ -326,3 +326,97 @@ test('store.js 的 ENUMS.lang 与内置语言列表一致', () => {
   assert.deepEqual(allowed.slice().sort(), builtin.slice().sort(),
     'store.js 的 ENUMS.lang 与 I18n.list() 不一致');
 });
+
+/* ---------------------------------------------------------- 原生层文案（1.3.7） */
+
+/**
+ * 原生层（Java / Rust）里**会被用户看到**的中文字面量，必须包在
+ * `L10n.t(zh, en)` / `i18n::t(zh, en)` 里。
+ *
+ * 为什么单列一节：
+ *   1.3.6 之前 i18n 的覆盖面只算「前端 + index.html」，原生层那批字符串
+ *   完全不在任何断言里 —— 于是 `NeteaseClient` 的「歌曲 id 不合法」和
+ *   `netease.rs` 的整整十处错误串可以长期漏翻，而测试永远全绿。
+ *   判据本身没错，错的是**取样范围**。
+ *
+ * 判据怎么定（这决定了它是不是一条好测试）：
+ *   不是「文件里有没有中文」（注释、日志里全是中文，会淹没结论），
+ *   而是「这一行会不会流到用户眼前」。三条可机械判定的排除：
+ *     · 注释行（* / // / /*）
+ *     · 日志调用（LogBridge.add / Log.* / eprintln!）
+ *     · 纯内部异常（FileNotFoundException 之类，只在日志里出现）
+ *   留下来的就是「会被 toast / 弹窗 / 崩溃页显示」的那批。
+ */
+const NATIVE_I18N_FILES = [
+  'android/app/src/main/java/com/ripple/app/NeteaseClient.java',
+  'android/app/src/main/java/com/ripple/app/HttpBridge.java',
+];
+
+/** 抽出一个文件里「用户可见但没包 L10n.t / i18n::t」的中文字面量 */
+function untranslatedUserFacingStrings(relPath) {
+  const src = fs.readFileSync(path.join(ROOT, relPath), 'utf8');
+  const lines = src.split('\n');
+  const CJK = /[\u4e00-\u9fff]/;
+  const out = [];
+  let inBlock = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (inBlock) {
+      if (line.includes('*/')) inBlock = false;
+      continue;
+    }
+    if (line.includes('/*')) {
+      if (!line.includes('*/')) inBlock = true;
+      continue;
+    }
+    const t = line.trim();
+    if (t.startsWith('//') || t.startsWith('*')) continue;
+    if (!CJK.test(t)) continue;
+    if (!/"[^"]*"/.test(t)) continue;
+    /*
+     * 日志不是文案：它写给开发者看，翻了反而不好检索
+     * （这一点与 app/js/log.js 的口径一致）。
+     */
+    if (/LogBridge\.|Log\.|log\(|eprintln!|println!/.test(t)) continue;
+    /*
+     * 多行 L10n.t(...) 的**第二行**（英文串那一行）不含中文，不会被误抓；
+     * 而中文串那一行往往也不含 `L10n.t` —— 它在上一行。所以往上多看两行。
+     */
+    const ctx = lines.slice(Math.max(0, i - 3), i + 1).join('\n');
+    if (/L10n\.t\(/.test(ctx)) continue;
+    out.push(relPath + ':' + (i + 1) + '  ' + t.slice(0, 100));
+  }
+  return out;
+}
+
+test('原生层：会被用户看到的中文文案都已包 L10n.t', () => {
+  const bad = [];
+  for (const f of NATIVE_I18N_FILES) bad.push(...untranslatedUserFacingStrings(f));
+  assert.deepEqual(bad, [],
+    '以下 ' + bad.length + ' 处会在英文界面下显示中文：\n' + bad.join('\n'));
+});
+
+/**
+ * 元测试：证明上面那条**真的会红**。
+ *
+ * 没有这一条，"断言通过" 可能只是因为它什么都没看见 —— 1.3.6 的
+ * i18n 覆盖率测试就是这个毛病（取样范围里没有原生层，恒真）。
+ * 这里临时构造一个未包装的字面量，喂给同一套判据，要求必须被抓出来。
+ */
+test('原生层判据有效：未包 L10n.t 的中文串会被抓出', () => {
+  const tmp = path.join(ROOT, 'tests', '.tmp-native-i18n.java');
+  try {
+    fs.writeFileSync(tmp, [
+      'class X {',
+      '  String a() { return "这条没包，必须被抓到"; }',
+      '  String b() { return L10n.t("这条包了", "wrapped"); }',
+      '  void c() { LogBridge.add(ctx, "LOG", "日志里的中文不算文案"); }',
+      '}',
+    ].join('\n'));
+    const found = untranslatedUserFacingStrings(path.relative(ROOT, tmp));
+    assert.equal(found.length, 1, '应当只有第一条被抓到，实际：' + JSON.stringify(found));
+    assert.match(found[0], /必须被抓到/);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (e) {}
+  }
+});

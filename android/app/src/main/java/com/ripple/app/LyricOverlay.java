@@ -394,6 +394,45 @@ public class LyricOverlay {
                     if (view == null || lp == null || !added) return;
                     centerHorizontally();
                 });
+            } else {
+                /*
+                 * P-01 的另一半：**拖过的位置**同样要跟着换句重算一次，
+                 * 但方向相反 —— 不是重新居中，而是把窗口宽度变化带来的
+                 * 「右边界溢出」收回来。
+                 *
+                 * 为什么必须有这一段：
+                 *   窗口是 WRAP_CONTENT（宽度包住文字），换一句更长的词，
+                 *   窗口就变宽。用户把浮层拖到靠右位置时，宽度一涨右半截
+                 *   就出屏了；下一句变短又回来。观感是「位置在抖」。
+                 *   以前这里是空的 —— 只有 posX < 0 的分支会动，于是拖过的
+                 *   位置在换句后由 WindowManager 按旧 x 重新布局，
+                 *   超出部分被裁掉，看着就像「位置不对了」。
+                 *
+                 * 注意这里只**平移不超过既有左边缘**：不改用户选的 x 本身，
+                 * 也不回写设置（那是拖动才做的事），下次换回短句自然还原。
+                 */
+                view.post(() -> {
+                    if (view == null || lp == null || !added) return;
+                    try {
+                        int sw = screenWidthPx();
+                        int vw = view.getWidth();
+                        if (sw <= 0 || vw <= 0) return;
+                        int max = Math.max(0, sw - vw);
+                        /*
+                         * 每次都从 posX（用户拖出来的那份设置）重算，而不是
+                         * 在上一帧的 lp.x 上继续收 —— 否则长句把它推到 max、
+                         * 下一句变短时没有回程基准，位置会单向左移、越走越偏。
+                         * 这也正是「位置看起来自己跑了」的另一半成因。
+                         */
+                        int want = Math.min(restoreX(posX), max);
+                        if (want != lp.x) {
+                            lp.x = want;
+                            if (wm != null) wm.updateViewLayout(view, lp);
+                        }
+                    } catch (Throwable e) {
+                        CrashLog.recordAsync(ctx, "lyric-reefit", e);
+                    }
+                });
             }
         });
     }
@@ -1116,14 +1155,9 @@ public class LyricOverlay {
     private void applyPosition() {
         if (lp == null) return;
         try {
-            int statusH = 0;
-            try {
-                int id = ctx.getResources().getIdentifier("status_bar_height", "dimen", "android");
-                if (id > 0) statusH = ctx.getResources().getDimensionPixelSize(id);
-            } catch (Throwable ignored) {
-            }
             if (posY < 0) {
                 // 状态栏下沿再往下一点点，落在状态栏和标题栏之间的空隙里
+                int statusH = statusBarHeightPx();
                 lp.y = statusH > 0 ? statusH - dp(2) : dp(26);
             } else {
                 /*
@@ -1135,7 +1169,18 @@ public class LyricOverlay {
             if (posX < 0) {
                 centerHorizontally();          // 默认：居中（要等窗口量出宽度）
             } else {
-                lp.x = clampX(posX);
+                /*
+                 * P-01（1.3.7，真机横屏反馈）：「拖过去的位置」是**逻辑位置**，
+                 * 不能每次重开都重新按当前屏幕宽度钳一遍。
+                 *
+                 * 原来的写法直接 clampX(posX) —— 而 clampX 的上限是
+                 * 「当前屏宽 - 当前窗宽」，窗宽随歌词长短变化、屏宽随横竖屏
+                 * 变化。于是同一份设置值在不同时刻会得到不同结果：
+                 *   横屏拖到右侧 → 保存 x（很大）→ 竖屏重开时
+                 *   上限骤减 → 被钳回屏幕内某处 → 看起来「位置自己跑了」。
+                 * 这里只做「完全出屏才拉回」的兜底，正常值原样还原。
+                 */
+                lp.x = restoreX(posX);
             }
             LogBridge.add(ctx, "LYRIC", "position x=" + lp.x + " y=" + lp.y
                     + " (saved " + posX + "," + posY + ")");
@@ -1143,6 +1188,90 @@ public class LyricOverlay {
             CrashLog.recordAsync(ctx, "lyric-pos", e);
             if (lp != null) lp.y = dp(26);
         }
+    }
+
+    /**
+     * 浮层所在屏幕的宽度（px）。
+     *
+     * 为什么不用 ctx.getResources().getDisplayMetrics().widthPixels：
+     *   这个 ctx 是 **application context**（见构造函数的 getApplicationContext），
+     *   它的 DisplayMetrics 描述的是「设备屏幕」，而不是本窗口所在的那块区域。
+     *   真机横屏 + 小窗（vivo/OriginOS 的应用小窗）下两者的 widthPixels
+     *   并不相等 —— 小窗里 Application 拿到的仍是竖屏整屏宽度，
+     *   而 WindowManager 布局用的是小窗可用宽度。
+     *   结果：默认位置算出来的 x 是「按整屏居中」的，放进小窗里自然偏到一边。
+     *
+     * 取法：从 WindowManager 的 currentWindowMetrics 拿本窗口的 bounds；
+     *   API < 30 时退回 DisplayMetrics（此时小窗能力也基本不存在）。
+     * 任何一步失败都不抛，退到 DisplayMetrics —— 位置算错好过浮层消失。
+     */
+    private int screenWidthPx() {
+        try {
+            if (Build.VERSION.SDK_INT >= 30 && wm != null) {
+                android.graphics.Rect b = wm.getCurrentWindowMetrics().getBounds();
+                int w = b.width();
+                if (w > 0) return w;
+            }
+        } catch (Throwable ignored) {
+            /* 落到下面的 DisplayMetrics */
+        }
+        try {
+            return ctx.getResources().getDisplayMetrics().widthPixels;
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
+    /** 同 {@link #screenWidthPx()}，纵向 */
+    private int screenHeightPx() {
+        try {
+            if (Build.VERSION.SDK_INT >= 30 && wm != null) {
+                android.graphics.Rect b = wm.getCurrentWindowMetrics().getBounds();
+                int h = b.height();
+                if (h > 0) return h;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            return ctx.getResources().getDisplayMetrics().heightPixels;
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
+    /** 状态栏高度（px）；取不到返回 0，由调用方决定兜底 */
+    private int statusBarHeightPx() {
+        try {
+            int id = ctx.getResources().getIdentifier("status_bar_height", "dimen", "android");
+            if (id > 0) return ctx.getResources().getDimensionPixelSize(id);
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    /**
+     * 还原用户拖过的 x（P-01）。
+     *
+     * 与 clampX 的区别：clampX 是「拖动过程中实时约束」，用当前窗宽/屏宽
+     * 保证拖不出屏幕，语义正确；而这里是「重开浮层时还原一份已保存的位置」，
+     * 如果也按当前尺寸重算上限，就会把合法位置越算越小 ——
+     * 横屏保存的大 x 在竖屏下被压扁，用户看到的就是「位置自己变回中间」。
+     *
+     * 所以这里只做**完全出屏**的兜底：只有当整块窗口都落在屏幕外
+     * （旧版本写坏的坐标）时才拉回来，正常值一律原样用。
+     */
+    private int restoreX(int x) {
+        int sw = screenWidthPx();
+        if (sw <= 0) return Math.max(0, x);
+        /*
+         * 判据用窗口左边缘，不用窗口宽度：
+         *   左边缘已经在屏幕右边界之外 = 整块窗口都在屏幕外，肯定是坏数据；
+         *   左边缘还在屏幕内 = 合法位置，原样还原（哪怕窗口右半截被裁掉）。
+         * 绝不能按「sw - viewWidth」去卡上限 —— 那正是用户抱怨的
+         * 「位置自己变回中间」的成因：窗宽随歌词长短变，一换句上限就变。
+         */
+        if (x >= sw) return 0;
+        return Math.max(0, x);
     }
 
     /** 把窗口放到屏幕水平正中（窗口宽度取自上一次测量结果） */
@@ -1154,7 +1283,7 @@ public class LyricOverlay {
             try {
                 if (lp == null) return;
                 int vw = v.getWidth();
-                int sw = ctx.getResources().getDisplayMetrics().widthPixels;
+                int sw = screenWidthPx();
                 /* 还没量出来时先按内容宽度估一个，量完 applyPosition 会再来一次 */
                 if (vw <= 0 && v instanceof FillTextView) {
                     /*
@@ -1169,6 +1298,7 @@ public class LyricOverlay {
                     vw = Math.min(sw, (int) tw);
                 }
                 if (vw <= 0) vw = sw;
+                if (sw <= 0) return;
                 lp.x = Math.max(0, (sw - vw) / 2);
                 if (added && view != null && wm != null) {
                     try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
@@ -1184,7 +1314,8 @@ public class LyricOverlay {
     /** 把 x 钳到「窗口完全落在屏幕内」的范围 */
     private int clampX(int x) {
         try {
-            int sw = ctx.getResources().getDisplayMetrics().widthPixels;
+            int sw = screenWidthPx();
+            if (sw <= 0) return Math.max(0, x);
             int vw = view != null ? view.getWidth() : 0;
             if (vw <= 0) vw = sw;
             int max = Math.max(0, sw - vw);
@@ -1207,7 +1338,8 @@ public class LyricOverlay {
      */
     private int clampY(int y) {
         try {
-            int sh = ctx.getResources().getDisplayMetrics().heightPixels;
+            int sh = screenHeightPx();
+            if (sh <= 0) return Math.max(0, y);
             int vh = view != null ? view.getHeight() : 0;
             int max = vh > 0 ? Math.max(0, sh - vh) : Integer.MAX_VALUE;
             return Math.max(0, Math.min(y, max));

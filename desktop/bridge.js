@@ -348,7 +348,24 @@
      * 缺了它就会在控制台留下一串 TypeError。
      * 所以给一个什么都不做的实现：形状对得上、语义上确实是「无需处理」。
      */
-    setLang: function () { return true; },
+    setLang: function (code) {
+      /*
+       * 1.3.7：不再是个空实现。
+       *
+       * 原生层也有一批**不经 DOM** 的字符串（网易云错误串、歌词窗创建失败…），
+       * 前端 i18n 引擎碰不到它们，只能由原生自己翻。Android 那边 1.3.5 就
+       * 用 L10n.t(zh, en) 包了 31 处；桌面端 1.3.6 之前一处都没有，
+       * 于是英文界面下所有网络错误都是中文。
+       *
+       * 这里把语言码转给 Rust 的 set_lang 命令。失败不影响界面（DOM 那层
+       * 仍然照常翻），只是原生错误串会停在默认的中文 —— 所以 catch 里
+       * 只留一条日志，不抛给调用方。
+       */
+      try {
+        invoke('set_lang', { code: String(code == null ? 'zh' : code) }).catch(function () {});
+      } catch (e) {}
+      return true;
+    },
 
     /** 桌面端永远不是安全模式 */
     safeMode: function () { return false; }

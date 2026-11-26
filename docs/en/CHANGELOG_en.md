@@ -6,6 +6,173 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.7 — Fourteenth Version
+
+> **Basis**: three real-device issues reported by the owner — (1) the status-bar lyric overlay drifts
+> in landscape with the app running as a small window; (2) the Windows installer has no language switch;
+> (3) native-layer error strings ignore the UI language.
+> **Implementation and docs by**: Deepseek V4.1 Flash 1017.
+
+This release is about the sentence **"synced across all three platforms" itself**.
+1.3.5 claimed multilingual support everywhere, but that only covered **strings that pass through the DOM**.
+Two kinds of strings never do: **error messages** built in native code and rethrown by the frontend
+straight into a toast, and the **installer wizard**, which draws its own UI. The first shows Chinese
+to English users; the second shows English to Chinese users — opposite directions, same root cause:
+**"UI copy" was only ever sampled from the web layer.**
+
+### Shared (frontend / build chain)
+
+- **Installer supports Chinese and English, with a language picker on first run** (Windows NSIS)
+- **Native-layer strings are now covered by the i18n test**, plus a meta-test proving it can fail
+- Version 1.3.7
+
+### Android
+
+- **Fixed status-bar lyric overlay drift in landscape + app-small-window mode** (the most impactful fix here)
+- User-visible error strings in `NeteaseClient` now go through `L10n.t` (including `Illegal API path`, caught by the new test)
+
+### Windows
+
+- Installer language picker (see below); added the `bundle.windows.nsis` block to the Tauri config
+- **All desktop native error strings wired into i18n**: 14 calls in `netease.rs` + 5 in `main.rs`
+
+### Linux
+
+- Shares the same Rust and frontend as Windows, so the native error-string fixes apply here too
+- The installer wizard is Windows-only (`.deb` / AppImage have none), so Linux is unaffected
+
+---
+
+### 1. Status-bar lyric overlay drift (Android, reproduced on device)
+
+**Symptom** (owner's words): in landscape, position the status-bar lyric overlay where you want it.
+Close the app's small window and the lyric jumps back to the centred-below-status-bar spot on the next line.
+Reopen the window, and after the current line finishes, the next line returns to the configured position.
+It oscillates and never settles.
+
+**Three stacked causes**, each of which looks correct in isolation:
+
+1. `LyricOverlay` uses `getApplicationContext()`. Its `getDisplayMetrics()` describes the **whole device screen**,
+   not the area the overlay lives in. In landscape with OriginOS's small-window mode those widths differ,
+   so the "centred" default position is computed wrong to begin with.
+2. `clampX(posX)` caps at *current screen width − current window width*, and the window is `WRAP_CONTENT`
+   (it hugs the text). **The window width changes with every lyric line**, so the cap changes too, and the
+   same saved value gets clamped to a different x at different times — that is the direct source of
+   "the next line jumps back".
+3. The reposition logic in `setText()` only handled `if (posX < 0)` (only "never dragged" re-centres).
+   A dragged position **never moved** when the line changed, even though the window width had changed,
+   so the right part got clipped off-screen.
+
+**Fix**:
+
+- Screen size now comes from `WindowManager.getCurrentWindowMetrics().getBounds()` (API 30+), falling back to
+  `DisplayMetrics` — it reports the **window's usable area**, not the whole device screen
+- Restoring a saved position uses the new `restoreX()`: the only test is "is the window's left edge already
+  off-screen?", and it **no longer caps by window width**. Valid positions are restored verbatim; only bad
+  data gets pulled back
+- After a line change, dragged positions are re-fitted too, but always against `posX` (the user's saved value),
+  never against the previous frame's `lp.x` — otherwise it drifts one way and gets worse over time
+
+### 2. The installer has no language switch (Windows)
+
+`tauri.conf.json` had no `bundle.windows` block at all, so Tauri's defaults applied:
+
+```rust
+let languages = nsis.languages.clone().unwrap_or_else(|| vec!["English".into()]);
+data.insert("display_language_selector", to_json(
+    nsis.map(|n| n.display_language_selector && languages.len() > 1).unwrap_or(false)));
+```
+
+Neither condition was met — one language, no selector. Verified by running `strings` over the v1.3.6
+`setup.exe`: `下一步 / 安装 / 完成 / 取消` return **zero hits** in both UTF-8 and UTF-16LE, while
+`Next / Cancel / Browse / Complete` are all present.
+
+Now added:
+
+```json
+"windows": { "nsis": {
+  "languages": ["SimpChinese", "English"],
+  "displayLanguageSelector": true
+} }
+```
+
+Tauri ships `SimpChinese.nsh` (there is a branch for it in `tauri-bundler`'s `get_lang_data`),
+so no translation file has to be written by hand.
+
+> **Not verified locally**: this machine is an Android proot environment — it cannot run the NSIS compiler
+> or display the wizard. Config validity is covered by Tauri's schema and CI's `cargo tauri build`, but
+> **whether the picker actually appears can only be confirmed by a Windows user installing once.**
+> This is stated plainly in the known-limitations section of `desktop/README.md`.
+
+### 3. Native error strings ignored the UI language (all three platforms, opposite directions)
+
+The frontend i18n engine only handles the DOM. But one class of strings **never passes through it**:
+
+```text
+native Err("song_detail: ids must not be empty")
+  → __rippleNativeResult → throw new Error(msg) in netease.js
+  → toast('This song cannot be played', e.message) in app.js
+```
+
+Android has wrapped 31 such sites in `L10n.t(zh, en)` since 1.3.5. **The desktop side had zero** —
+so on the desktop every network error was Chinese even in the English UI. Now fixed:
+
+| Location | Count | Handling |
+|---|---|---|
+| `netease.rs` | 14 call sites | All via `i18n::t` / `i18n::tf` |
+| `main.rs` | 5 call sites | Same (params parsing, state lock, lyric window creation, lyric window title) |
+| `NeteaseClient.java` | 3 call sites | Via `L10n.t` (`Illegal API path` reuses one string for three checks) |
+
+New module `desktop/src-tauri/src/i18n.rs`: **no third-party crate** — a few dozen strings and two
+languages need no more than an `AtomicBool` plus a `match`, and it keeps the `--offline --locked` build
+from pulling in another dependency tree. The language is pushed from the frontend's `setLang` through
+`bridge.js` to the Rust `set_lang` command.
+
+> **Known boundary**: the Rust process starts before the WebView, so it cannot read the frontend's
+> localStorage at startup. The first error message after a restart may therefore be in the Chinese default.
+> The frontend pushes the language again as soon as boot completes, so the rest of the session is correct.
+> Documented in `desktop/README.md`.
+
+### 4. The most important part is why the tests did not catch this before
+
+1.3.6's i18n coverage test was green, and its predicate `I.T(s) !== s` was not wrong — the **sample set** was:
+
+```js
+const files = [
+  'app/js/app.js', 'app/js/store.js', 'app/js/player.js', 'app/js/netease.js',
+  'app/js/log.js', 'app/js/perf.js', 'app/js/qrcode.js', 'app/js/lrc.js',
+];
+```
+
+`L10n.java`, `NeteaseClient.java`, `bridge.js` and `netease.rs` **were not in it at all**. However strict the
+predicate is, it cannot see half the code — so the conclusion was narrower than it looked.
+
+Two tests were added:
+
+- `Native layer: user-visible Chinese strings are all wrapped in L10n.t` — scans Java, skipping comments,
+  log calls and internal exceptions
+- `Native-layer predicate is effective: unwrapped Chinese strings are caught` — a **meta-test** proving the
+  first one can actually fail
+
+The second is the key: without it, "assertion passed" may just mean it saw nothing. This test **caught three
+untranslated `Illegal API path` strings on the spot**, which are fixed as well.
+
+### 5. One documentation error corrected along the way
+
+When the 1.3.5 changelog said "synced across all three platforms", readers would assume multilingual support
+covered the whole UI. In reality: **frontend copy is shared by all three; only Android's native layer was
+translated; the installer was not translated at all.** This release spells that out instead of hiding three
+different states behind one blanket phrase.
+
+### 6. Known limitations (listed honestly)
+
+1. **Installer language not verified locally** — no NSIS compiler, no Windows environment (see above).
+2. **The first desktop error message after a restart may be Chinese** — Rust starts before the WebView (see above).
+3. **The Android overlay-position fix was not re-verified on a real device** — no vivo device here; it is derived
+   from the code path. That `getApplicationContext().getDisplayMetrics()` differs from the window area is
+   documented behaviour, but **how much they differ in small-window mode has not been measured**. The owner
+   needs to install once to confirm.
+
 ## 1.3.6 — Thirteenth Version
 
 > **Basis**: the 1.3.5 code review report from MiniMax M3.1 Flash
