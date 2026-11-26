@@ -556,6 +556,9 @@
     "已解锁": "Unlocked",
     "不可拖动，不影响使用": "Can't be dragged; everything else works the same",
     "可拖动位置": "Draggable",
+    /* 原生控制面板（1.3.8）右上角 ✕ 关闭状态栏歌词后的提示 */
+    "状态栏歌词已关闭": "Status bar lyrics turned off",
+    "可以在「设置 → 状态栏歌词」里重新打开": "Turn it back on in Settings → Status bar lyrics",
     "进度填充色": "Progress fill color",
     "歌词染色（已播放）": "Lyric fill (sung part)",
     "歌词颜色": "Lyric color",

@@ -978,15 +978,58 @@ public class MainActivity extends Activity {
         if (lyricOverlay == null) {
             lyricOverlay = LyricOverlay.get(this);
             lyricOverlay.setCallback(new LyricOverlay.Callback() {
+                /**
+                 * 1.3.8：点一下浮层的「动作」已经全部由原生面板接管
+                 * （见 LyricOverlay 的类注释），网页不用再弹底部面板了 ——
+                 * 而且那个面板这时候也看不见：用户既然在点状态栏歌词，
+                 * 就说明他正在用别的 App，WebView 是后台状态。
+                 *
+                 * 所以这里只打一条日志：它同时是「原生面板打开/收起」
+                 * 这一跳的痕迹，排查「点了没反应」时有它就能分清
+                 * 是触摸没进来、还是面板建不出来。
+                 */
                 @Override
                 public void onTap() {
-                    // 未锁定时点一下 → 网页弹调整面板
-                    runJs("window.__rippleLyricTap && window.__rippleLyricTap()");
+                    LogBridge.add(MainActivity.this, "LYRIC", "overlay tap (native panel)");
                 }
 
+                /**
+                 * 拖动结束。x/y 是**歌词左上角**的屏幕坐标（不是窗口原点）——
+                 * 面板打开时窗口原点被 padding 平移过，这里由 LyricOverlay
+                 * 负责换算好再送上来，网页照旧直接落盘即可。
+                 */
                 @Override
                 public void onMoved(int x, int y) {
                     runJs("window.__rippleLyricMoved && window.__rippleLyricMoved(" + x + "," + y + ")");
+                }
+
+                /** 面板里改了颜色/字号 → 网页落盘（原生侧已经先应用了） */
+                @Override
+                public void onStyle(String colorHex, String sizeSp) {
+                    runJs("window.__rippleLyricStyle && window.__rippleLyricStyle("
+                            + jsStr(colorHex) + "," + jsStr(sizeSp) + ")");
+                    LogBridge.add(MainActivity.this, "LYRIC",
+                            "panel style " + colorHex + " " + sizeSp + "sp");
+                }
+
+                /** 面板里点了「锁定」 → 网页存盘（原生侧 flags 已经落实） */
+                @Override
+                public void onLockChanged(boolean locked) {
+                    runJs("window.__rippleLyricLock && window.__rippleLyricLock(" + locked + ")");
+                    LogBridge.add(MainActivity.this, "LYRIC", "panel lock=" + locked);
+                }
+
+                /** 面板里点了 ✕ → 网页把「状态栏歌词」开关关掉（原生侧已 hide） */
+                @Override
+                public void onClose() {
+                    runJs("window.__rippleLyricClose && window.__rippleLyricClose()");
+                    LogBridge.add(MainActivity.this, "LYRIC", "panel close");
+                }
+
+                /** 媒体按钮：prev / toggle / next（与通知栏按钮走同一条网页入口） */
+                @Override
+                public void onCommand(String cmd) {
+                    runJs("window.__rippleMediaCmd && window.__rippleMediaCmd(" + jsStr(cmd) + ")");
                 }
             });
         }

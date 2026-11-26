@@ -373,172 +373,48 @@ jobs:
           echo "产物：$OUT"
           echo "SHA256：$SHA"
 
-      - name: 从 CHANGELOG 提取本版说明
+      # Release 正文由 scripts/release-notes.js 生成，不再写在 YAML 里的 awk。
+      #
+      # 为什么把逻辑搬进 node 脚本（本次重构的全部理由）：
+      #   ① 可测试 —— tests/release-notes.test.js 用临时 fixture 直接 require 它，
+      #      覆盖「versionCode 非正整数 / 中英 CHANGELOG 缺该版本段落 / 摘要块里
+      #      一条列表项都没有」四个硬失败分支，还有一条元测试故意塞 versionCode=0
+      #      证明判据真的会红。写在 YAML 里的 awk 一行都测不了 —— 它只能靠
+      #      「推上去看 CI 红不红」验证，而 CI 是绿的也不代表正文是对的。
+      #   ② 可本地复现 —— `node scripts/release-notes.js --out /tmp/notes.md`
+      #      当场看到 CI 会发出去的正文，不用等一轮 CI、也不用猜。
+      #
+      # ⚠️ 历史上这一段出过两次事，现在都由新脚本接管成**硬失败**：
+      #   · 1.3.5 的正文里那行标记是 `<!-- ripple-version-code:  -->`，数字整个
+      #     是空的 —— 旧实现从「上一个 step」取 VC，跨 step 的局部变量根本不存在。
+      #     而 App 端解析失败**不报错**、静默退化成版本名比较，于是带空标记的
+      #     Release 被静默发了出去。脚本现在自己读 version.json，不是正整数就
+      #     退出码 1，不再靠人记得去查。
+      #   · 1.3.x 的正文越写越长：9 个小节 + 中英双版 + 安装包表格 + SHA-256 +
+      #     <details> 折叠，400+ 行。用户明确要求只要「本次更新 / This release」
+      #     两块摘要 —— 安装包清单和下载方式 README 里早写着，Release 页面再抄
+      #     一遍只是让人多滚几屏。脚本只取版本段落里**第一个 --- 之前**的
+      #     ### 小标题与 - 列表项，详情留在 CHANGELOG.md 里给想深看的人。
+      - name: 生成 Release 正文
         id: notes
+        # id 必须保持 notes。当前下游「发布到 Release」是直接用 /tmp/notes.md
+        # 的（gh release --notes-file），并不读 outputs.body —— 但仍然照样把
+        # body 写进 $GITHUB_OUTPUT，保持与旧 step 的接口一致，免得哪天有人
+        # 加了 `${{ steps.notes.outputs.body }}` 的引用却拿到空值。
         run: |
-          VN="${{ steps.meta.outputs.version }}"
-          # versionCode 也要在这里重新取一次。
-          # ⚠️ 上一版这里只声明了 VN，而下面「埋 versionCode 标记」那段用的是 $VC ——
-          # 那个 VC 是**上一个 step**（meta）里的局部变量，跨 step 根本不存在，
-          # 于是渲染出来是 `<!-- ripple-version-code:  -->`，数字整个是空的。
-          # 而 App 内「检查更新」正是靠这行判新旧 → 它永远解析失败，
-          # 只能退化成版本名比较（1.3.10 vs 1.3.9 就会判错）。
-          # 这次 1.3.5 的 Release 就是带着一个空标记发出去的，已确认是空的。
-          VC="${{ steps.meta.outputs.code }}"
-          OUT=/tmp/notes.md
-          ZH=/tmp/notes_zh.md
-          EN=/tmp/notes_en.md
+          # versionCode / versionName 都由脚本从 version.json 自己读（刻意不再
+          # 透传 steps.meta.outputs.*：跨 step 传值正是 1.3.5 空标记的根因）。
+          node scripts/release-notes.js --out /tmp/notes.md
 
-          # 从 CHANGELOG 抓某一版的段落：从本版标题行开始，到下一个 "## " 之前。
-          # 标题行会保留（发布正文需要一个像样的开头），尾部多余的分隔线一并裁掉。
-          extract() {
-            _file="$1"; _out="$2"
-            if [ -f "$_file" ] && grep -q "^## $VN" "$_file"; then
-              awk -v v="$VN" '
-                $0 ~ "^## "v"([ ]|$)" { on=1 }
-                on && NR > 1 && /^## / && $0 !~ "^## "v"([ ]|$)" { exit }
-                on { print }
-              ' "$_file" | awk '{ lines[NR]=$0 } END {
-                # 从尾部回删空行与 "---"
-                n=NR
-                while (n>0 && (lines[n]=="" || lines[n]=="---" || lines[n]==" ")) n--
-                for (i=1;i<=n;i++) print lines[i]
-              }' > "$_out"
-              echo "已从 $_file 提取 $VN 的说明（$(wc -l < "$_out") 行）"
-              return 0
-            fi
-            return 1
-          }
-
-          extract CHANGELOG.md "$ZH" || {
-            {
-              echo "## Ripple $VN"
-              echo ""
-              echo "本版未在 CHANGELOG.md 中找到对应段落，详见仓库提交记录。"
-            } > "$ZH"
-            echo "CHANGELOG.md 里没有 $VN 的段落，使用中文占位说明"
-          }
-
-          extract docs/en/CHANGELOG_en.md "$EN" || {
-            {
-              echo "## Ripple $VN"
-              echo ""
-              echo "This version has no matching section in CHANGELOG_en.md; see the commit history."
-            } > "$EN"
-            echo "docs/en/CHANGELOG_en.md 里没有 $VN 的段落，使用英文占位说明"
-          }
-
-          # ===== 折叠：解决「更新内容太长、用户要一直下拉、还容易划过头」 =====
-          #
-          # 现象：1.3.x 起每版 CHANGELOG 有 9 个左右的三级小节，中英双版叠加后
-          # 正文常有 400+ 行。GitHub Release 是整页滚动，用户想找「安装包 /
-          # SHA-256」得一路往下拉；拉到之后想回到某一节又要往上爬，很容易划过头。
-          #
-          # 方案（三层，全部用 GitHub 原生支持的 <details>）：
-          #   ① 顶部一小块「本版包含」，列出所有三级小节标题 —— 不折叠，
-          #      用户一眼看出这版覆盖了哪几块；
-          #   ② 中文正文整体放进 <details open>（默认展开：中文是主要读者）；
-          #   ③ 英文正文放进 <details>（默认收起：非中文读者自己点开）。
-          #
-          # 这样默认页面高度压到几十行，「安装包 / SHA-256」就在一两屏内。
-          # 好处还在于：内容一个字都不删（想复查细节可以展开），
-          # 而且是 GitHub 渲染层原生折叠，不依赖任何平台特性。
-          #
-          # ⚠️ 两个必须遵守的格式细节，否则折叠块会渲染成一堆纯文本：
-          #   · <summary> 与 </summary> 必须在同一行，中间不能换行；
-          #   · <details> 后面的内容要空一行，Markdown 才会被当成 Markdown 解析。
-          # 指纹直接从**成品 APK** 读，而不是从 keystore 猜：
-          # 用户真正关心的是「这个包是什么签名」，而 apksigner --print-certs 给的
-          # 是实际打包用的证书摘要（顺带兼容 keytool 各版本 "SHA256:" / "SHA-256:" 的差异）。
-          CERT=$("$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs \
-                   "${{ steps.meta.outputs.file }}" 2>/dev/null \
-                 | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)
-          echo "签名证书 SHA-256：${CERT:-（读取失败）}"
-
-          ZH_LINES=$(wc -l < "$ZH")
-          EN_LINES=$(wc -l < "$EN")
-          ZH_TOC=$(grep -E '^### ' "$ZH" | sed 's/^###[[:space:]]*//' | sed 's/^/- /' || true)
-          if [ -z "$ZH_TOC" ]; then
-            ZH_TOC="- （本版无小节标题 / no subsection headings）"
-          fi
-
-          {
-            # 头部：标题 + 本版要点清单（不折叠）。
-            # 这部分和下面的折叠块分开写，是为了让「安装包」区块能插在中间。
-            echo "> 本文档为中英双语 · This release note is bilingual (Chinese / English)."
-            echo ""
-            echo "**本版包含 / What's in this release**"
-            echo ""
-            echo "$ZH_TOC"
-            echo ""
-            # 机器可读的 versionCode（1.3.4）：
-            # GitHub Release API 不提供 versionCode（只存在于 APK 内部），
-            # 而 App 内「检查更新」必须按整数比版本 ——
-            # 按版本名字符串比会在 1.3.10 vs 1.3.9 上判错。
-            # 埋一行 HTML 注释给它解析；找不到时 App 端退化成版本名比较。
-            # 防呆：VC 为空就直接让这一步失败。
-            # 上一版就是因为它为空而**静默**发了一个解析不出新旧版本的 Release，
-            # 直到发布后人工核对才发现 —— 这类「产物看起来正常、但一行关键元数据是空的」
-            # 必须由 CI 自己拦住，而不是靠人记得去查。
-            if [ -z "$VC" ]; then
-              echo "::error::versionCode 为空 —— Release 正文会写成空的 version-code 标记，App 内检查更新将永远解析失败。请检查 steps.meta.outputs.code 是否已传出。"
-              exit 1
-            fi
-            echo "<!-- ripple-version-code: $VC -->"
-          } > "$OUT"
-
-          # 安装包在最前（紧跟要点清单），用户不用展开折叠、也不用往下拉就能看到
-          {
-            echo ""
-            echo "---"
-            echo ""
-            echo "## 安装包 / Artifacts"
-            echo ""
-            echo "| 平台 | 文件 |"
-            echo "|---|---|"
-            echo "| Android | \`${{ steps.meta.outputs.file }}\` |"
-            echo "| Linux | \`Ripple_${VN}_amd64.deb\` · \`Ripple_${VN}_amd64.AppImage\` · \`Ripple-${VN}-linux-x86_64.tar.gz\` |"
-            echo "| Windows | \`Ripple_${VN}_x64-setup.exe\` · \`Ripple-${VN}-windows-x64.zip\` |"
-            echo ""
-            echo "**SHA-256**：\`${{ steps.meta.outputs.sha256 }}\`"
-            echo ""
-            echo "> 用仓库内固定的 debug keystore 签名，签名跨版本稳定，可直接覆盖安装。"
-            echo "> 签名证书 SHA-256：\`${CERT:-unknown}\`"
-            echo "> debug 证书的密码是公开的，**不能上架应用商店**；仅供自用 / 内测分发。"
-            echo "> minSdk 24 / Android 7.0+。"
-            echo "> 校验下载完整性：\`sha256sum ${{ steps.meta.outputs.file }}\`"
-            echo ""
-            echo "**Unsigned desktop builds**: the Windows/Linux packages are not code-signed. "
-            echo "On Windows, SmartScreen -> \"More info\" -> \"Run anyway\". "
-            echo "On Linux, \`chmod +x\` the AppImage/tar.gz, or \`sudo dpkg -i\` the deb."
-          } >> "$OUT"
-
-          # 折叠正文：中英各一个 <details>
-          # 前面必须空一行，否则 <details> 会被当成上一段文字的延续，
-          # GitHub 就不会把它渲染成折叠块。
-          {
-            echo ""
-            echo "<details open>"
-            echo "<summary><b>中文说明</b>（${ZH_LINES} 行 · 点击展开或收起）</summary>"
-            echo ""
-            cat "$ZH"
-            echo ""
-            echo "</details>"
-            echo ""
-            echo "<details>"
-            echo "<summary><b>English notes</b> (${EN_LINES} lines · click to expand or collapse)</summary>"
-            echo ""
-            cat "$EN"
-            echo ""
-            echo "</details>"
-          } >> "$OUT"
-          echo "中英双版正文已合并（带折叠）：$(wc -l < "$OUT") 行（中文 $(wc -l < "$ZH") + 英文 $(wc -l < "$EN")）"
-
+          # 与旧 step 完全相同的多行输出写法，下游不用改。
           {
             echo "body<<__EOF__"
-            cat "$OUT"
+            cat /tmp/notes.md
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
+
+          echo "Release 正文如下（本地可用 node scripts/release-notes.js 复现）："
+          cat /tmp/notes.md
 
       - name: 发布到 Release
         env:

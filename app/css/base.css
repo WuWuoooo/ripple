@@ -747,7 +747,28 @@ body.no-cover .np-bg{opacity:0}
     #000 64%,rgba(0,0,0,.55) 86%,transparent 100%);
   mask:linear-gradient(180deg,transparent 0%,rgba(0,0,0,.55) 14%,#000 36%,
     #000 64%,rgba(0,0,0,.55) 86%,transparent 100%)}
-.np-lyric .ln{height:var(--lyr-lh);line-height:var(--lyr-lh);
+.np-lyric .ln{
+  /*
+   * ⚠️ 必须收缩到**文字宽度**，不能是整行宽 —— 这是「换句后颜色停顿一秒才动」
+   * 的真正根因（1.3.8 真机反馈）。
+   *
+   * 机理：卡拉OK 的硬边由 linear-gradient 的百分比控制，而百分比是相对
+   * **元素自身的 border box** 铺的。.ln 是 flex 项，在 .np-lyric 里被拉成
+   * 整行宽（实测 411 屏下 el=456px），而文字本身只有 121px、水平居中，
+   * 左右各留 168px 空白。于是 --kp 从 0 涨到 1 的过程中：
+   *   0 → 0.37   硬边还在文字左边，**画面上完全没变化**
+   *   0.37 → 0.63 硬边扫过文字（这一段才是用户看到的「在填」）
+   *   0.63 → 1    硬边已经出了右边，**又不动了**
+   * 一句 2.7s 的歌词，前 1.0s 和后 1.0s 都是静止的 —— 用户原话
+   * 「会换句停顿大约一秒后然后继续填充」，数字完全对得上。
+   *
+   * 修法：让 .ln 收缩到文字宽度（fit-content），再用 auto 外边距保持居中。
+   * 这样元素的 border box 就等于文字的外框，渐变百分比与「唱到第几个字」严格一致。
+   * max-width:100% 保证超长句仍然被省略号截断（overflow/text-overflow 已在下面）。
+   */
+  width:fit-content;max-width:100%;
+  margin-left:auto;margin-right:auto;
+  height:var(--lyr-lh);line-height:var(--lyr-lh);
   font-size:var(--lyric-size,11px);
   /*
    * 这里不能用 --text3 再叠一层 opacity：两层不透明度相乘后
@@ -1241,6 +1262,51 @@ html:not(.perf-low) .np-lyric.roll-in{
 .np.expanded .np-lyric{display:none}
 
 /*
+ * 收起：整块歌词按**展开时同一条曲线、同一个时长**淡出。
+ *
+ * 为什么必须有这一条 —— 这是用户报的「收起动画和展开不一样，看着不顺」
+ * 的唯一根因，不是曲线参数调得不对：
+ *
+ *   展开时 .np.expanded .lyric 挂着 lyricIn，0.3s 淡入；
+ *   而收起时 .expanded 一摘掉，.lyric 立刻回到基础态的 display:none ——
+ *   **淡入存在、淡出不存在**。于是同一秒里：
+ *     封面 0.3s 慢慢落回来、歌名 0.3s 慢慢往下走、
+ *     整篇歌词「啪」一下整块消失。
+ *   两个节奏对不上，看起来就像「收起是另一个动作」。
+ *
+ * 做法：JS 收起时先挂 .collapsing（本规则让 .lyric 继续 display:block
+ * 并跑 lyricOut），0.3s 后再摘掉，回到 display:none。
+ * 时长与曲线直接复用 --dur-ani / --ease-inout，正反是同一段动画。
+ *
+ * 同时把三行歌词继续藏住（.np.collapsing .np-lyric）：
+ * 展开时三行是「第 0 帧立刻消失 + 整篇 0.3s 淡入」，严格反过来就是
+ * 「整篇 0.3s 淡出 + 结束那一帧三行出现」，这样正反严格互逆。
+ * 如果这里让三行跟着淡入，反而会变成「展开瞬间消失、收起缓慢出现」，
+ * 又是一种不对称。
+ */
+.np.collapsing .lyric{display:block;
+  animation:lyricOut var(--dur-ani) var(--ease-inout) both}
+@keyframes lyricOut{from{opacity:1}
+  to{opacity:0}}
+/*
+ * 三行在收起过程中**同时淡入**（交叉淡化），不是等整篇淡完再「啪」地出现。
+ *
+ * 上一版写的是「收起全过程三行保持 display:none，动画结束那一帧三行回来」——
+ * 严格互逆，但那一帧是一个硬切：用户看到整篇慢慢淡掉之后，三行凭空一闪。
+ * 这一版改成两者在同一条时间轴上交叉 ——
+ *   展开：三行第 0 帧消失，整篇 0.3s 淡入；
+ *   收起：整篇 0.3s 淡出，三行 0.3s 淡入。
+ * 每个方向上都只有「一个在显、一个在隐」，没有硬切。
+ *
+ * 布局上不会跳：收起态 .np-lyricbox 的 min-height 正好是三行的高度，
+ * 所以三行在这 0.3s 里出现不会改变容器尺寸（实测 coverH 全程恒定）。
+ */
+.np.collapsing .np-lyric{display:flex;
+  animation:lyricMiniIn var(--dur-ani) var(--ease-inout) both}
+@keyframes lyricMiniIn{from{opacity:0}
+  to{opacity:1}}
+
+/*
  * ============================================================
  * 展开时：整块封面「原样」滑走，歌名/进度/按钮让位
  * ============================================================
@@ -1321,8 +1387,25 @@ html:not(.perf-low) .np-lyric.roll-in{
   -webkit-mask:linear-gradient(180deg,transparent,#000 10%,#000 80%,transparent);
   mask:linear-gradient(180deg,transparent,#000 10%,#000 80%,transparent)}
 .lyric::-webkit-scrollbar{display:none}
-.lyric .ln{padding:9px 2px;font-size:var(--ln-size,14px);line-height:1.55;color:var(--text3);
+.lyric .ln{
+  /*
+   * 展开层**不能用 width:fit-content**（三行那一层可以）。
+   *
+   * 原因：这里的 .ln 里除了正文还有一行 .tr 译文，而译文往往比正文长。
+   * 元素宽度一旦被译文撑开，正文又是居中、左右留白，渐变硬边照样空跑 ——
+   * 实测「正文 47px / 元素 276px / 左右各空 115px」。
+   *
+   * 所以改成：.ln 保持整行（负责居中与点击热区），
+   * 把渐变挪到里面的 .tx（正文包裹层，inline-block 天然收缩到文字宽度）。
+   * 这样译文再长也不会影响正文的渐变范围。
+   */
+  padding:9px 2px;font-size:var(--ln-size,14px);line-height:1.55;color:var(--text3);
   transition:.36s var(--ease);text-align:center}
+/* 正文包裹层：inline-block 收缩到文字宽度，渐变百分比才等于「唱到第几个字」。
+   超长句仍要被省略号截断（inline-block + max-width 已经能压住，
+   这里补 overflow 只是为了让裁切真的发生，否则文字会画出盒子外）。 */
+.lyric .ln .tx{display:inline-block;max-width:100%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 /*
  * 译文行：用独立的 --lyric-tr 令牌，**不要再叠 opacity**。
  *
@@ -1333,7 +1416,20 @@ html:not(.perf-low) .np-lyric.roll-in{
  * 现在一个令牌给一个实测值：深色 5.32:1、浅色 5.20:1，两套主题都过 AA。
  * 层次感仍保留 —— 译文比 --lyric-dim（非当前行）再弱一档。
  */
-.lyric .ln .tr{display:block;font-size:11.5px;color:var(--lyric-tr);margin-top:4px}
+/*
+ * 译文行。
+ *
+ * ⚠️ width:fit-content 那一套只解决「正文比容器窄」，解决不了「**译文比正文宽**」：
+ * 译文是 .ln 的子元素，它一宽就把 .ln 撑宽，正文又变成居中 + 左右留白，
+ * 渐变照样空跑（实测：正文 47px、元素 276px、左右各空 115px）。
+ * 所以译文自己也收缩到内容宽度，并且只作用在正文那一行上 ——
+ * 正文行（text node）用 .ln 的 ::first-line 管不到，只能靠结构。
+ * 这里用 margin 让它跟着正文居中即可：.ln 的宽度由「较宽的那个」决定，
+ * 而两种情况下渐变的硬边都只覆盖正文自身宽度，视觉上足够准；
+ * 真正需要绝对精确的是**正文比译文窄**这一侧，见下面的 .tr 收缩。
+ */
+.lyric .ln .tr{display:block;width:fit-content;max-width:100%;
+  margin:4px auto 0;font-size:11.5px;color:var(--lyric-tr)}
 /* 当前行放大：用 calc(变量 × 1.12) 而不是固定 16px，
    否则设置里的「歌词字号」一改，播放页三行和展开层就对不上；
    也避免再用行内 font-size 把它压掉（那正是它以前完全失效的原因）。
@@ -1380,15 +1476,21 @@ html:not(.perf-low) .np-lyric.roll-in{
  * .on 的 color 会把 transparent 覆盖回去，染色失效。
  */
 .lyric .ln.kf{
-  background-image:linear-gradient(90deg,
-    var(--k-done) calc(var(--kp,0) * 100%),
-    var(--k-base) calc(var(--kp,0) * 100%));
-  -webkit-background-clip:text;
-  background-clip:text;
+  /*
+   * 渐变挂在**正文包裹层** .tx 上，不挂在 .ln 上（见上面 .ln 的注释）。
+   * --kp 是自定义属性，会从 .ln 继承下来，所以 JS 侧仍然只往 .ln 写变量，
+   * 不需要改任何一行染色逻辑。
+   */
   -webkit-text-fill-color:transparent;
   color:transparent;
   /* 同上：染色态不要让 color 参与过渡，否则换句会闪一下 */
   transition:background-color .36s var(--ease),opacity .36s var(--ease)}
+.lyric .ln.kf .tx{
+  background-image:linear-gradient(90deg,
+    var(--k-done) calc(var(--kp,0) * 100%),
+    var(--k-base) calc(var(--kp,0) * 100%));
+  -webkit-background-clip:text;
+  background-clip:text}
 /*
  * 译文必须从「掏空」里救回来。
  *

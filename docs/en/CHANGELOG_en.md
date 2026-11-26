@@ -6,6 +6,165 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.8 — Fifteenth Version
+
+> **Basis**: two issues reported by the owner — (1) tapping the status-bar lyric only ever opened
+> an in-app sheet, so it was useless while other apps were in front; (2) the collapse animation of
+> the player lyric did not match the expansion. Also specified that release notes should list only
+> what changed, not long essays.
+> **Implementation and docs by**: Deepseek V4.1 Flash 1017.
+
+### Shared (frontend / build chain)
+
+- **Player lyric collapse is now the exact reverse of expansion** (same curve, same duration;
+  the three-line view and the full view cross-fade)
+- **Fixed karaoke fill "pausing for a second after each line change"**: the gradient percentage was
+  painted across the full-width row while the text was centred, so the first and last 37% landed on
+  empty space (both surfaces; the full view also had to work around translations widening the row)
+- **Fixed the cover "jumping in and twitching bigger"**: the collapse animation was misread as a
+  settled layout, so a collapsed container height was measured and written as the new cover size
+- **Release notes are now a plain summary**: only what changed, no artifact table, no SHA-256
+- Release-note extraction moved out of CI awk into `scripts/release-notes.js` — runnable locally, with tests
+- Version 1.3.8
+
+### Android
+
+- **New native control bar for the status-bar lyric**: tap in place, no jumping back to the app
+- Bar: lock / previous / play-pause / next / style, plus an ✕ to turn the lyric off
+- Style page: 8 preset colours, a draggable hue bar, and T+/T- for size, applied immediately
+- **The card background is draggable too** (previously only the lyric text itself could be moved)
+- Fixed **the card growing wider on every open and being pushed off screen** (the padding top-up was
+  accumulating)
+- Fixed **the lyric "popping out from the top-left corner"** when closing or locking (padding was
+  cleared before the window moved, leaving one frame misaligned)
+
+### Windows
+
+- No changes (no desktop code touched in this release)
+
+### Linux
+
+- No changes (shares the same Rust and frontend as Windows; untouched here)
+
+---
+
+### 1. Status-bar lyric: the control bar moved to native (Android)
+
+**Symptom** (owner's words): with the overlay unlocked, tapping it opened a web bottom sheet —
+but in the situation where the feature is actually used (listening while another app is in front),
+that sheet is invisible.
+
+**Why it did not work before**: `__rippleLyricTap` called the web-side `openSbTune()`, a bottom
+sheet inside the app. Tapping the status-bar lyric means the WebView is necessarily in the
+background, so the real effect was "bring Ripple to the foreground, cover half the screen, and let
+the user find the right row themselves". The interaction path contradicted the requirement.
+
+**Now**: the panel is drawn by `LyricOverlay` itself — it already is that overlay window, so it can
+add content without bringing the app forward.
+
+- The lyric does not move; the card grows around it. The root container always carries the same
+  12/28/12/10dp padding (18dp rounded translucent background); closing the panel just hides the
+  background and the buttons — **the window geometry never changes**, so nothing can jump.
+- **The card background is draggable too** (previously only the lyric text itself): background and
+  lyric share the same drag semantics, both anchored on the lyric position.
+- The button row adapts through four tiers (single row → tighter margins → two rows 3+2 → smaller
+  icons), and never moves the window to fit on screen.
+- All icons are self-drawn (`GlyphButton`, Canvas + Path), no emoji and no Unicode symbols: font
+  fallback differs across ROMs, so the same "⏸" renders as a colour emoji on one device, a thin
+  line on another, and a tofu box on a third.
+- The hue bar is self-drawn too (`HueBar`): an HSV gradient with a dot marking the current colour.
+- Auto-collapse after 8 seconds of no interaction, so the window never sits on top of other apps.
+- Drag coordinate conversion: `onMoved` must report the **lyric** position, not the window origin —
+  otherwise every open-drag-close cycle would shift the saved position by one padding step.
+
+**Two on-device bugs fixed in this release** (both introduced by the first 1.3.8 build):
+
+1. **The card grew wider on every open and was eventually pushed off screen.** The first build kept
+   the buttons visible when the card extended past the right edge by adding the overflow width to the
+   left padding — but that code lived in `reanchorPanel()`, which layout callbacks fired repeatedly,
+   so `padL` only ever grew. Device log: `padL += 149px` twice in a row → `pad = 334` → another
+   `+19+19` → `410`, pushing the window origin to `x = -652` on a 1258px-wide screen.
+   **Conclusion: any padding that changes always produces a visible jump; that path is wrong.**
+   Padding is now a constant, and `padL +=` or `padL = 0` anywhere is a bug.
+2. **The lyric "popped out from the top-left corner" when closing or locking.** The first build had
+   `closePanel()` call `applyPanelChrome(false)` (clearing padding) before `lp.x = lyricX` (moving the
+   window); for one frame padding was zero while the window was still at the old origin, so the
+   content drew in the top-left corner. Closing now only hides content and touches neither padding
+   nor `lp`, so that frame cannot exist.
+
+### 2. Lyric collapse animation (shared)
+
+**Symptom** (owner's words): "the collapse animation of the lyric should be the same as expansion
+but reversed; right now it is a different animation and looks off".
+
+**Root cause is not a mistuned curve — the collapse animation did not exist**:
+
+- Expansion: `.np.expanded .lyric` carries the `lyricIn` keyframes, a 0.3s fade-in;
+- Collapse: removing `.expanded` returns `.lyric` to the base `display:none` —
+  **instant disappearance, no transition.**
+
+So within the same second: the cover slides back over 0.3s, the title slides down over 0.3s, and
+the whole lyric block vanishes in one frame. Two rhythms that do not match read as "collapse is a
+different action".
+
+**Fix**: on collapse, add `.np.collapsing` first so `.lyric` stays `display:block` and runs
+`lyricOut` (1 → 0, **the same `--dur-ani` / `--ease-inout`**), then remove the class when the
+animation ends. The two directions are now strictly inverse:
+
+| | Three-line lyric | Full lyric |
+|---|---|---|
+| Expand | gone on frame 0 | 0.3s fade-in |
+| Collapse | appears at the end | 0.3s fade-out |
+
+Two details:
+
+- The cleanup timer reads the **actual milliseconds** of `--dur-ani` instead of a hard-coded 300.
+  The "animation speed" setting scales that value down; hard-coding would leave the class on for
+  twice the animation length, so tapping expand again would feel stuck.
+- No collapse animation while the player page is closing (`closeNP` has already removed `.open`):
+  the page is sliding down over 0.52s, and an inner 0.3s fade-out would make the three-line lyric
+  flash into view for a frame in the middle of that slide.
+
+### 3. Release notes list only what changed (build chain)
+
+The owner asked for this shape, without long essays and without repeating the install instructions
+that README already covers:
+
+```
+## 本次更新
+- new cross-platform feature
+- fixed something on Windows
+
+## This release
+- ...
+```
+
+**How**: the body used to be assembled by 160 lines of awk in CI (table of contents, artifact
+table, SHA-256, certificate digest, bilingual `<details>` folding). Now:
+
+- Extraction moved into `scripts/release-notes.js` (plain node, zero dependencies); CI only calls
+  it — because the body format is something worth testing, and awk inside YAML can be neither
+  tested nor reproduced locally.
+- Rules: cut the version section → **keep only what precedes the first `---`** (everything after it
+  is detailed analysis and stays out of the notes) → keep only `### ` headings and `- ` list items.
+- Still carries `<!-- ripple-version-code: 138 -->`: the in-app update checker compares integer
+  version codes (comparing version-name strings misjudges 1.3.10 vs 1.3.9).
+- Five hard failures turn CI red: non-positive versionCode, missing versionName, missing version
+  section in the Chinese or the English changelog, and an empty summary block. (1.3.5 once shipped a
+  release whose versionCode marker was silently empty.)
+- `tests/release-notes.test.js` has 12 cases, all with temporary-directory fixtures rather than the
+  real changelog text, including a meta-test proving the assertions are not vacuous.
+
+### 4. Not done in this release
+
+- Desktop: no changes (the player-page animation is shared frontend code, so desktop gets it too).
+- The native Android panel is **not verified on a real device**. No usable device here; the geometry
+  (padding / window-origin shift / onMoved inverse mapping) was derived from the code path and only
+  compile-verified. If the panel is offset, start with how `applyPanelChrome` and `applyPosition`
+  interact in `LyricOverlay`.
+- The web-side `#sbSheet` panel is still there (Settings → "Style ›" opens it); tapping the overlay
+  simply no longer triggers it.
+
 ## 1.3.7 — Fourteenth Version
 
 > **Basis**: three real-device issues reported by the owner — (1) the status-bar lyric overlay drifts

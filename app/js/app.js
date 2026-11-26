@@ -2749,8 +2749,18 @@
       box.innerHTML = `<div class="empty">暂无歌词<br><span style="opacity:.6">在线曲目会自动匹配</span></div>`;
       _lyricSig = '';
     } else {
+      /*
+       * 正文必须包在 .tx 里（1.3.8 真机反馈「换句后停顿一秒才填充」的修法之一）。
+       *
+       * 原因：这一行里除了正文还有译文 .tr，而译文往往比正文长。
+       * 元素宽度被译文撑开后，正文是居中的、左右各留一大片空白，
+       * 而卡拉OK 渐变的百分比是相对**元素**宽度铺的 —— 于是 --kp
+       * 前 40% 和后 40% 都画在空白里，画面上完全不动。
+       * 把正文单独包一层 inline-block（CSS 里 .lyric .ln .tx），
+       * 渐变就只覆盖正文自身宽度，「唱到第几个字」才和硬边位置一致。
+       */
       box.innerHTML = lyricLines.map((l, i) =>
-        `<div class="ln" data-i="${i}" data-t="${l.t}">${esc(l.text)}`
+        `<div class="ln" data-i="${i}" data-t="${l.t}"><span class="tx">${esc(l.text)}</span>`
         + `${l.tr && S().showTrans ? `<span class="tr">${esc(l.tr)}</span>` : ''}</div>`
       ).join('');
       /*
@@ -4166,8 +4176,25 @@
     const wrap = document.querySelector('.cover-wrap');
     const np = $('#np');
     if (!wrap || !np) return;
-    /* 展开态 / 播放页没打开：不发布，保持上一次的值 */
+    /*
+     * 展开态 / 正在收起 / 播放页没打开：一律不发布，保持上一次的值。
+     *
+     * ⚠️ 收起态（.collapsing）也必须跳过 —— 这条是 1.3.8 真机反馈
+     * 「歌曲封面像是直接跳出来的，从小直接抽搐变大」的直接原因。
+     *
+     * 机理：收起动画一开始就摘掉了 .expanded、挂上 .collapsing，
+     * 而这里原来只判 .expanded，于是收起的第一帧就被判定成「稳定状态」，
+     * 兴冲冲地量了一次 cover-wrap 的**当前**高度（那时容器还在 71px 之类的
+     * 中间值），算出 130px 这种小尺寸写进 --cover-size；
+     * 紧接着容器长回来又量一次 287px 写回去。
+     * 用户看到的就是封面先缩一下再弹大 —— 一个抽搐。
+     *
+     * 实测（headless Chrome，411×914，跑的是本函数的原样代码）：
+     *   不加这条：COLLAPSE 期间 _coverSize = 287 → 130 → 182 → 230 → 257 → 287
+     *   加上这条：全程恒为 287
+     */
     if (np.classList.contains('expanded')) return;
+    if (np.classList.contains('collapsing')) return;
     if (!np.classList.contains('open')) return;
     const cs = getComputedStyle(wrap);
     const padL = parseFloat(cs.paddingLeft) || 0;
@@ -4405,25 +4432,71 @@
    * 所以改成先量起始高度、切类后量目标高度，再用显式 height 过渡，
    * 结束后清掉内联样式交还给 CSS。这样高度是严格单调的。
    */
+  /*
+   * 收起动画的收摊定时器（见下面 animateLyricBox）。
+   *
+   * 为什么要有它：展开是 CSS 动画（.np.expanded .lyric 上的 lyricIn），
+   * 收起如果只靠「摘掉 .expanded」就会瞬间 display:none ——
+   * 淡入有、淡出没有，正反不对称（用户原话「收起动画与展开不同，看着不顺」）。
+   * 现在收起走 .np.collapsing + lyricOut，动画跑完再摘类。
+   */
+  let _collapseTimer = null;
+
+  /**
+   * 读 --dur-ani 的实际毫秒数。
+   *
+   * 不写死 300：设置里的「动画速度」会等比缩小它（上限 0.3s），
+   * 慢速档下 CSS 是 0.15s 而定时器还是 300ms 的话，摘类会延后一倍时长 ——
+   * 表现就是「收起完了还要愣一下才能再点展开」。
+   */
+  function aniDurationMs() {
+    try {
+      const v = getComputedStyle(document.documentElement)
+        .getPropertyValue('--dur-ani').trim();
+      let ms = 300;
+      if (/ms$/.test(v)) ms = parseFloat(v);
+      else if (/s$/.test(v)) ms = parseFloat(v) * 1000;
+      if (!isFinite(ms) || ms <= 0) return 300;
+      return Math.min(300, Math.round(ms));
+    } catch (e) {
+      return 300;
+    }
+  }
+
   function animateLyricBox(expand) {
-    /*
-     * 现在整个函数只剩一次 class 切换。
-     *
-     * 早期实现里有一整套「冻结封面尺寸 / 到点解冻 / 结束后重算」的补偿逻辑，
-     * 是围绕 JS 量尺寸那套架构长出来的。现在封面尺寸完全由 CSS 的
-     * width:100% + aspect-ratio + max-height 决定，浏览器在布局阶段自己算，
-     * 动画过程中它只会跟着容器一起变，不存在需要冻结的 inline 值，
-     * 也就不需要任何计时器去「事后修正」。
-     *
-     * 这同时消掉了两个老问题：
-     *   · 偶见封面变小 —— 某次测量在容器还没长开时跑了一遍，把 120px 那样
-     *     的小值写进 inline style，之后一直错着；
-     *   · 收回时歌名「再往下闪一下」—— 解冻后立刻重算尺寸，
-     *     在动画刚结束的那一刻又改了一次布局。
-     */
     const np = $('#np');
     if (!np) return;
-    np.classList.toggle('expanded', !!expand);
+    /*
+     * 收起与展开是**同一段动画正着播和倒着播**：
+     *   展开 = 三行在第 0 帧消失，整篇 lyricIn 0.3s 淡入；
+     *   收起 = 整篇 lyricOut 0.3s 淡出，结束那一帧三行回来。
+     * 严格互逆，所以用户看到的是「同一个动作的两个方向」。
+     *
+     * 这里的定时器必须清掉再重挂：用户可能在中途反复点，
+     * 旧的 300ms 到点会把新加的 .collapsing 摘掉，动画就断在半途。
+     */
+    clearTimeout(_collapseTimer);
+    np.classList.remove('collapsing');
+    if (expand) {
+      np.classList.add('expanded');
+      return;
+    }
+    /* 本来就没展开：不必播一次空动画，直接保证状态干净 */
+    if (!np.classList.contains('expanded')) return;
+    /*
+     * 播放页正在关闭（closeNP 先摘 .open 再调这里）时不要播收起动画。
+     * 那时整页正在用 0.52s 滑下去，若同时让歌词 0.3s 淡出，
+     * 0.3s 后三行会在「还在下滑的页面里」突然出现一帧 —— 正是老版本
+     * 用户抱怨过的「关播放页时闪一下」。
+     * 页面整体要收走时，内部就不必再演一遍。
+     */
+    if (!np.classList.contains('open')) {
+      np.classList.remove('expanded');
+      return;
+    }
+    np.classList.remove('expanded');
+    np.classList.add('collapsing');
+    _collapseTimer = setTimeout(() => np.classList.remove('collapsing'), aniDurationMs());
   }
 
   function expandLyric() {
@@ -7330,10 +7403,93 @@
     if (lk) lk.textContent = S().sbLocked ? '已锁定 ›' : '可调整 ›';
   }
 
-  /** 未锁定时点一下浮层 → 弹出调整面板 */
+  /*
+   * ================= 原生控制面板（1.3.8）=================
+   *
+   * 1.3.7 及以前：未锁定时点一下状态栏歌词 → 原生回调 onTap() →
+   * 这里调 openSbTune() 弹一个网页的底部面板。
+   *
+   * 问题（用户原话）：「用户点击状态栏歌词 出现黑色背景 可以进行切歌
+   * 暂停/继续 锁定 颜色设置 关闭操作 再次点击收起」——
+   * 那时点一下只是把**整个 App 拉到前台**再弹一个底部 sheet，
+   * 而用户当时往往正在别的 App 里（这正是状态栏歌词的使用场景），
+   * 所以「点一下」的实际体验是「跳到 Ripple、遮住半屏、还要再找按钮」。
+   *
+   * 现在面板完全由原生画（LyricOverlay 里的 root + 按钮行 + 样式页），
+   * 不离开当前 App、不动歌词位置、点哪里就在哪里。
+   * 网页这边只剩「收下原生改的值并落盘」四件事。
+   *
+   * 注意：__rippleLyricTap 仍然保留成空实现而不是删掉 ——
+   * 万一用户装的是新网页 + 旧 APK（WebView 缓存没更新、或降级安装），
+   * 旧原生仍会调它；留着空实现比让它抛 TypeError 干净。
+   * 新 APK 侧已经改成只打日志、不再调 JS，所以这条路径平时不会走。
+   */
   window.__rippleLyricTap = function () {
-    if (!sbEnabled() || S().sbLocked) return;
-    openSbTune();
+    /* 面板已由原生接管；旧 APK 调过来时什么也不做（不要弹网页 sheet） */
+    Log.add('LYRIC', 'native tap (panel is native since 1.3.8), ignored');
+  };
+
+  /**
+   * 原生面板改了颜色 / 字号。
+   *
+   * 只收两个参数：面板里能改的就是这两样（不透明度/粗体/描边仍在
+   * App 的设置页里，那边有滑块，面板上放滑块会挤）。
+   * 传空串表示「这次那一项没变」——原生只在用户真的动过时才带值。
+   */
+  window.__rippleLyricStyle = function (colorHex, sizeSp) {
+    if (!sbEnabled()) return;
+    const c = String(colorHex == null ? '' : colorHex).trim();
+    if (/^#[0-9a-fA-F]{6}$/.test(c)) {
+      S().sbColor = c.toUpperCase();
+    }
+    const n = Number(sizeSp);
+    if (Number.isFinite(n) && n > 0) {
+      /* 与原生侧的钳制范围一致（9..22），两边都夹一次防止任一侧漏了 */
+      S().sbSize = Math.min(22, Math.max(9, Math.round(n)));
+    }
+    Store.save();
+    /*
+     * force=true：颜色/字号是用户**刚刚动手改的**，必须立刻重推一次。
+     * 用默认的签名幂等也行（值变了签名就变），但这里显式 force 更稳 ——
+     * 万一原生回传的值和网页记的原值相同（用户点到当前色），
+     * 幂等判断会早退，而原生那边其实已经切到新状态了。
+     */
+    applySbOverlay(true);
+    if (colorHex != null) renderSbTune();
+    Log.add('LYRIC', 'native style color=' + S().sbColor + ' size=' + S().sbSize);
+  };
+
+  /** 原生面板点了「锁定」 */
+  window.__rippleLyricLock = function (locked) {
+    if (!sbEnabled()) return;
+    S().sbLocked = !!locked;
+    Store.save();
+    applySbOverlay(true);
+    syncSbOverlay();
+    renderSbTune();
+    Log.add('LYRIC', 'native lock=' + S().sbLocked);
+  };
+
+  /**
+   * 原生面板右上角的 ✕ —— 关闭状态栏歌词。
+   *
+   * 与用户在设置页里关掉开关**走同一条路**（syncSbOverlay → stopSbOverlay），
+   * 不要另写一套：设置页那个开关的 .on 状态、提示文案、
+   * 「上次开着状态栏歌词的话启动后接上」那条启动逻辑都挂在这条路上，
+   * 另写一套就会出现「浮层没了但开关还亮着」。
+   */
+  window.__rippleLyricClose = function () {
+    if (!S().sbLyric) return;
+    S().sbLyric = false;
+    Store.save();
+    const sw = $('[data-set="sbLyric"]');
+    if (sw) {
+      sw.classList.remove('on');
+      if (sw.getAttribute('role') === 'switch') sw.setAttribute('aria-checked', 'false');
+    }
+    syncSbOverlay();
+    toast('状态栏歌词已关闭', '可以在「设置 → 状态栏歌词」里重新打开', 'check');
+    Log.add('LYRIC', 'closed from native panel');
   };
 
   /**

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -13,7 +14,11 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 /**
  * 状态栏歌词浮层。
@@ -25,19 +30,84 @@ import android.view.WindowManager;
  * 交互：
  *   · 锁定（默认）：纯展示，不可拖动、不可修改，完全不拦触摸（FLAG_NOT_TOUCHABLE），
  *     用户正常操作别的 App 时一点感觉都没有。
- *   · 未锁定：可以按住拖动位置；点击一次会回调给网页，由网页弹出
- *     颜色 / 字号 / 透明度的调整面板。
+ *   · 未锁定：可以按住拖动位置；点击一次弹出**原生控制面板**（1.3.8 起）。
+ *
+ * ===== 原生控制面板（1.3.8）=====
+ *
+ * 以前点一下是回调网页、由网页弹底部面板。问题很直接：状态栏歌词的
+ * 使用场景就是「已经切到别的 App」，而这时网页在后台 —— 弹出来的
+ * 底部面板根本看不见（WebView 不可见）。用户点了半天只有等切回 App 才看到。
+ * 所以面板必须画在这块悬浮窗自己身上。
+ *
+ * 结构（为什么是 FrameLayout 套一层，而不是直接给歌词 View 加子 View）：
+ *   之前 wm.addView 的是歌词本身（FillTextView，自绘 View，不会布局子 View）。
+ *   现在改成：
+ *       root(FrameLayout)  ← 真正 addView 给 WindowManager 的那个
+ *         ├─ LinearLayout(竖向, id=body)
+ *         │    ├─ view   ← 歌词本体（FillTextView），一行代码没改
+ *         │    └─ bar    ← 按钮行 / 样式页（默认 GONE）
+ *         └─ GlyphButton(✕)  ← 右上角，浮动在 root 的 padding 区域里
+ *
+ *   view 字段保持不变（大量既有代码在用它的 getWidth/textWidth/alpha…），
+ *   只是从「窗口视图」降级成「窗口里的一行」。所有 wm.addView /
+ *   updateViewLayout / removeView 全部换成 root。
+ *
+ * 几何（用户明确要求：面板打开时歌词本身**不能动**）：
+ *   面板打开时给 root 设 padding（左上右下 = 12/28/12/10 dp）作为卡片的内缩，
+ *   卡片背景是一张圆角 Drawable。
+ *   padding 会把内容整体往右下推，所以窗口原点必须**反向平移同样的量**：
+ *       lp.x = 歌词x - padLeft ; lp.y = 歌词y - padTop
+ *   于是 (窗口原点 + padding) 恒等于歌词原来的屏幕坐标 —— 歌词纹丝不动，
+ *   卡片是围着它长出来的。
+ *   关闭面板时 padding 归零、背景置 null，窗口正好包住歌词，与旧版完全一致。
+ *
+ *   为此本类把「窗口原点」和「歌词位置」严格分开：
+ *     · 对外的一切（posX/posY、onMoved、applyPosition 的入参）都是**歌词位置**；
+ *     · lp.x / lp.y 永远是**窗口原点**，需要时用 lyricXFromWindow() 换算。
+ *
+ * 自动收起：面板开着就是一块能拦触摸的窗口，一直挂在那儿会挡住下面的 App。
+ * 所以打开后 8 秒无操作自动收起（任何点击/拖动都重新计时）。
  */
 public class LyricOverlay {
 
     private static LyricOverlay instance;
 
     public interface Callback {
-        /** 用户点了一下浮层（未锁定时），网页据此弹调整面板 */
+        /**
+         * 用户点了一下浮层（未锁定时）。
+         *
+         * ⚠️ 1.3.8 起原生面板接管了「点一下弹面板」，所以 MainActivity 里这个
+         * 回调只剩打日志的作用（见 MainActivity.overlay()）。保留它是因为
+         * 它同时也是「未锁定浮层被点」这个语义的唯一出口，将来若要再加
+         * 其它反应（震动、统计）还有地方挂。
+         */
         void onTap();
 
-        /** 用户拖动结束后的新位置（屏幕坐标，px） */
+        /**
+         * 用户拖动结束后的新位置（歌曲位置的**屏幕坐标 px**）。
+         *
+         * 注意这里给的是「歌词的左上角」，不是窗口原点 ——
+         * 面板打开时窗口原点被 padding 平移过（见 openPanel / shiftWindowForPanel），
+         * 直接把 lp.x/lp.y 报上去会让网页存下的位置一路往左上游。
+         */
         void onMoved(int x, int y);
+
+        /**
+         * 面板里改了样式（颜色 / 字号）。网页据此落盘。
+         *
+         * @param colorHex 形如 "#B3A2FF"（不带 alpha）
+         * @param sizeSp   字号的十进制字符串，如 "12"
+         */
+        void onStyle(String colorHex, String sizeSp);
+
+        /** 面板里点了「锁定」。网页据此存盘（原生侧已经先把 locked 落实了） */
+        void onLockChanged(boolean locked);
+
+        /** 面板里点了 ✕，浮层已经被原生 hide() 掉；网页据此把 App 里的开关关掉 */
+        void onClose();
+
+        /** 面板里的媒体按钮：prev / toggle / next */
+        void onCommand(String cmd);
     }
 
     private final Context ctx;
@@ -54,6 +124,41 @@ public class LyricOverlay {
     private volatile Callback cb;
 
     private FillTextView view;
+    /**
+     * 真正的窗口视图（1.3.8）。
+     *
+     * view（歌词）现在是它的孙子：root → body(竖向 LinearLayout) → view。
+     * 为什么要多这一层：卡片背景、内缩 padding、右上角的 ✕、下方的按钮行
+     * 都需要一个「容器」来承载；而 FillTextView 是自绘 View，它不布局子 View。
+     */
+    private FrameLayout root;
+    /** root 里唯一那个竖向 LinearLayout，装「歌词 + 按钮行」 */
+    private LinearLayout body;
+    /** 按钮行（第一页：锁定/上一首/播放暂停/下一首/齿轮） */
+    private LinearLayout bar;
+    /** 样式页（第二页：预设色点 + 色相条 + T-/T+） */
+    private LinearLayout stylePage;
+    /** 右上角的关闭按钮（✕），浮动在 root 的 padding 区域里 */
+    private GlyphButton closeBtn;
+    /** 播放/暂停按钮（要跟着 timingPlaying 换图标，所以留引用） */
+    private GlyphButton playBtn;
+    /** 齿轮按钮（切到样式页时高亮） */
+    private GlyphButton gearBtn;
+    /** 锁定按钮（已锁定时高亮） */
+    private GlyphButton lockBtn;
+    /** 当前正在走哪个页面：false=按钮行，true=样式页 */
+    private boolean showingStylePage = false;
+    /** 面板是否打开（打开时才设 padding / 背景 / 平移窗口） */
+    private volatile boolean panelOpen = false;
+    /**
+     * 拖动锚点：面板打开期间歌词**在屏幕上的**左上角坐标（px）。
+     *
+     * 常量 padding + body 左对齐之后，歌词相对窗口的偏移恒为 (padL, padT)，
+     * 所以这个值理论上总能由 lp.x + padL 算出来 —— 保留它只是为了拖动时
+     * 有一个「按下那一刻的基准」可以累加位移，避免每帧累加误差。
+     * 面板关着时它没有意义（不用它）。
+     */
+    private int anchorX = 0, anchorY = 0;
     private WindowManager.LayoutParams lp;
     private volatile boolean added = false;
 
@@ -255,7 +360,20 @@ public class LyricOverlay {
                           final boolean fill, final String fillHex) {
         main.post(() -> {
             try {
+                /*
+                 * 面板打开期间被改成锁定（比如用户在 App 里点了「锁定」）：
+                 * 必须立刻收起面板。理由很实在 —— 锁定后窗口 flags 变成
+                 * FLAG_NOT_TOUCHABLE，面板上的按钮再也收不到触摸，
+                 * 会变成一块「看得见但点不动」的黑色卡片挡在状态栏上。
+                 *
+                 * 注意要在写 this.locked 之前判断旧值：判断依据是
+                 * 「本来没锁、现在要锁」。
+                 */
+                boolean wasLocked = this.locked;
                 this.locked = locked;
+                if (!wasLocked && locked && panelOpen) {
+                    closePanel();
+                }
                 int c = parseColor(colorHex, this.color);
                 float sz = parseFloat(sizeSp, this.sizeSp);
                 float al = parseFloat(alphaStr, this.alpha);
@@ -303,13 +421,7 @@ public class LyricOverlay {
                 if (lp == null) return;
                 if (reposition) {
                     applyPosition();
-                    if (added && view != null && wm != null) {
-                        try {
-                            wm.updateViewLayout(view, lp);
-                        } catch (Throwable e) {
-                            CrashLog.recordAsync(ctx, "lyric-move", e);
-                        }
-                    }
+                    updateWindow();
                 }
                 updateLayoutFlags();
             } catch (Throwable e) {
@@ -425,9 +537,17 @@ public class LyricOverlay {
                          * 这也正是「位置看起来自己跑了」的另一半成因。
                          */
                         int want = Math.min(restoreX(posX), max);
-                        if (want != lp.x) {
-                            lp.x = want;
-                            if (wm != null) wm.updateViewLayout(view, lp);
+                        /*
+                         * want 是「歌词左边缘」，lp.x 是「窗口原点」，
+                         * 两者恒差一个常量 padding —— 面板开不开都一样，
+                         * 不需要任何分支（1.3.8 第一版这里要分两种算法，
+                         * 纯粹是因为那时 padding 和歌词偏移都会变）。
+                         */
+                        if (want != lyricXFromWindow(lp.x)) {
+                            lp.x = toWindowX(want);
+                            updateWindow();
+                            /* 面板开着时按钮行档位可能因此变化（歌词右移了） */
+                            if (panelOpen) relayoutBar(want);
                         }
                     } catch (Throwable e) {
                         CrashLog.recordAsync(ctx, "lyric-reefit", e);
@@ -456,6 +576,13 @@ public class LyricOverlay {
      */
     public void setLocked(boolean v) {
         main.post(() -> {
+            /*
+             * 面板开着时被锁定（运行中改锁定）→ 先收起面板。
+             * 锁定后 flags 变 FLAG_NOT_TOUCHABLE，面板会变成一块
+             * 「看得见但点不动」的暗色卡片挡在状态栏上。
+             * 与 configure() 里那段同一条理由，两个入口都要管。
+             */
+            if (v && panelOpen) closePanel();
             locked = v;
             /* lp 还没建（从未 show 过）时无事可做，show() 会按 locked 初始化 */
             if (lp != null) updateLayoutFlags();
@@ -493,6 +620,9 @@ public class LyricOverlay {
                 /* 长歌词别把窗口撑出屏幕：给一个上限，超了走自实现的跑马灯 */
                 final int screenW = ctx.getResources().getDisplayMetrics().widthPixels;
                 view.setMaxTextWidth(Math.max(dp(120), screenW - dp(24)));
+
+                /* 先把「歌词 + 面板」的层级搭好，再建 lp（见类注释里的结构图） */
+                buildRoot();
 
                 lp = new WindowManager.LayoutParams();
                 lp.type = Build.VERSION.SDK_INT >= 26
@@ -549,12 +679,14 @@ public class LyricOverlay {
                 } else {
                     view.setVisibility(View.GONE);
                 }
-                placeDefault();
                 bindTouch();
+                placeDefault();
 
-                wm.addView(view, lp);
+                wm.addView(root, lp);
                 added = true;
                 LogBridge.add(ctx, "LYRIC", "overlay shown locked=" + locked);
+                /* 浮层是新窗口：播放/暂停图标按当前播放状态重新对一次 */
+                syncPlayGlyph();
             } catch (Throwable e) {
                 CrashLog.recordAsync(ctx, "lyric-show", e);
                 LogBridge.add(ctx, "LYRIC", "show failed: " + e);
@@ -566,11 +698,51 @@ public class LyricOverlay {
     public void hide() {
         main.post(() -> {
             try {
-                if (added && view != null && wm != null) wm.removeView(view);
+                if (added && root != null && wm != null) wm.removeView(root);
             } catch (Throwable ignored) {
             }
+            cancelPanelTimeout();
             added = false;
+            panelOpen = false;
+            showingStylePage = false;
+            /*
+             * ⚠️ padding **不要**归零：它是常量，由下一次 show() → buildRoot()
+             * 重新算一遍（和这次的值必然相同）。1.3.8 第一版在这里写死
+             * padL=0，配合「关闭时先清 padding 后挪窗口」的顺序，
+             * 制造出了用户看到的「从左上角弹出来」。
+             *
+             * 拖动锚点只对「面板打开期间的拖动」有意义，浮层都没了就该清掉。
+             */
+            anchorX = 0;
+            anchorY = 0;
+            /*
+             * 面板相关的引用必须一起清：它们都挂在旧的 root 上，
+             * 留着会让下一次 show() 里的判空误以为「已经建过」而跳过重建。
+             */
             view = null;
+            root = null;
+            body = null;
+            bar = null;
+            stylePage = null;
+            closeBtn = null;
+            playBtn = null;
+            gearBtn = null;
+            lockBtn = null;
+            /*
+             * ⚠️ 这几个**列表**必须一起清 —— 它们是按钮的唯一登记表，
+             * 而 applyBarMode / fitStylePage 会遍历列表往行里 addView。
+             * 不清的话下次 show() → buildBar() 会在旧列表后面**再追加** 5 个，
+             * 于是同一排按钮被加两遍（前 5 个的父容器是 null，会直接挂上去），
+             * 表现为「面板里按钮变多了 / 点错位置」。
+             */
+            barRowA = null;
+            barRowB = null;
+            barButtons.clear();
+            dotsRowA = null;
+            dotsRowB = null;
+            dotButtons.clear();
+            styleMainRow = null;
+            hueBar = null;
             lp = null;
             /*
              * E-12：必须把 text 一起清掉。
@@ -593,6 +765,976 @@ public class LyricOverlay {
             stopTick();
         });
     }
+
+    /* ================= 原生控制面板（1.3.8） ================= */
+
+    /*
+     * ===== 面板的几何参数（dp）—— 常量，永久不变 =====
+     *
+     *   · 左/右 12dp —— 卡片比歌词「宽一圈」但不显胖；
+     *   · 上 28dp    —— 给右上角那个 ✕ 留位（✕ 是 24dp，加上下留白正好 28）；
+     *   · 下 10dp    —— 按钮行与卡片底边之间的呼吸。
+     *
+     * ⚠️⚠️ 这四个 padding 是**常量**：面板开、面板关、锁定、拖动，全部一样。
+     *      面板关着时只是「背景置 null + 所有控件 GONE」，窗口比歌词大一圈
+     *      但整块全透明，视觉上和「窗口正好包住歌词」没有区别。
+     *
+     * ===== 为什么必须常量：真机上被 shift 方案坑惨了 =====
+     *
+     * 1.3.8 第一版走的是「打开面板时把 padding 变大、同时把窗口原点反向平移
+     * 同样的量」那套（shift 方案），真机日志（vivo V2425A，411×914dp @3.06）：
+     *
+     *   16:52:05 panel open lyric=411,528 window=411,528 pad=36,85
+     *   16:52:06 panel too wide, padL += 149px (overflow 149)
+     *   16:52:06 panel too wide, padL += 149px (overflow 149)   ← 同一个溢出加了两次
+     *   16:52:07 position x=-189 (saved 73,588, pad=334,85)     ← padL 36+149+149=334
+     *   16:52:09 panel reanchor window=-652,503                 ← 窗口被推到屏幕外 652px
+     *   16:52:23 position x=19 y=433 (saved 411,518, pad=410,85) ← padL 只增不减
+     *
+     * 病灶有两个，而且都是结构性的、没法靠打补丁解决：
+     *   ① 「卡片太宽 → 补左 padding」这一步是**累加**的，而 reanchorPanel 会被
+     *      OnLayoutChangeListener、openPanel、setStylePage 反复调用 ——
+     *      同一次溢出被加两遍，改一次字号 padL 就涨一截，永远不回落，
+     *      最后把窗口推出屏幕（-652px）；
+     *   ② 关闭时「先清 padding、后挪窗口」，中间有一帧是「padding 已归零、
+     *      窗口还在旧位置」，内容画到左上角 → 用户看到「从左上角弹出来」。
+     *
+     * 结论（别再改回去）：**只要 padding 会变，就一定有「几何在动」的那一帧，
+     * 也就一定有可见的跳变**。所以改成 padding 恒定、窗口几何永不变化，
+     * 打开/关闭只切内容的可见性 —— 窗口只是向下长高（按钮行变 VISIBLE），
+     * 左上角一像素都不动，歌词自然纹丝不动、也不可能有弹出效果。
+     */
+    private static final int PAD_LR_DP = 12;
+    private static final int PAD_TOP_DP = 28;
+    private static final int PAD_BOTTOM_DP = 10;
+    /** 卡片背景：18dp 圆角 + 约 85% 不透明的深灰，压暗但不遮死底下的内容 */
+    private static final int CARD_BG_COLOR = 0xD91A1A1E;
+    private static final int CARD_RADIUS_DP = 18;
+    /** 面板无操作后自动收起的时长（毫秒） */
+    private static final long PANEL_TIMEOUT_MS = 8000L;
+    /** 图标按钮的边长（dp） */
+    private static final int GLYPH_DP = 32;
+    /** 色相条宽度（dp）。不能用 weight —— 见 buildStylePage 里的说明 */
+    private static final int HUE_BAR_W_DP = 96;
+
+    /**
+     * 预设色点 —— 必须与网页 app.js 里的 SB_COLORS 完全一致，
+     * 否则「原生面板选的颜色」在 App 设置页里显示不出来（找不到匹配的选中态）。
+     */
+    private static final String[] SB_COLORS = {
+            "#FFFFFF", "#FFD166", "#8FD8FF", "#B3A2FF",
+            "#FF9EC4", "#7DE3D0", "#000000", "#F1EEEA"
+    };
+
+    /**
+     * 面板 padding 的像素值 —— **永远**是 12/28/12/10 dp，建 root 时算一次，之后不再改。
+     * 见上面那段「为什么必须常量」。任何地方出现 padL = 0 或 padL += 的写法都是 bug。
+     */
+    private int padL = 0, padT = 0, padR = 0, padB = 0;
+
+    /** 样式改动回写网页的合并器（见 pushStyleDebounced） */
+    private boolean styleDirty = false;
+
+    /** 8 秒自动收起 */
+    private final Runnable panelTimeout = new Runnable() {
+        @Override
+        public void run() {
+            if (!panelOpen) return;
+            LogBridge.add(ctx, "LYRIC", "panel auto close (timeout)");
+            closePanel();
+        }
+    };
+
+    /**
+     * 样式回写的延迟任务。
+     *
+     * 为什么要延迟合并而不是每次改动都直接跨桥：
+     *   色相条拖动一次会产生几十上百个 onChange（每个像素一次），
+     *   每次都 evaluateJavascript 会把 JS 桥线程打满，
+     *   拖动本身反而变得卡顿。合并成「最后一次改动后 120ms 推一次」，
+     *   既保证网页最终一定拿到最新值（末值必达），又把跨桥次数压到个位数。
+     */
+    private final Runnable stylePusher = new Runnable() {
+        @Override
+        public void run() {
+            if (!styleDirty) return;
+            styleDirty = false;
+            try {
+                Callback c = cb;
+                if (c != null) {
+                    c.onStyle(String.format("#%06X", color & 0xFFFFFF),
+                            String.valueOf(Math.round(sizeSp)));
+                }
+            } catch (Throwable e) {
+                CrashLog.recordAsync(ctx, "lyric-style-cb", e);
+            }
+        }
+    };
+
+    /*
+     * ===== 歌词坐标 ⇄ 窗口原点（唯一一对换算，别在别处再写第三份） =====
+     *
+     * 因为有 padding 恒定 + body 左对齐（gravity=START），歌词相对窗口原点的
+     * 偏移**永远**等于 (padL, padT)，与面板开没开、卡片多宽、换了几句都无关：
+     *
+     *     歌词左上角（屏幕） = 窗口原点 + (padL, padT)
+     *
+     * 所以这是一个纯减法，不需要任何布局后实测（1.3.8 第一版那套
+     * lyricInRoot / reanchorPanel 正是因为没有这个前提才必须实测）。
+     */
+    private int lyricXFromWindow(int windowX) {
+        return windowX + padL;
+    }
+
+    private int lyricYFromWindow(int windowY) {
+        return windowY + padT;
+    }
+
+    /** 歌词位置 → 窗口原点（所有摆放代码都必须走它） */
+    private int toWindowX(int lyricX) {
+        return lyricX - padL;
+    }
+
+    private int toWindowY(int lyricY) {
+        return lyricY - padT;
+    }
+
+    /**
+     * 搭出「根 FrameLayout → 竖向 LinearLayout（歌词 + 按钮行/样式页）→ 右上角 ✕」。
+     *
+     * 为什么 ✕ 挂在 root 上而不是 body 里：
+     *   它要浮在 padding 留出来的那块空白里，不占歌词和按钮行的高度。
+     *   挂在 body 里会让它成为布局的一部分，面板高度会多出一行。
+     */
+    private void buildRoot() {
+        /*
+         * padding 在这里算一次，之后永不改变（见 PAD_LR_DP 上方那段注释）。
+         */
+        padL = dp(PAD_LR_DP);
+        padT = dp(PAD_TOP_DP);
+        padR = dp(PAD_LR_DP);
+        padB = dp(PAD_BOTTOM_DP);
+
+        root = new FrameLayout(ctx);
+        /* padding 恒定量，开局就设上：窗口从第一次 addView 起就比歌词大一圈 */
+        root.setPadding(padL, padT, padR, padB);
+
+        body = new LinearLayout(ctx);
+        body.setOrientation(LinearLayout.VERTICAL);
+        /*
+         * ⚠️ 必须是 START，不能是 CENTER_HORIZONTAL。
+         *
+         * 面板打开时 body 的宽度 = max(歌词宽, 按钮行宽)。按钮行（5 个 32dp
+         * 图标 ≈ 180dp）经常比一句短歌词宽，若歌词在 body 里**居中**，
+         * 它就会随按钮行宽度右移 —— 而按钮行宽度会随「第一页/样式页」切换、
+         * 字号变化而变，于是歌词位置跟着飘。
+         *
+         * 左对齐后：歌词永远贴 body 左边，而 body 左边 = root 左边 + padL，
+         * 恒定不变 → 歌词屏幕坐标恒定。这正是「打开面板歌词不能动」的落地方式。
+         */
+        body.setGravity(Gravity.START);
+        root.addView(body, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        /*
+         * 歌词。宽度仍然由它自己 WRAP_CONTENT 决定 ——
+         * 位置计算（clampX / centerHorizontally / setText 重排）全都建立在
+         * 「view.getWidth() 是歌词宽度」这个前提上，不能改成 MATCH_PARENT，
+         * 否则那些换算会整片错位。
+         */
+        body.addView(view, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        body.addView(buildBar(), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        body.addView(buildStylePage(), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        closeBtn = new GlyphButton(ctx);
+        closeBtn.setGlyph(GlyphButton.CLOSE);
+        closeBtn.setContentDescription(L10n.t("关闭状态栏歌词", "Turn off status bar lyrics"));
+        closeBtn.setOnClickListener(v -> {
+            bumpPanelTimeout();
+            doClose();
+        });
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(dp(24), dp(24));
+        clp.gravity = Gravity.TOP | Gravity.END;
+        root.addView(closeBtn, clp);
+
+        /*
+         * ===== 卡片背景（含 padding 空白区）也能拖动 =====
+         *
+         * 用户原话：「拖动状态栏歌词黑色背景时也要能移动」—— 之前只有歌词
+         * 本身（view）能拖，点在黑色卡片上什么都不发生。
+         *
+         * 为什么挂 OnTouchListener 而不是 OnClickListener：
+         *   ViewGroup.dispatchTouchEvent 会先把事件给子 View，只有**没有子 View
+         *   消费**时才轮到自己的 OnTouchListener。所以歌词上的拖动、
+         *   按钮/✕/色点/色相条的点击都不会被这里抢走 —— 正好只兜住
+         *   「点在卡片空白或 padding 上」这一种情况。
+         *
+         * 面板关着时不拦（返回 false）：那时窗口虽然比歌词大一圈，但全透明，
+         * 用户看不到也点不到 —— 拦住反而会挡住歌词下方 App 的正常操作。
+         */
+        root.setOnTouchListener((v, ev) -> {
+            if (!panelOpen || locked || lp == null) return false;
+            return onPanelBackgroundTouch(ev);
+        });
+
+        /* 起始态：面板是关的 —— 常量 padding 不动，只把背景和控件藏起来 */
+        applyPanelChrome(false);
+    }
+
+    /**
+     * 卡片背景上的触摸：与 view 上完全相同的拖动语义。
+     *
+     * 唯一区别是「按下时的基准」—— 这里用 anchorX/anchorY（打开面板时记下的
+     * 歌词屏幕坐标），因为卡片背景本身没有「歌词宽高」可以参考。
+     *
+     * ⚠️ 全程不许改 lp.x 之外的任何几何：padding 是常量，窗口原点只由
+     *    「歌词位置 - padding」决定。1.3.8 第一版在这里做过 padL 累加，
+     *   把窗口推到屏幕外 652px（见 PAD_LR_DP 上方的真机日志）。
+     */
+    private boolean onPanelBackgroundTouch(MotionEvent ev) {
+        switch (ev.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                bgDownX = ev.getRawX();
+                bgDownY = ev.getRawY();
+                bgOriginX = lyricXFromWindow(lp.x);
+                bgOriginY = lyricYFromWindow(lp.y);
+                anchorX = bgOriginX;
+                anchorY = bgOriginY;
+                bgMoved = false;
+                bumpPanelTimeout();
+                return true;
+            case MotionEvent.ACTION_MOVE: {
+                float dx = ev.getRawX() - bgDownX;
+                float dy = ev.getRawY() - bgDownY;
+                if (Math.abs(dx) > dp(3) || Math.abs(dy) > dp(3)) bgMoved = true;
+                /* clampX/clampY 的入参是**歌词坐标**（它们的语义一直是歌词能放哪） */
+                anchorX = clampX(bgOriginX + (int) dx);
+                anchorY = clampY(bgOriginY + (int) dy);
+                lp.x = toWindowX(anchorX);
+                lp.y = toWindowY(anchorY);
+                updateWindow();
+                if (bgMoved) bumpPanelTimeout();
+                return true;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL: {
+                if (bgMoved) {
+                    /* 存的是歌词位置，不是窗口原点 */
+                    posX = anchorX;
+                    posY = anchorY;
+                    Callback c = cb;
+                    if (c != null) c.onMoved(anchorX, anchorY);
+                }
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    /* 卡片背景拖动的一次性状态（不进字段池，只给 onPanelBackgroundTouch 用） */
+    private float bgDownX, bgDownY;
+    private int bgOriginX, bgOriginY;
+    private boolean bgMoved = false;
+
+    /*
+     * ===== 按钮行：宽度自适应，绝不靠挪窗口来塞进屏幕 =====
+     *
+     * 用户报的「点击调整颜色时 状态栏歌词下方黑被拉长」，根因就是第一版
+     * 想用「把窗口往左挪 / 补左 padding」来给变宽的按钮行腾地方 ——
+     * 而窗口一动就带动歌词，于是只能靠 padding 累加去补偿，
+     * 最后 padL 涨到 410px、窗口被推到屏幕外 652px（真机日志见 PAD_LR_DP 注释）。
+     *
+     * 正确做法：**窗口不动，让按钮行自己变窄**。四档，从好看往紧凑退：
+     *   A 单行 + 左右各 2dp margin      （5×32 + 10×2 = 180dp）← 默认
+     *   B 单行 + margin 压到 0          （5×32 = 160dp）
+     *   C 两行（3+2）+ margin 0         （3×32 = 96dp 一行）
+     *   D 两行 + 按钮缩到 26dp + margin 0（3×26 = 78dp 一行）← 极窄屏兜底
+     * 任何一档都不改 lp.x / padding。
+     */
+    private LinearLayout barRowA;      // 第一行（单行模式时就是全部按钮）
+    private LinearLayout barRowB;      // 第二行（只有两行模式才有内容）
+    private final java.util.List<GlyphButton> barButtons = new java.util.ArrayList<>();
+
+    /** 第一页：锁定 / 上一首 / 播放暂停 / 下一首 / 齿轮 */
+    private LinearLayout buildBar() {
+        bar = new LinearLayout(ctx);
+        bar.setOrientation(LinearLayout.VERTICAL);
+        bar.setGravity(Gravity.CENTER_HORIZONTAL);
+        bar.setVisibility(View.GONE);
+
+        barRowA = new LinearLayout(ctx);
+        barRowA.setOrientation(LinearLayout.HORIZONTAL);
+        barRowA.setGravity(Gravity.CENTER);
+        barRowB = new LinearLayout(ctx);
+        barRowB.setOrientation(LinearLayout.HORIZONTAL);
+        barRowB.setGravity(Gravity.CENTER);
+        barRowB.setVisibility(View.GONE);
+
+        lockBtn = makeBarBtn(GlyphButton.LOCK, L10n.t("锁定", "Lock"), v -> doLock());
+        makeBarBtn(GlyphButton.PREV, L10n.t("上一首", "Previous"), v -> sendCommand("prev"));
+        playBtn = makeBarBtn(GlyphButton.PLAY,
+                L10n.t("播放暂停", "Play or pause"), v -> sendCommand("toggle"));
+        makeBarBtn(GlyphButton.NEXT, L10n.t("下一首", "Next"), v -> sendCommand("next"));
+        gearBtn = makeBarBtn(GlyphButton.GEAR, L10n.t("样式", "Style"), v -> {
+            setStylePage(!showingStylePage);
+        });
+
+        bar.addView(barRowA, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        bar.addView(barRowB, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        /* 默认单行（真正的档位在 openPanel 里按可用宽度重算） */
+        applyBarMode(1, dp(GLYPH_DP), dp(2));
+        syncPlayGlyph();
+        return bar;
+    }
+
+    /**
+     * 造一个按钮并记进 barButtons。
+     *
+     * 为什么不在这里 setMargins/setLayoutParams：位置和大小由
+     * {@link #applyBarMode} 统一决定 —— 档位切换时要重新摆一遍，
+     * 建的时候写死会让两处打架。
+     */
+    private GlyphButton makeBarBtn(int glyph, String desc, View.OnClickListener l) {
+        final GlyphButton b = new GlyphButton(ctx);
+        b.setGlyph(glyph);
+        b.setContentDescription(desc);
+        b.setOnClickListener(v -> {
+            /*
+             * 任何一次点击都算「有操作」，重新计时。
+             * 放在这里而不是各自 onClick 里，是为了漏不掉 ——
+             * 以后新加按钮也会自动带上自动收起的续期。
+             */
+            bumpPanelTimeout();
+            if (l != null) l.onClick(v);
+        });
+        barButtons.add(b);
+        return b;
+    }
+
+    /**
+     * 按档位重新摆按钮：{@code rows} 行、{@code glyphPx} 边长、{@code marginPx} 左右留白。
+     *
+     * 会先把按钮从旧的行里摘下来再挂到新的行里 —— 这是「1 行 ↔ 2 行」切换
+     * 唯一的正确做法（一个 View 只能有一个父容器）。
+     */
+    private void applyBarMode(int rows, int glyphPx, int marginPx) {
+        if (barRowA == null || barRowB == null) return;
+        /* 先全部摘下来，避免「先 add 后 remove」导致同一个 View 有两个父容器 */
+        for (GlyphButton b : barButtons) {
+            ViewGroup p = (ViewGroup) b.getParent();
+            if (p != null) p.removeView(b);
+        }
+
+        final int split = rows >= 2 ? 3 : barButtons.size();   // 两行时 3+2
+        for (int i = 0; i < barButtons.size(); i++) {
+            GlyphButton b = barButtons.get(i);
+            LinearLayout.LayoutParams p =
+                    new LinearLayout.LayoutParams(glyphPx, glyphPx);
+            p.setMargins(marginPx, 0, marginPx, 0);
+            b.setLayoutParams(p);
+            if (i < split) barRowA.addView(b);
+            else barRowB.addView(b);
+        }
+        barRowB.setVisibility(rows >= 2 && barRowB.getChildCount() > 0
+                ? View.VISIBLE : View.GONE);
+        /* 两行时行间留一点缝，否则两排图标贴在一起 */
+        if (barRowB.getChildCount() > 0) barRowB.setPadding(0, dp(2), 0, 0);
+    }
+
+    /**
+     * 按「当前歌词有多宽、还能往右长多少」挑一档最宽的、能放下的按钮布局。
+     *
+     * 约束（不许挪窗口，所以只能压按钮行）：
+     *   卡片右边缘 = (歌词x - padL) + [max(歌词w, 按钮行w) + padL + padR]
+     *   要求 <= 屏宽
+     *   ⇒ 按钮行宽 <= 屏宽 - padR - 歌词x
+     *
+     * 之所以不从「屏宽 - 2*padLR - 歌词宽」算（那是假设歌词水平居中的乐观值）：
+     * 用户可以把歌词拖到屏幕右边，那时能往右长的空间比居中时小得多 ——
+     * 用居中值会算出「能放下」，然后卡片右半截被裁掉。
+     *
+     * ⚠️ 已知的、有意接受的极限情况：
+     *   用户把歌词一直拖到贴着屏幕右边缘时（clampX 允许 lyrics 右边缘 == 屏宽），
+     *   卡片背景必然有 padR（12dp≈37px）伸出屏幕右边、被裁掉一条。
+     *   这一条**故意不修**：
+     *     · 裁掉的只是卡片右上角一小块圆角背景，不是按钮（按钮在 body 里、
+     *       受 availBody 约束，一定在屏幕内，见 relayoutBar）；
+     *     · 想修只能改 clampX 把歌词往左夹 —— 那会改变「面板没开时」的拖动
+     *       行为（用户会发现歌词拖不到最右边），是因小失大。
+     *
+     * @param lyricX 歌词左边缘的屏幕坐标（px）
+     */
+    private void relayoutBar(int lyricX) {
+        try {
+            if (barButtons.isEmpty()) return;
+            final int sw = screenWidthPx();
+            if (sw <= 0) return;
+            /* 按钮行/样式页最多能有这么宽（卡片右边缘不许过屏幕右边） */
+            int availBar = sw - padR - lyricX;
+            if (availBar <= 0) availBar = 1;
+            /* 样式页也按同一个可用宽度收窄（它在同一个 body 里） */
+            fitStylePage(availBar);
+
+            final int g32 = dp(GLYPH_DP);
+            final int g26 = dp(26);
+            final int m2 = dp(2);
+            final int n = barButtons.size();          // 5
+            final int rowCount2 = 3;                  // 两行时第一行 3 个
+
+            /* A: 单行 + 2dp margin */
+            if (n * g32 + n * 2 * m2 <= availBar) {
+                applyBarMode(1, g32, m2);
+                LogBridge.add(ctx, "LYRIC", "bar mode A (1 row, 32dp, 2dp margins) avail=" + availBar);
+                return;
+            }
+            /* B: 单行 + margin 0 */
+            if (n * g32 <= availBar) {
+                applyBarMode(1, g32, 0);
+                LogBridge.add(ctx, "LYRIC", "bar mode B (1 row, 32dp, no margin) avail=" + availBar);
+                return;
+            }
+            /* C: 两行 3+2 + 32dp + margin 0 */
+            if (rowCount2 * g32 <= availBar) {
+                applyBarMode(2, g32, 0);
+                LogBridge.add(ctx, "LYRIC", "bar mode C (2 rows, 32dp) avail=" + availBar);
+                return;
+            }
+            /* D: 两行 + 26dp 兜底（极窄屏） */
+            applyBarMode(2, g26, 0);
+            LogBridge.add(ctx, "LYRIC", "bar mode D (2 rows, 26dp, cramped) avail=" + availBar);
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-bar-layout", e);
+        }
+    }
+
+    /*
+     * 样式页也是「宽度自适应」的，理由和按钮行完全相同：
+     * 不许改 lp.x，所以只能让内容自己收窄。
+     *   色点：8 个一行（22+4 各 = 208dp）→ 放不下就 4+4 两行（104dp）
+     *   色相条：宽 96dp → 放不下就按剩余空间收缩（最低 48dp）
+     */
+    private LinearLayout dotsRowA, dotsRowB;
+    private final java.util.List<GlyphButton> dotButtons = new java.util.ArrayList<>();
+    private LinearLayout styleMainRow;
+
+    /** 第二页：预设色点 + 色相条 + 字号增减 */
+    private LinearLayout buildStylePage() {
+        stylePage = new LinearLayout(ctx);
+        stylePage.setOrientation(LinearLayout.VERTICAL);
+        stylePage.setGravity(Gravity.START);
+        stylePage.setVisibility(View.GONE);
+
+        /* ---- 预设色点（与网页 SB_COLORS 一一对应） ---- */
+        dotsRowA = new LinearLayout(ctx);
+        dotsRowA.setOrientation(LinearLayout.HORIZONTAL);
+        dotsRowA.setGravity(Gravity.CENTER_VERTICAL);
+        dotsRowB = new LinearLayout(ctx);
+        dotsRowB.setOrientation(LinearLayout.HORIZONTAL);
+        dotsRowB.setGravity(Gravity.CENTER_VERTICAL);
+        dotsRowB.setVisibility(View.GONE);
+
+        for (final String hex : SB_COLORS) {
+            final int c = parseColor(hex, Color.WHITE);
+            GlyphButton d = new GlyphButton(ctx);
+            d.setSwatch(c);
+            d.setContentDescription(L10n.t("颜色 " + hex, "Color " + hex));
+            d.setOnClickListener(v -> {
+                bumpPanelTimeout();
+                applyPanelColor(c);
+                syncSwatches();
+            });
+            dotButtons.add(d);
+        }
+        stylePage.addView(dotsRowA);
+        stylePage.addView(dotsRowB);
+
+        /* ---- 色相条 + 字号增减（同一行） ---- */
+        styleMainRow = new LinearLayout(ctx);
+        styleMainRow.setOrientation(LinearLayout.HORIZONTAL);
+        styleMainRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        /*
+         * 「完成」按钮：切回第一页。
+         * ⚠️ 这一项是需求里没写、但实现上**必须**有的：样式页把按钮行整排
+         *    换掉了，不给出口的话用户只能等 8 秒自动收起才能回到媒体按钮。
+         *    图标用 CHECK（需求里预留的第 8 个字形，语义正好是「确认完成」）。
+         */
+        GlyphButton done = new GlyphButton(ctx);
+        done.setGlyph(GlyphButton.CHECK);
+        done.setContentDescription(L10n.t("完成", "Done"));
+        LinearLayout.LayoutParams dlp =
+                new LinearLayout.LayoutParams(dp(26), dp(26));
+        dlp.setMargins(dp(2), dp(2), 0, dp(2));
+        done.setLayoutParams(dlp);
+        done.setOnClickListener(v -> {
+            bumpPanelTimeout();
+            setStylePage(false);
+        });
+        styleMainRow.addView(done);
+
+        hueBar = new HueBar(ctx);
+        hueBar.setContentDescription(L10n.t("自定义颜色", "Custom color"));
+        hueBar.setOnColorChange(c -> {
+            applyPanelColor(c);
+            syncSwatches();
+            bumpPanelTimeout();
+        });
+        /*
+         * ⚠️ 宽度不能用 weight（LayoutParams(0, h, 1f)）。
+         * 整个面板是 WRAP_CONTENT 一路下来的，带 weight 的子 View 在
+         * 「父容器宽度由内容决定」的场景里会被量成 0 宽 —— 色相条直接消失，
+         * 而样式页高度还是对的，现象是「这一行只剩下完成键和 T±」。
+         * 改成固定宽度，放不下时由 fitStylePage 按可用空间调小。
+         */
+        styleMainRow.addView(hueBar);
+
+        /*
+         * T- / T+：需求里明确说「用简单 TextView 也行」，就保持最朴素的样子。
+         * 字号范围 9..22 与网页设置页的滑杆完全一致 ——
+         * 这里放宽会导致网页滑杆把值钳回去，用户看到「改了又跳回来」。
+         */
+        addSizeBtn(styleMainRow, "T-", L10n.t("字号减小", "Smaller text"), -1);
+        addSizeBtn(styleMainRow, "T+", L10n.t("字号增大", "Larger text"), +1);
+
+        stylePage.addView(styleMainRow);
+
+        /* 默认形态（真正的宽窄在 openPanel / clampIntoPanel 里按实测重算） */
+        fitStylePage(dp(300));
+        return stylePage;
+    }
+
+    private HueBar hueBar;
+
+    /**
+     * 按可用宽度摆样式页：色点 1 行 ↔ 2 行、色相条宽度收缩。
+     *
+     * @param availBody 面板内容区最多能有多宽（px）。
+     *                  = 屏宽 - padR - 歌词左边缘
+     */
+    private void fitStylePage(int availBody) {
+        if (dotsRowA == null || dotsRowB == null || dotButtons.isEmpty()) return;
+        try {
+            final int dotPx = dp(22);
+            final int dotM = dp(2);
+            final int perDot = dotPx + dotM * 2;
+
+            /* 先全部摘下来，再按行数重新分配 */
+            for (GlyphButton d : dotButtons) {
+                ViewGroup p = (ViewGroup) d.getParent();
+                if (p != null) p.removeView(d);
+            }
+
+            final boolean oneRow = dotButtons.size() * perDot <= availBody;
+            final int split = oneRow ? dotButtons.size() : (dotButtons.size() + 1) / 2;
+            for (int i = 0; i < dotButtons.size(); i++) {
+                GlyphButton d = dotButtons.get(i);
+                LinearLayout.LayoutParams p =
+                        new LinearLayout.LayoutParams(dotPx, dotPx);
+                p.setMargins(dotM, dp(1), dotM, dp(1));
+                d.setLayoutParams(p);
+                if (i < split) dotsRowA.addView(d);
+                else dotsRowB.addView(d);
+            }
+            dotsRowB.setVisibility(dotsRowB.getChildCount() > 0
+                    ? View.VISIBLE : View.GONE);
+
+            /*
+             * 色相条宽度：剩下的空间给多少用多少，但夹在 [48dp, 96dp]。
+             * 下限 48dp 是「还能拖动选色」的实用最小值；再窄就点不准了。
+             */
+            if (hueBar != null) {
+                int fixed = dp(26 + 2)                  // 完成键 + margin
+                        + dp(72)                        // T- / T+ 两个字的估算宽度
+                        + dp(10);                       // 色相条左右 margin
+                int hueW = Math.min(dp(HUE_BAR_W_DP), Math.max(dp(48), availBody - fixed));
+                LinearLayout.LayoutParams hlp =
+                        new LinearLayout.LayoutParams(hueW, dp(22));
+                hlp.setMargins(dp(4), dp(2), dp(4), dp(2));
+                hueBar.setLayoutParams(hlp);
+            }
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-style-fit", e);
+        }
+    }
+
+    private TextView addSizeBtn(LinearLayout parent, String label, String desc,
+                                final int delta) {
+        TextView tv = new TextView(ctx);
+        tv.setText(label);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        tv.setTextColor(0xFFF2F2F2);
+        tv.setGravity(Gravity.CENTER);
+        tv.setContentDescription(desc);
+        tv.setClickable(true);
+        tv.setFocusable(true);
+        /* 触摸区域别只有字形那么大，13sp 的文字本身很窄 */
+        tv.setPadding(dp(8), dp(4), dp(8), dp(4));
+        tv.setOnClickListener(v -> {
+            bumpPanelTimeout();
+            applyPanelSize(sizeSp + delta);
+        });
+        parent.addView(tv);
+        return tv;
+    }
+
+    /** 把当前的 color / sizeSp 同步到色点与色相条的选中态 */
+    private void syncSwatches() {
+        try {
+            if (stylePage == null) return;
+            /*
+             * ⚠️ 遍历 dotButtons 列表，不要遍历 stylePage 的某个子行。
+             * 色点在「一行 8 个」和「两行 4+4」之间会搬家（fitStylePage），
+             * 按行遍历时第二行的 4 个色点永远轮不到选中态 ——
+             * 现象是「选了浅紫/樱粉/薄荷/黑，色点上没有勾」。
+             */
+            int cur = color & 0xFFFFFF;
+            for (int i = 0; i < dotButtons.size() && i < SB_COLORS.length; i++) {
+                int hex = parseColor(SB_COLORS[i], Color.WHITE) & 0xFFFFFF;
+                dotButtons.get(i).setActive(hex == cur);
+            }
+            if (hueBar != null) hueBar.setColor(color);
+            if (lockBtn != null) lockBtn.setActive(locked);
+            if (gearBtn != null) gearBtn.setActive(showingStylePage);
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-swatch", e);
+        }
+    }
+
+    /** 面板里改颜色：立即生效 + 合并回写网页 */
+    private void applyPanelColor(int c) {
+        /*
+         * ⚠️ 必须显式补不透明 alpha（0xFF000000）。
+         * 面板给的是 RGB（色点是 #FFFFFF 这种、色相条是 HSVToColor 的纯色），
+         * 而 FillTextView 直接把这个 int 当 Paint 颜色用 —— 若只保留低 24 位，
+         * 得到的就是 alpha=0 的完全透明色，歌词会当场消失。
+         * 透明度由单独的 view.setAlpha(alpha) 负责，不在这里参与。
+         */
+        color = 0xFF000000 | (c & 0xFFFFFF);
+        applyStyle();
+        pushStyleDebounced();
+        LogBridge.add(ctx, "LYRIC", "panel color=" + String.format("#%06X", color & 0xFFFFFF));
+    }
+
+    /** 面板里改字号：立即生效 + 合并回写网页 */
+    private void applyPanelSize(float sp) {
+        sizeSp = Math.max(9f, Math.min(22f, sp));
+        applyStyle();
+        pushStyleDebounced();
+        /* 字号一变歌词宽度就变，居中/边界都要重算 */
+        if (posX < 0) {
+            centerHorizontally();
+        } else {
+            clampIntoPanel();
+        }
+        LogBridge.add(ctx, "LYRIC", "panel size=" + sizeSp);
+    }
+
+    private void pushStyleDebounced() {
+        styleDirty = true;
+        main.removeCallbacks(stylePusher);
+        main.postDelayed(stylePusher, 120);
+    }
+
+    /** 收起面板前把待回写的样式立刻推出去（否则最后 120ms 内的改动会丢） */
+    private void flushStyle() {
+        main.removeCallbacks(stylePusher);
+        if (styleDirty) stylePusher.run();
+    }
+
+    /** 播放/暂停图标跟随真实播放状态（timingPlaying 由 setTiming 更新） */
+    private void syncPlayGlyph() {
+        try {
+            if (playBtn == null) return;
+            playBtn.setGlyph(timingPlaying ? GlyphButton.PAUSE : GlyphButton.PLAY);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 媒体按钮 → 网页 */
+    private void sendCommand(String cmd) {
+        try {
+            Callback c = cb;
+            if (c != null) c.onCommand(cmd);
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-cmd", e);
+        }
+    }
+
+    /**
+     * 面板里点「锁定」。
+     *
+     * 顺序是有讲究的，不能换：
+     *   ① 先收起面板 —— 锁定会立刻把窗口 flags 换成 FLAG_NOT_TOUCHABLE，
+     *      那时面板已经收不到任何触摸，留着就是一块挡在状态栏上的死卡片；
+     *   ② 再落实 locked —— flagsFor / updateLayoutFlags 都按 locked 算；
+     *   ③ 最后回调网页存盘。
+     */
+    private void doLock() {
+        closePanel();
+        locked = true;
+        updateLayoutFlags();
+        try {
+            Callback c = cb;
+            if (c != null) c.onLockChanged(true);
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-lock-cb", e);
+        }
+        LogBridge.add(ctx, "LYRIC", "panel lock");
+    }
+
+    /** 面板里点 ✕：先真的关掉浮层，再让网页把开关也关掉 */
+    private void doClose() {
+        try {
+            Callback c = cb;
+            hide();
+            if (c != null) c.onClose();
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-close-cb", e);
+        }
+        LogBridge.add(ctx, "LYRIC", "panel close");
+    }
+
+    /** 在第一页 / 样式页之间切换 */
+    private void setStylePage(boolean style) {
+        showingStylePage = style;
+        try {
+            if (bar != null) bar.setVisibility(style ? View.GONE : View.VISIBLE);
+            if (stylePage != null) stylePage.setVisibility(style ? View.VISIBLE : View.GONE);
+            syncSwatches();
+            /*
+             * 两页的宽度需求不同（按钮行 5×32，样式页是色点行 + 色相条行），
+             * 切过去时按当前可用空间重新摆一次。
+             */
+            if (lp != null) {
+                int availBody = screenWidthPx() - padR - lyricXFromWindow(lp.x);
+                if (availBody > 0) fitStylePage(availBody);
+            }
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-page", e);
+        }
+        /*
+         * 样式页比按钮行宽/高都可能不同 → 重新挑一档按钮行布局。
+         * ⚠️ 只调按钮行，窗口不动（第一版这里 post 的是 reanchorPanel，
+         *    而那个函数会改 padding，正是 padL 累加的另一个入口）。
+         */
+        if (root != null) root.post(this::clampIntoPanel);
+    }
+
+    /** 点歌词：没开就打开，开着就收起（需求里的第 3 条） */
+    private void togglePanel() {
+        if (panelOpen) closePanel();
+        else openPanel();
+    }
+
+    /**
+     * 打开面板。
+     *
+     * ⚠️ 这里**不动窗口几何**（1.3.8 第一版就是在这一段挪窗口 + 改 padding，
+     *    制造出了真机上那串 padL 累加和「从左上角弹出来」）。
+     *
+     * 具体只做三件事：
+     *   ① 记下拖动锚点（歌词屏幕坐标，供拖动用）；
+     *   ② 按「当前歌词位置还能往右长多少」挑一档按钮行布局（不挪窗口！）；
+     *   ③ 把背景、✕、按钮行切到可见 —— 窗口于是「向下长高」，
+     *      左上角一像素都不动，歌词自然纹丝不动。
+     *
+     * 窗口原点完全不用改：歌词相对窗口原点的偏移恒为 (padL, padT)，
+     * 所以 lp.x/lp.y 在打开面板前后是**同一个值**。
+     */
+    private void openPanel() {
+        if (panelOpen || root == null || lp == null || !added) return;
+        try {
+            /* 歌词屏幕坐标 = 窗口原点 + 常量 padding，纯减法，不需要实测 */
+            anchorX = lyricXFromWindow(lp.x);
+            anchorY = lyricYFromWindow(lp.y);
+
+            panelOpen = true;
+            showingStylePage = false;
+
+            /*
+             * 先按真实歌词位置挑按钮行档位，再让按钮行可见 ——
+             * 否则会有一帧「按钮行按上一档的宽度画出来」再跳一下。
+             */
+            relayoutBar(anchorX);
+
+            applyPanelChrome(true);
+            if (bar != null) bar.setVisibility(View.VISIBLE);
+            if (stylePage != null) stylePage.setVisibility(View.GONE);
+            syncSwatches();
+            syncPlayGlyph();
+
+            /*
+             * 窗口原点保持不变（不写 lp.x/lp.y）。
+             * 只调一次 updateWindow 是为了让新出现的按钮行触发一次
+             * measure/layout —— 这块悬浮窗在某些 ROM 上普通 invalidate
+             * 不兑现成帧（见 forceRedraw 的注释），必须过一遍 WMS。
+             */
+            updateWindow();
+
+            bumpPanelTimeout();
+            LogBridge.add(ctx, "LYRIC", "panel open lyric=" + anchorX + "," + anchorY
+                    + " window=" + lp.x + "," + lp.y
+                    + " pad=" + padL + "," + padT + " (constant)");
+        } catch (Throwable e) {
+            panelOpen = false;
+            CrashLog.recordAsync(ctx, "lyric-panel-open", e);
+        }
+    }
+
+    /**
+     * 收起面板。
+     *
+     * ⚠️ 顺序是这次真机 bug 的关键：**先让内容消失，再（可选地）动窗口**。
+     *
+     * 1.3.8 第一版是「先 applyPanelChrome(false) 把 padding 归零，
+     * 然后才 lp.x = 歌词x」—— 中间那一帧 padding 已经是 0 而窗口还在旧位置，
+     * 内容被画到窗口左上角，用户看到的就是「从左上角弹出来」。
+     * 用户原话：「点击关闭状态栏歌词下方背景时（或者点击锁定按钮）
+     * 歌词会有一个从左上角弹出来的效果 多余了」。
+     *
+     * 现在 padding 是常量，窗口本来就没动过，所以连 lp.x/lp.y 都不用写：
+     * 画面上的变化只有「背景变透明 + 按钮行/✕ 消失」，
+     * 那一帧用户看到的就已经是纯歌词了，不存在任何位移。
+     */
+    private void closePanel() {
+        if (!panelOpen) return;
+        try {
+            flushStyle();               // 最后 120ms 的改动不能丢
+            cancelPanelTimeout();
+
+            /*
+             * 先藏内容，再改状态位。
+             * 顺序反过来的话，applyPanelChrome 读到的 panelOpen 已经是 false，
+             * 万一里面还有依赖 panelOpen 的分支就会错 —— 现在没有，但别踩。
+             */
+            applyPanelChrome(false);
+            if (bar != null) bar.setVisibility(View.GONE);
+            if (stylePage != null) stylePage.setVisibility(View.GONE);
+
+            panelOpen = false;
+            showingStylePage = false;
+
+            /* 窗口原点不变；只推一次让 WMS 重新走一遍排版（内容变矮了） */
+            updateWindow();
+            LogBridge.add(ctx, "LYRIC", "panel close (window untouched) x="
+                    + lp.x + " y=" + lp.y);
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-panel-close", e);
+        }
+    }
+
+    /**
+     * 落实「面板外观」：圆角背景 + ✕ 的可见性与位置。
+     *
+     * ⚠️ 这里**不碰 padding**（常量，建 root 时设一次就定了）。
+     * 1.3.8 第一版在这里 setPadding(open ? padL : 0, ...)，
+     * 于是每次开关面板都要重排一遍布局 —— 那正是跳变的来源。
+     *
+     * ✕ 为什么用 translation 而不是负 margin：
+     *   FrameLayout 会把子 View 摆在 padding **以内**，而 ✕ 要待在上方
+     *   28dp 那条留白里。负 margin 在不同 ROM 的 layout 实现里行为不一致，
+     *   而 translationY/X 只影响绘制与命中测试（组件分发触摸时会换算），
+     *   布局本身不变 —— 稳定且不影响其他子 View。
+     */
+    private void applyPanelChrome(boolean open) {
+        if (root == null) return;
+        try {
+            /* padding 恒定，这里一个字都不改 */
+            if (open) {
+                GradientDrawable bg = new GradientDrawable();
+                bg.setShape(GradientDrawable.RECTANGLE);
+                bg.setCornerRadius(dp(CARD_RADIUS_DP));
+                bg.setColor(CARD_BG_COLOR);
+                root.setBackground(bg);
+            } else {
+                root.setBackground(null);
+            }
+            if (closeBtn != null) {
+                closeBtn.setVisibility(open ? View.VISIBLE : View.GONE);
+                /* ✕ 浮在 padding 留出的上方空白里，靠 translation 挪出去 */
+                closeBtn.setTranslationY(open ? (-padT + dp(4)) : 0f);
+                closeBtn.setTranslationX(open ? (padR - dp(4)) : 0f);
+            }
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-chrome", e);
+        }
+    }
+
+    /*
+     * ===== 这里曾经有一个 reanchorPanel()，已删除 —— 不要加回来 =====
+     *
+     * 它干的事是：布局完成后用 view.getLocationInWindow() 量出「歌词相对窗口的
+     * 实际偏移」，再反推窗口原点，并在卡片比屏幕宽时把溢出量「补进左 padding」。
+     *
+     * 真机（vivo V2425A，411×914dp @3.06）实测的两个死结：
+     *   ① padding 变成可变状态后，「补左 padding」是**累加**的，而它是一个
+     *      被 OnLayoutChangeListener / openPanel / setStylePage 反复调用的函数 ——
+     *      同一次溢出被加两遍，改一次字号 padL 就涨一截且永不回落：
+     *        16:52:06 padL += 149px (overflow 149)   ← 连续两条，同一个溢出
+     *        16:52:07 pad=334,85                      ← 36 + 149 + 149
+     *        16:52:23 pad=410,85                      ← 继续涨
+     *        16:52:09 window=-652,503                 ← 窗口被推出屏幕 652px
+     *   ② 它让「窗口几何」变成了一个会随内容变化的量，于是开关面板必然有
+     *      「几何在动」的那一帧 —— 用户看到的就是「从左上角弹出来」。
+     *
+     * 现在的前提变了，它已经没有必要存在：
+     *   · padding 是常量（12/28/12/10 dp）；
+     *   · body 左对齐（gravity=START）→ 歌词相对窗口的偏移恒为 (padL, padT)；
+     *   · 按钮行宽度自适应（relayoutBar，四档）→ 不需要靠挪窗口腾地方。
+     * 三条合起来，offset 是常量，纯减法就够，不需要任何布局后实测。
+     */
+
+    /** 内容尺寸变了（字号 / 换页 / 换句）后，重新挑一档按钮行布局。
+     *  注意：只调按钮行，**不碰窗口**。 */
+    private void clampIntoPanel() {
+        try {
+            if (!panelOpen || lp == null) return;
+            relayoutBar(lyricXFromWindow(lp.x));
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-clamp-panel", e);
+        }
+    }
+
+    /** 任何操作都续期 8 秒自动收起 */
+    private void bumpPanelTimeout() {
+        if (!panelOpen) return;
+        main.removeCallbacks(panelTimeout);
+        main.postDelayed(panelTimeout, PANEL_TIMEOUT_MS);
+    }
+
+    private void cancelPanelTimeout() {
+        main.removeCallbacks(panelTimeout);
+    }
+
+    /**
+     * 统一的「窗口属性变了，通知 WindowManager」。
+     *
+     * 以前这段在 4 个地方各写一遍 wm.updateViewLayout(xxx, lp)，1.3.8 把
+     * 窗口视图从 view 换成 root 之后，任何一处漏改就会「歌词动了、面板没动」
+     * 或者反过来 —— 这类 bug 极难从现象倒推。所以收成一个函数，只在这里
+     * 碰 view 的具体类型。
+     */
+    private void updateWindow() {
+        if (root == null || lp == null || wm == null || !added) return;
+        try {
+            wm.updateViewLayout(root, lp);
+        } catch (Throwable e) {
+            CrashLog.recordAsync(ctx, "lyric-window", e);
+        }
+    }
+
 
     /* ================= 内部 ================= */
 
@@ -620,6 +1762,12 @@ public class LyricOverlay {
             } else {
                 fv.clearFill(color);
             }
+            /*
+             * ⚠️ alpha 只给歌词（view），不给 root。
+             * root 是窗口视图，如果它半透明，面板卡片也会跟着变淡 ——
+             * 用户把歌词透明度调到 30% 时，面板会淡到看不见。
+             * 所以透明度作用域仍然是「歌词本身」，与 1.3.8 之前一致。
+             */
             view.setAlpha(alpha);
         } catch (Throwable e) {
             CrashLog.recordAsync(ctx, "lyric-style", e);
@@ -751,6 +1899,8 @@ public class LyricOverlay {
             applyProgressFill();
             scheduleTick();
             reportTiming();
+            /* 播放/暂停图标跟着真实状态走（面板开着时才需要重画） */
+            syncPlayGlyph();
         });
     }
 
@@ -1155,17 +2305,26 @@ public class LyricOverlay {
     private void applyPosition() {
         if (lp == null) return;
         try {
+            /*
+             * ⚠️ posX / posY / clampX / clampY 的语义全部是**歌词位置**，
+             * 而这里写的是 lp.x / lp.y = **窗口原点**，两者恒差一个常量 padding。
+             * 所以下面统一算出「歌词位置」，最后一步用 toWindowX/toWindowY 换算 ——
+             * 中间任何一处直接把 lp.x 当歌词位置都会错位。
+             * （面板开不开都是同一个换算：padding 是常量，歌词又左对齐。）
+             */
+            int lyricY;
             if (posY < 0) {
                 // 状态栏下沿再往下一点点，落在状态栏和标题栏之间的空隙里
                 int statusH = statusBarHeightPx();
-                lp.y = statusH > 0 ? statusH - dp(2) : dp(26);
+                lyricY = statusH > 0 ? statusH - dp(2) : dp(26);
             } else {
                 /*
                  * J-10 的另一半：已经存进设置里的越界 y（老版本拖出去的）也要拉回来，
                  * 否则升级后浮层仍然在屏幕外——用户不会想到是「旧的坏坐标」。
                  */
-                lp.y = clampY(posY);
+                lyricY = clampY(posY);
             }
+            lp.y = toWindowY(lyricY);
             if (posX < 0) {
                 centerHorizontally();          // 默认：居中（要等窗口量出宽度）
             } else {
@@ -1180,13 +2339,17 @@ public class LyricOverlay {
                  *   上限骤减 → 被钳回屏幕内某处 → 看起来「位置自己跑了」。
                  * 这里只做「完全出屏才拉回」的兜底，正常值原样还原。
                  */
-                lp.x = restoreX(posX);
+                final int lyricX = restoreX(posX);
+                lp.x = toWindowX(lyricX);
+                /* 面板开着时按钮行档位按新位置重挑一次（不挪窗口） */
+                if (panelOpen) relayoutBar(lyricX);
             }
             LogBridge.add(ctx, "LYRIC", "position x=" + lp.x + " y=" + lp.y
-                    + " (saved " + posX + "," + posY + ")");
+                    + " (saved " + posX + "," + posY + ", pad=" + padL + "," + padT + ")");
         } catch (Throwable e) {
             CrashLog.recordAsync(ctx, "lyric-pos", e);
-            if (lp != null) lp.y = dp(26);
+            /* 兜底也只管歌词的 y，窗口原点仍要换算 */
+            if (lp != null) lp.y = toWindowY(dp(26));
         }
     }
 
@@ -1299,10 +2462,15 @@ public class LyricOverlay {
                 }
                 if (vw <= 0) vw = sw;
                 if (sw <= 0) return;
-                lp.x = Math.max(0, (sw - vw) / 2);
-                if (added && view != null && wm != null) {
-                    try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
-                }
+                /*
+                 * 居中算的是**歌词**（vw 是 view.getWidth()），写进 lp 的却是
+                 * 窗口原点 —— 恒差一个常量左 padding，与面板开没开无关。
+                 */
+                final int lyricCenterX = Math.max(0, (sw - vw) / 2);
+                lp.x = toWindowX(lyricCenterX);
+                updateWindow();
+                /* 面板开着：位置变了要重挑按钮行档位（不挪窗口） */
+                if (panelOpen) relayoutBar(lyricCenterX);
             } catch (Throwable e) {
                 CrashLog.recordAsync(ctx, "lyric-center", e);
             }
@@ -1385,8 +2553,8 @@ public class LyricOverlay {
                 /* 解锁态稍亮一点：让用户看得出「现在是可拖动的」 */
                 view.setAlpha(locked ? alpha : Math.min(1f, alpha + 0.06f));
             }
-            if (added && view != null && wm != null) {
-                wm.updateViewLayout(view, lp);
+            if (added && root != null && wm != null) {
+                updateWindow();
                 LogBridge.add(ctx, "LYRIC", "flags updated locked=" + locked);
             }
         } catch (Throwable e) {
@@ -1394,9 +2562,23 @@ public class LyricOverlay {
         }
     }
 
+    /**
+     * 歌词本体上的触摸：拖动 + 单击开关面板。
+     *
+     * ⚠️ 这里全程区分两套坐标，混用会让面板打开后位置一路漂：
+     *   · origin = lp.x/lp.y      → **窗口原点**
+     *   · clampX / clampY 的入参   → **歌词位置**（它们的语义是「歌词尺寸」的约束）
+     *   · onMoved 报给网页的       → **歌词位置**
+     * 所以按下时先把窗口原点换算成歌词位置，拖动过程在歌词坐标系里算，
+     * 最后再减 padding 写回 lp。
+     *
+     * 面板打开时也允许拖 —— 用户按需求「拖动也算操作」，会续期自动收起；
+     * 拖完面板会跟着窗口一起走（padding 不变，窗口原点整体平移），
+     * 歌词与卡片的相对关系保持不变。
+     */
     private void bindTouch() {
         final float[] down = new float[2];
-        final int[] origin = new int[2];
+        final int[] origin = new int[2];   // 歌词坐标（不是窗口原点）
         final boolean[] moved = new boolean[]{false};
         view.setOnTouchListener((v, ev) -> {
             if (locked || lp == null) return false;
@@ -1404,15 +2586,19 @@ public class LyricOverlay {
                 case MotionEvent.ACTION_DOWN:
                     down[0] = ev.getRawX();
                     down[1] = ev.getRawY();
-                    origin[0] = lp.x;
-                    origin[1] = lp.y;
+                    /* 拖动基准 = 歌词当前屏幕坐标 = 窗口原点 + 常量 padding */
+                    origin[0] = lyricXFromWindow(lp.x);
+                    origin[1] = lyricYFromWindow(lp.y);
                     moved[0] = false;
+                    /* 面板开着时按住歌词也算「有操作」，续期自动收起 */
+                    bumpPanelTimeout();
                     return true;
                 case MotionEvent.ACTION_MOVE: {
                     float dx = ev.getRawX() - down[0];
                     float dy = ev.getRawY() - down[1];
                     if (Math.abs(dx) > dp(3) || Math.abs(dy) > dp(3)) moved[0] = true;
-                    lp.x = clampX(origin[0] + (int) dx);
+                    /* clampX/clampY 的语义一直是「歌词能放在哪」，入参必须是歌词坐标 */
+                    int lyricX = clampX(origin[0] + (int) dx);
                     /*
                      * J-10：y 方向补齐上限，与 clampX 对称。
                      * 以前只有 Math.max(0, ...) 的下限 —— 配合 FLAG_LAYOUT_NO_LIMITS
@@ -1420,20 +2606,30 @@ public class LyricOverlay {
                      * 位置会被持久化（onMoved → 网页存设置），重启后它仍然在屏幕外，
                      * 只能靠「恢复默认位置」救回来，用户当时的感觉就是「歌词不见了」。
                      */
-                    lp.y = clampY(origin[1] + (int) dy);
-                    try { wm.updateViewLayout(view, lp); } catch (Throwable ignored) {}
+                    int lyricY = clampY(origin[1] + (int) dy);
+                    if (moved[0]) bumpPanelTimeout();
+                    lp.x = toWindowX(lyricX);
+                    lp.y = toWindowY(lyricY);
+                    updateWindow();
                     return true;
                 }
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL: {
                     if (!moved[0]) {
+                        /* 单击：开关原生面板（1.3.8，不再回调网页弹底部面板） */
+                        togglePanel();
                         Callback c = cb;
                         if (c != null) c.onTap();
                     } else {
-                        posX = lp.x;
-                        posY = lp.y;
+                        /* 存的是歌词位置，不是窗口原点 —— 否则面板开合一次就漂一次 */
+                        final int lx = lyricXFromWindow(lp.x);
+                        final int ly = lyricYFromWindow(lp.y);
+                        anchorX = lx;
+                        anchorY = ly;
+                        posX = lx;
+                        posY = ly;
                         Callback c = cb;
-                        if (c != null) c.onMoved(lp.x, lp.y);
+                        if (c != null) c.onMoved(lx, ly);
                     }
                     return true;
                 }

@@ -25,7 +25,7 @@ public class RippleApp extends Application {
      * 正常路径下不起作用 —— 版本号优先从 PackageManager 读（J-04），
      * 免得有人绕开 build-apk.sh 手改版本后，日志里报的还是旧版本。
      */
-    private static final String FALLBACK_VERSION_TAG = "version=1.3.7(137)";
+    private static final String FALLBACK_VERSION_TAG = "version=1.3.8(138)";
 
     @Override
     public void onCreate() {
@@ -96,7 +96,7 @@ public class RippleApp extends Application {
     }
 
     /**
-     * 运行时版本标记（"version=1.3.7(137)" 这种形状）。
+     * 运行时版本标记（"version=1.3.8(138)" 这种形状）。
      * 读不到时回落 FALLBACK_VERSION_TAG；任何异常都不能冒出去 ——
      * 这行日志是启动取证的一部分，不能反过来把启动搞挂。
      */

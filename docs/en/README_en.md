@@ -201,6 +201,9 @@ LAN address; point the phone at `http://<your-ip>:8080` on the same Wi-Fi and us
   button support
 - Status-bar lyric overlay: colour (with a hand-drawn colour picker), font size, opacity,
   bold, outline, and **fill that follows playback progress**
+- **When unlocked, a tap opens a native control bar in place**: previous / play-pause / next /
+  lock / style, plus an ✕ to turn it off; tap again to collapse. No jumping back to the app, so
+  playback stays controllable while another app is in front
 - **Locked mode does not intercept touch at all**, so it never gets in the way; unlock it to
   drag the overlay around
 
