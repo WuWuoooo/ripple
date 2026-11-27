@@ -767,7 +767,12 @@ test('元测试：把三处修复逐个改回旧写法，上面的判据必须�
 
     fs.writeFileSync(path.join(oldDir, 'server.js'), unknown200);
     fs.copyFileSync(path.join(ROOT, 'server-security.js'), path.join(oldDir, 'server-security.js'));
-    fs.symlinkSync(path.join(ROOT, 'app'), path.join(oldDir, 'app'), 'dir');
+    /*
+     * 用**拷贝**而不是符号链接：Windows 上建目录符号链接需要开发者模式或管理员
+     * 权限，普通开发者本地跑全量测试会直接 EPERM（CI 只跑 ubuntu-24.04 所以
+     * 不会暴露，但本地 Windows 会）。app/ 只有 1.2MB，cpSync 的代价可以接受。
+     */
+    fs.cpSync(path.join(ROOT, 'app'), path.join(oldDir, 'app'), { recursive: true });
 
     oldEnv = startServerIn(oldDir);
     const oldPort = await oldEnv.ready;

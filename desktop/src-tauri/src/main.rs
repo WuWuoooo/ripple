@@ -263,7 +263,9 @@ fn netease(
                 });
                 let js = format!(
                     "if (typeof window.__rippleNativeResult === 'function') {{ window.__rippleNativeResult({}, {}); }}",
-                    serde_json::Value::String(cb_id).to_string(),
+                    /* 虽然这条分支紧接着就 return，但 clone 一下更稳：
+                       以后若有人在下面补日志/补逻辑，就不会突然变成 move-after-move */
+                    serde_json::Value::String(cb_id.clone()).to_string(),
                     serde_json::Value::String(bad.to_string()).to_string()
                 );
                 /* 与正常结果同一条投递口径（见下方 H-12 注释） */
@@ -401,7 +403,12 @@ fn netease(
          */
         let js = format!(
             "if (typeof window.__rippleNativeResult === 'function') {{ window.__rippleNativeResult({}, {}); }}",
-            serde_json::Value::String(cb_id).to_string(),
+            /*
+             * ⚠️ 必须 clone：下面的失败日志还要借用 cb_id。
+             * 上一版没 clone，CI 直接 E0382「borrow of moved value: cb_id」——
+             * 这正是「本机无编译环境」的代价，靠 CI 抓到。
+             */
+            serde_json::Value::String(cb_id.clone()).to_string(),
             serde_json::Value::String(text).to_string()
         );
         /*
