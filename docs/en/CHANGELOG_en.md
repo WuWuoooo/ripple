@@ -93,6 +93,13 @@ The single source of truth for the version number is `version.json` in the root 
   design, not by failure, yet it wrote a line on every `applyTheme`/`renderAll`/`paletteFor` call —
   in the owner's 2026-11-27 Windows log dozens of noisy lines squeezed the real error into a few.
   Now it is logged once
+- **Results now go only to the webview that issued the command** (cleanup of this release's
+  intermediate H-12 state): the first version broadcast every result to **all** webviews, judging
+  that "one extra delivery is a harmless no-op". Measurement disproved that — a local 30-second
+  startup log contained 13 `API: received an ownerless callback (probably timed out)` lines, all
+  produced by the broadcast. The command now takes `webview: tauri::Webview`, which the framework
+  fills in with the caller, and replies only there; the frontend's ownerless-callback log is also
+  capped (first 5 verbatim, then counted)
 - **Fixed the lyric window position being reset on every change** (review H-3): on desktop
   `sbX/sbY` is always `-1` (the position lives only on the Rust side and never flows back), while
   `want_reset` treated "received a negative number" as "reset to default" — so changing a colour

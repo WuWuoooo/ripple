@@ -260,6 +260,7 @@ fn get_or_init_client(
 #[tauri::command]
 fn netease(
     app: tauri::AppHandle,
+    webview: tauri::Webview,
     state: State<'_, AppState>,
     cmd: String,
     params: String,
@@ -293,9 +294,16 @@ fn netease(
                     serde_json::Value::String(cb_id.clone()).to_string(),
                     serde_json::Value::String(bad.to_string()).to_string()
                 );
-                /* 与正常结果同一条投递口径（见下方 H-12 注释） */
-                for (_label, win) in app.webview_windows() {
-                    let _ = win.eval(&js);
+                /*
+                 * 与正常结果同一条投递口径：**只回给发起命令的那个 webview**。
+                 * 见下方 H-12 注释里那段「为什么不再广播给所有窗口」。
+                 */
+                let label = webview.label().to_string();
+                if let Err(e) = webview.eval(&js) {
+                    log_line_at(
+                        &app,
+                        &format!("[IPC] 参数错误结果投递失败 win={label} cb={cb_id}: {e}"),
+                    );
                 }
                 return Ok(());
             }
@@ -332,6 +340,14 @@ fn netease(
      * `Clone + Send + 'static`，取到的 State 生命周期落在闭包体内，用完即弃。
      */
     let app2 = app.clone();
+    /*
+     * 把「谁发的这条命令」带进 worker 线程。
+     *
+     * `tauri::Webview` 是 Clone + Send + 'static，可以安全地 move 进闭包 ——
+     * 它是窗口的**句柄**而不是窗口本体，即使窗口在这期间被关掉，
+     * 用它 eval 也只会返回一个 Err（下面会记日志），不会 panic。
+     */
+    let webview2 = webview.clone();
 
     /*
      * 审查 L-11：不再每条命令裸 spawn 一个线程。
@@ -383,8 +399,13 @@ fn netease(
                         serde_json::Value::String(cb_id.clone()).to_string(),
                         serde_json::Value::String(text).to_string()
                     );
-                    for (_label, win) in app2.webview_windows() {
-                        let _ = win.eval(&js);
+                    /* 只回给发起命令的那个 webview，理由见下方 H-12 注释 */
+                    let label = webview2.label().to_string();
+                    if let Err(e) = webview2.eval(&js) {
+                        log_line_at(
+                            &app2,
+                            &format!("[IPC] 建 Client 失败的结果投递失败 win={label} cb={cb_id}: {e}"),
+                        );
                     }
                     return;
                 }
@@ -416,23 +437,30 @@ fn netease(
         /*
          * 与 Android 桥同名的全局回调。
          *
-         * 审查 H-12：以前这里写死投到 `get_webview_window("main")`，
-         * 于是「谁发的请求」这件事被丢掉了 —— 只有主窗口能收到结果。
-         * 桌面端有**两个** webview（主窗口 + 歌词窗），各自有独立的 JS 上下文；
-         * 哪一个窗口发起的命令，结果就该回给哪一个，否则歌词窗里的
-         * 命令会永远等不到返回。
+         * ===== H-12 的三步演进（别把中间那步当成终态）=====
          *
-         * 现在的做法：带上 typeof 守卫后投给**所有** webview。
-         * 为什么不用「按 cbId 记发起窗口」那套（更精确但更重）：
-         *   · 回调函数 __rippleNativeResult 是前端全局表驱动的，
-         *     只有真正发起过这条 cbId 的窗口才会有对应条目；
-         *   · 多投一份到没有该条目的窗口是**无害的 no-op**（typeof 守卫挡住）；
-         *   · 而按窗口记账要多维护一张 cbId→label 的表，还得处理
-         *     「窗口中途被关掉」的清理 —— 对当前只有两个窗口的规模不值得。
-         * 一旦以后窗口数变多、或回调开始有副作用，就该换成按窗口记账。
+         * ① 1.3.8 及以前：写死投到 `get_webview_window("main")` ——
+         *    「谁发的请求」这件事被丢掉了，只有主窗口能收到结果。
          *
-         * 找不到任何窗口时静默跳过：前端 pending 表有 22 秒超时兜底，
-         * 不会永久卡住；而在这里 panic 会把整个应用带崩，代价大得多。
+         * ② 1.3.9 第一版：带上 typeof 守卫后**广播给所有 webview**。
+         *    当时的取舍是「多投一份是无害 no-op，不值得为此维护 cbId→label 表」。
+         *    这个取舍**建立在「没有窗口会对自己发起的请求之外的回调做出反应」之上**，
+         *    而它被实测证伪了：本机跑起来后日志里成片出现
+         *      `API: 收到无主回调（可能已超时）: n2`
+         *    —— 每一条命令都会在另一个窗口留下一条「无主回调」记录。
+         *    它本身确实不改变状态，但代价是把真正的错误淹掉：用户在 2026-11-27
+         *    发来的 Windows 日志里，这类噪音和 `BARS: no native bridge` 一起
+         *    把「请求超时」挤成了少数几行。
+         *
+         * ③ 现在：直接用 Tauri 注入的 `tauri::Webview` 参数定位**发起方**，
+         *    只回给它。命令行参加了一个 `webview: tauri::Webview`，它由框架
+         *    自动填成「调用这条命令的那个 webview」—— 不需要我们自己记账、
+         *    也不需要处理「窗口中途被关掉」的清理（句柄失效时 eval 会返回 Err，
+         *    下面照常记一行日志）。
+         *
+         * 注意：这里**不能**用 `app2.webview_windows()` 再按 label 找回来 ——
+         * 那样还得在一堆窗口里挑，且窗口若已被关掉就完全找不到；
+         * 直接 move 一个 Webview 句柄进闭包既简单又精确。
          */
         let js = format!(
             "if (typeof window.__rippleNativeResult === 'function') {{ window.__rippleNativeResult({}, {}); }}",
@@ -456,22 +484,13 @@ fn netease(
          * 「有投递失败」+「前端报超时」，就能立刻判定是渲染侧的问题
          * 而不是网络侧 —— 这两种情况以前在日志里长得一模一样。
          */
-        let mut delivered = 0usize;
-        for (label, win) in app2.webview_windows() {
-            match win.eval(&js) {
-                Ok(()) => delivered += 1,
-                Err(e) => log_line_at(
-                    &app2,
-                    &format!("[IPC] 结果投递失败 win={label} cb={cb_id}: {e}"),
-                ),
-            }
-        }
-        if delivered == 0 {
-            /* 一个窗口都没投进去（比如都关了）—— 前端注定要超时，先记下来 */
-            log_line_at(
+        let label = webview2.label().to_string();
+        match webview2.eval(&js) {
+            Ok(()) => {}
+            Err(e) => log_line_at(
                 &app2,
-                &format!("[IPC] 没有任何窗口接收结果 cb={cb_id}（前端会等到超时）"),
-            );
+                &format!("[IPC] 结果投递失败 win={label} cb={cb_id}: {e}"),
+            ),
         }
     });
 
