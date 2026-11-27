@@ -494,10 +494,25 @@
    * `BARS: send`。这里做值级幂等 —— 颜色和明暗都没变就不再跨桥、不再写日志。
    */
   let _lastBarsKey = '';
+  /*
+   * 「没有 systemBars」这个事实只记一次。
+   *
+   * 以前是无条件每调用一次就写一行，而 syncSystemBars 会被 applyTheme /
+   * renderAll / paletteFor / refreshSystemBars 反复调到 —— 2026-11-27 用户
+   * 发来的 Windows 日志里，几十行 `BARS: no native bridge, skip` 把
+   * **同一段时间内的真实错误挤成了少数几行**，排查时第一眼看到的是噪音。
+   *
+   * 而这不是每条日志都值得一提的状态：桌面端本来就没有系统状态栏，
+   * 所以「没有 bridge」是**设计如此**、不是故障。设计层面的事实写一条就够。
+   */
+  let _barsNoBridgeLogged = false;
   function syncSystemBars(bg, lightTheme, force) {
     const N = window.RippleNative;
     if (!N || typeof N.systemBars !== 'function') {
-      Log.add('BARS', 'no native bridge, skip ' + bg);
+      if (!_barsNoBridgeLogged) {
+        _barsNoBridgeLogged = true;
+        Log.add('BARS', 'no native systemBars（本平台无系统状态栏，跳过；只记这一次）');
+      }
       return;
     }
     const key = bg + '|' + (lightTheme ? 1 : 0);

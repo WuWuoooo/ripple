@@ -71,6 +71,28 @@ The single source of truth for the version number is `version.json` in the root 
   not starve a click), per-request timeout 25s → 12s plus a separate 6s `connect_timeout`, and result
   delivery failures are logged as `[IPC]` instead of being swallowed by `let _ =`
   (previously "the result never reached the page" and "the network timed out" looked identical)
+
+- **Fixed the real root cause of "not a single song will play on Windows": requests were serialized
+  behind one global lock** (measured in this release): the previous round only enlarged the pool and
+  shortened the timeout, but never removed the queueing — `Arc<Mutex<Client>>` wrapped the whole
+  `c.call()` in a lock, so a bigger pool just meant more threads queueing for the same lock.
+  Local measurement: one `song_url` takes 0.13s; 8 of them through that lock take **0.92s** (nearly
+  the sum), while 8 concurrent without the lock take **0.51s**. On a weak network a single request is
+  3~5s, so a dozen boot-time commands queue up to 30~50s — the frontend's 25s budget then reports
+  "request timed out (song_url)", and the user sees "no song will play". Fix: `Client` became a
+  cheaply `Clone`-able value type (`reqwest::blocking::Client` is thread-safe and truly concurrent);
+  only the cookie is shared via its own `Arc<Mutex<CookieJar>>`, with the critical section reduced to
+  the purely in-memory "snapshot / merge Set-Cookie" steps — it never wraps network IO
+- **Extracted the cookie-merge rules into `CookieJar` with 7 new unit tests**: that logic used to sit
+  inside `post()` and could only be verified indirectly by running a whole command and checking the
+  login state, which offline CI cannot do. Extracting it immediately caught a real bug — replacing a
+  same-name key by "remove then append" reordered the jar, so **every response looked changed** and
+  triggered two pointless disk writes (NetEase sends Set-Cookie on almost every response). With
+  in-place replacement, `merge()` only persists on a real change
+- **`BARS: no native bridge` no longer floods the log**: the desktop build has no system status bar by
+  design, not by failure, yet it wrote a line on every `applyTheme`/`renderAll`/`paletteFor` call —
+  in the owner's 2026-11-27 Windows log dozens of noisy lines squeezed the real error into a few.
+  Now it is logged once
 - **Fixed the lyric window position being reset on every change** (review H-3): on desktop
   `sbX/sbY` is always `-1` (the position lives only on the Rust side and never flows back), while
   `want_reset` treated "received a negative number" as "reset to default" — so changing a colour

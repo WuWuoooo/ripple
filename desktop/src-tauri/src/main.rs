@@ -45,7 +45,15 @@ use tauri::{Emitter, Manager, RunEvent, State};
 
 /// 全局客户端。桌面端只有一份登录态，所有命令共享它。
 struct AppState {
-    client: Mutex<Option<Arc<Mutex<netease::Client>>>>,
+    /*
+     * 1.3.9：从 `Mutex<Option<Arc<Mutex<Client>>>>` 降成一层。
+     *
+     * 外层那把锁只用来「只建一次 Client」，内层那把锁以前包住整条网络请求
+     * （见 netease.rs 顶部注释里那段实测数据）。现在 Client 自身是 Clone 的
+     * 值类型、内部只有 cookie 需要互斥，于是这里只要保证「全局只建一次」，
+     * 不再需要为每次请求加锁。
+     */
+    client: Mutex<Option<netease::Client>>,
     data_dir: PathBuf,
     /// 歌词窗口的状态（见本文件下方「歌词窗」注释块）。与 client 分开加锁，
     /// 免得「推一句歌词」和「发一次网络请求」互相等锁。
@@ -190,10 +198,18 @@ impl WorkerPool {
 /// 用户点最小化要走的 `window` 命令）都只能在通道里排队 ——
 /// 表现就是「点了没反应」+「所有请求 22 秒超时」。
 ///
-/// 现在改成 8 个：不是为了让网络请求更快（那把锁仍然串行），
-/// 而是保证**即使有几条请求卡在网络上，通道里也永远有空闲 worker 接手
-/// 短小的 UI 任务**。这是「资源隔离」而不是「提高吞吐」——
-/// 一个卡住的长任务不该饿死一个点击。
+/// 现在改成 8 个。注意这里有两个**互相独立**的问题，别把它们的修法混起来：
+///
+///   ① 通道饿死（池太小）：即使每条请求都很快，只有 2 个线程时，
+///      几条卡在网络上的请求就能让新任务（包括点最小化要走的 window 命令）
+///      永远排不到 worker。→ 扩到 8，这是**资源隔离**。
+///   ② 请求串行化（那把大锁）：每条请求本身只要 0.1~0.3 秒，但 8 条经过
+///      `Arc<Mutex<Client>>` 就变成 0.92 秒排队相加，弱网下放大成几十秒。
+///      → 去掉那把锁，这是**并发度**（详见 netease.rs 顶部注释）。
+///
+/// 只做 ① 是不够的：线程再多，它们也都在同一把锁后面排成一列。
+/// 本机实测印证了这一点 —— 8 线程 + 大锁 = 0.92s，8 线程 + 无锁 = 0.51s。
+/// ① 的价值仍然存在（短任务不被长任务饿死），但不能拿它当 ②的替代品。
 fn worker_pool() -> &'static WorkerPool {
     static POOL: std::sync::OnceLock<WorkerPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| WorkerPool::new(8))
@@ -201,12 +217,13 @@ fn worker_pool() -> &'static WorkerPool {
 
 /// 惰性初始化共享 Client：首次调用时建，之后所有命令共用同一个实例。
 ///
-/// 返回 Arc 的克隆，所以调用方拿到后可以在锁外持有 —— 这正是
-/// 「并发的两条命令不能各建一个 Client」的关键。
+/// 返回的是一个 **Client 的克隆**（包含同一个 cookie 的 Arc 与同一个
+/// reqwest 句柄），不是共享锁。这正是「并发的两条命令不能各建一个 Client」
+/// 与「并发请求不该互相排队」两件事同时成立的关键。
 fn get_or_init_client(
     state: &State<'_, AppState>,
     data_dir: &PathBuf,
-) -> Result<Arc<Mutex<netease::Client>>, String> {
+) -> Result<netease::Client, String> {
     let mut guard = state.client.lock().map_err(|e| {
         i18n::tf(
             "状态锁被污染：{e}",
@@ -215,10 +232,18 @@ fn get_or_init_client(
         )
     })?;
     if let Some(c) = guard.as_ref() {
-        return Ok(Arc::clone(c));
+        /* Client 是 Clone 的：这里只是复制两个 Arc 和一份 reqwest Client 句柄，
+        不会新建连接池、不会重读 cookie 文件。 */
+        return Ok(c.clone());
     }
-    let client = Arc::new(Mutex::new(netease::Client::new(data_dir)?));
-    *guard = Some(Arc::clone(&client));
+    /*
+     * 建 Client 会走 reqwest 的 builder()，上游要在内部 spawn 一个线程、
+     * 建 tokio current-thread runtime 并初始化 TLS —— 那是几百毫秒级的阻塞。
+     * 仍在持锁状态下做，是对的：这段时间里别的请求本来就该等，
+     * 而且等的是「初始化一次」而不是「每条请求都排一次队」。
+     */
+    let client = netease::Client::new(data_dir)?;
+    *guard = Some(client.clone());
     Ok(client)
 }
 
@@ -279,16 +304,18 @@ fn netease(
 
     let data_dir = state.data_dir.clone();
     /*
-     * 这里必须用 Arc 共享同一个 Client，不能「取出→用完→放回」。
+     * 这里必须共享同一个 Client，不能「取出→用完→放回」。
      *
      * 早先的写法是 `guard.take()` 把 Client 拿走，请求期间它在共享状态里是
      * None —— 此时若并发的第二条命令进来，会看到 None 而**新建一个 Client**。
-     * 两个 Client 各有自己的 cookie_jar，后果是：一边登录成功了，
+     * 两个 Client 各有自己的 cookie，后果是：一边登录成功了，
      * 另一边仍然认为没登录；Set-Cookie 写回时互相覆盖，登录态随机丢失。
      *
-     * 前端确实会并发（首页一次性拉每日推荐 + 推荐歌单 + 排行榜），
-     * 所以这不是理论问题。改成 Arc<Mutex<Client>> 后，所有命令共享同一份
-     * cookie_jar，锁只包住真正访问 client 的那一小段。
+     * 但「共享」不等于「共享一把锁」。1.3.9 之前这里做成了
+     * `Arc<Mutex<Client>>`，把网络请求也串行化了 —— 那是本机实测过的
+     * 性能灾难（见 netease.rs 顶部注释：8 条请求排队 0.92s vs 并发 0.51s，
+     * 且差距随弱网线性放大）。现在 Client 是 Clone 的值类型：
+     * 共享的是 cookie 与连接池，**不是**执行权。
      *
      * H-17（审查报告，1.3.8）：`get_or_init_client` 的调用点已经挪到下面的
      * worker 池内部（见 pool.execute 里的第一段），这里只留需要的值。
@@ -365,12 +392,18 @@ fn netease(
         };
 
         let text = {
-            // 锁的范围：只包住这一次网络请求。同类请求会串行，
-            // 但桌面端请求量本来就不高，且能保证 cookie 不被并发写坏。
-            let result = match client.lock() {
-                Ok(mut c) => c.call(&cmd, &params_json),
-                Err(e) => Err(i18n::tf("状态锁被污染：{e}", "State lock poisoned: {e}", &[("e", e.to_string())])),
-            };
+            /*
+             * 1.3.9：**这里不再有锁**。
+             *
+             * 以前这里是 `client.lock()` 包住整条 c.call() —— 那是整个
+             * 「Windows 一首歌都播不了」的根因：网络请求被串行化，首页十几条
+             * 命令排队，弱网下累计远超前端 25 秒预算。
+             *
+             * 现在 client 是 Clone 的值类型（内部只有 cookie 需要互斥，
+             * 而那段临界区只有内存操作）。于是 8 个 worker 是**真并发**：
+             * 队列里不再有那条人为的独木桥。
+             */
+            let result = client.call(&cmd, &params_json);
             match result {
                 Ok(t) => t,
                 Err(e) => format!(
@@ -1613,11 +1646,15 @@ fn main() {
                  * 避免在持锁状态里做 IO。
                  */
                 if let Some(state) = app.try_state::<AppState>() {
-                    let client = state.client.lock().ok().and_then(|g| g.as_ref().cloned());
+                    /*
+                     * 只克隆出来再落盘：Client 已经是 Clone 的值类型，
+                     * save_cookie 内部自己会取 cookie 快照、且不在锁里做文件 IO。
+                     * 以前这里是「先拿外层锁克隆 Arc，再拿内层锁调 save」，
+                     * 两层锁在退出路径上有互相等待的可能；现在只剩一层、且已经放掉了。
+                     */
+                    let client = state.client.lock().ok().and_then(|g| g.clone());
                     if let Some(c) = client {
-                        if let Ok(guard) = c.lock() {
-                            guard.save_cookie();
-                        }
+                        c.save_cookie();
                     }
                 }
                 /*
