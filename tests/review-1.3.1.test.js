@@ -273,6 +273,118 @@ test('D-02 sync-version.sh 必须同步桌面端（否则下次发版又漂移�
   assert.match(src, /Cargo\.toml 的 \[package\] version 同步失败/, '必须有同步后的断言');
 });
 
+/* ============================================================
+   审查 1.3.8 · B-4 / H-12：CI 与写入侧不许再抄「读第一处 version」
+
+   上面那条 B-1 用例证明的是「解析器能抓出来」。但 B-4 证明的是**另一件事**：
+   两个 workflow + 一个测试文件各自抄了一份错判据，所以解析器再对也没人用。
+   下面这条因此在临时副本里**直接跑 workflow 里现在那一行命令**，
+   并断言「对抗样本下它必须失败」—— 谁把 workflow 改回手写 grep/sed，立刻红。
+   ============================================================ */
+test('B-4 元测试：workflow 的版本校验必须调唯一解析器，对抗样本下必须报红', () => {
+  const { spawnSync } = require('node:child_process');
+  const os = require('node:os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ripple-b4-'));
+  try {
+    const need = ['version.json', 'scripts/version-facts.js',
+      'android/app/build.gradle',
+      'android/app/src/main/java/com/ripple/app/CrashLog.java',
+      'android/app/src/main/java/com/ripple/app/RippleApp.java',
+      'app/js/version.js', 'app/sw.js',
+      'desktop/src-tauri/tauri.conf.json', 'desktop/src-tauri/Cargo.lock'];
+    for (const rel of need) {
+      const dst = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(path.join(ROOT, rel), dst);
+    }
+    const vj = JSON.parse(fs.readFileSync(path.join(tmp, 'version.json'), 'utf8'));
+    /*
+     * 对抗样本（报告 B-4 的原始构造）：[package] 之前先来一个 version 键，
+     * 值等于 version.json（看起来完全正常）；[package].version 是旧值。
+     */
+    fs.writeFileSync(path.join(tmp, 'desktop/src-tauri/Cargo.toml'), [
+      '[profile.release]',
+      'version = "' + vj.versionName + '"',
+      '',
+      '[package]',
+      'name = "ripple-desktop"',
+      'version = "1.2.0"',
+      '',
+      '[dependencies]',
+      'serde = "1"',
+      '',
+    ].join('\n'));
+
+    /* ① 修复后的判据（workflow 里现在跑的就是这一行）必须报红 */
+    const r = spawnSync(process.execPath,
+      [path.join(tmp, 'scripts', 'version-facts.js'), '--assert'],
+      { cwd: tmp, encoding: 'utf8', timeout: 30000 });
+    const all = (r.stdout || '') + (r.stderr || '');
+    assert.notStrictEqual(r.status, 0,
+      '对抗样本下 version-facts.js --assert 必须失败（[package].version 是 1.2.0，而 version.json 是 '
+      + vj.versionName + '）：\n' + all);
+    assert.match(all, /Cargo\.toml/, '失败信息要点名 Cargo.toml，实际：\n' + all);
+
+    /*
+     * ② 老判据（复刻被删掉的那一行）在同一份样本上必须**报绿** —— 这条断言
+     *    把「老判据是错的」钉进测试：它在这份样本上确实会漏报。
+     */
+    const sedOut = spawnSync('sed',
+      ['-n', 's/^version = "\\([0-9.]*\\)"/\\1/p', 'desktop/src-tauri/Cargo.toml'],
+      { cwd: tmp, encoding: 'utf8' });
+    const oldRead = String(sedOut.stdout || '').split('\n')[0];
+    assert.strictEqual(oldRead, vj.versionName,
+      '老判据（读第一处）在这份样本上应当读到 ' + vj.versionName
+      + ' —— 这正是它误报绿的原因');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+/* ============================================================
+   审查 1.3.8 · H-12：写入侧必须是 [package] 段内，不是「改第一处」
+
+   B-4 修「检查侧」，H-12 是「写入侧」—— 报告明确指出写入侧更根本：
+   写对了就不需要下游兜底。这条把 sync-version.sh 里那段 python 抽出来真跑，
+   断言：[profile.release] 的 version 不被改动、[package].version 被改对。
+   ============================================================ */
+test('H-12：sync-version.sh 只改 [package] 段内的 version，不碰别的表', () => {
+  const os = require('node:os');
+  const snip = read('android/sync-version.sh');
+  const m = snip.match(/CT="\$ROOT\/desktop\/src-tauri\/Cargo\.toml"\n  if ! python3 - "\$CT" "\$VN" <<'PY'\n([\s\S]*?)\nPY/);
+  assert.ok(m, 'sync-version.sh 里找不到 [package] 段内定位的 python 段（H-12 的修法）');
+  const py = m[1];
+  assert.match(py, /\[package\]/, '那段 python 必须显式定位 [package] 段');
+  assert.ok(!/0,\/\^version/.test(py), '那段 python 不该再出现「改第一处」的 sed 语义');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ripple-h12-'));
+  try {
+    const toml = path.join(tmp, 'Cargo.toml');
+    fs.writeFileSync(toml, [
+      '[profile.release]',
+      'version = "0.0.1"',
+      '',
+      '[package]',
+      'name = "ripple-desktop"',
+      'version = "0.0.2"',
+      '',
+      '[dependencies]',
+      'serde = "1"',
+      '',
+    ].join('\n'));
+    const { spawnSync } = require('node:child_process');
+    const r = spawnSync('python3', ['-', toml, '9.9.9'], { input: py, encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, '段内定位那段 python 应当成功：' + (r.stderr || ''));
+    const after = fs.readFileSync(toml, 'utf8');
+    assert.match(after, /\[profile\.release\]\nversion = "0\.0\.1"/,
+      '[profile.release] 的 version 被改动了 —— 这正是 H-12 原文里「写错了表」的症状：\n' + after);
+    assert.match(after, /\[package\][\s\S]*?version = "9\.9\.9"/,
+      '[package].version 没有被改成 9.9.9：\n' + after);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 /* ---------------------------------------------------------------
  * D-03 [high] CI 的版本号断言必须在组装之前（否则恒真）
  * --------------------------------------------------------------- */

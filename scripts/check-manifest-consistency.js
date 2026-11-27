@@ -1040,10 +1040,22 @@ function checkBuildChainGuards() {
   if (cl !== null) {
     checked++;
     const clCode = stripComments(cl);
-    if (!/downloadPoolOf\s*\(/.test(clCode) || !/tagOf\s*\(/.test(clCode)) {
-      fail('CrashLog 的下载目录清理仍只按文件名前缀分池（B-3）：'
+    /*
+     * ⚠️ 判据必须看**函数定义**，不能只看「有没有出现这个名字」。
+     *   第一次写这条时用的是 /downloadPoolOf\s*\(/ —— 把定义行改名后，
+     *   调用点 downloadPoolOf(row[0]) 仍然命中，检查器照样报绿（变异测试抓到的）。
+     *   这类「断言比它以为的宽松」正是本文件存在要防的东西，所以自己也要挨这一刀。
+     */
+    const poolDef = /private\s+static\s+int\s+downloadPoolOf\s*\(\s*String\s+\w+\s*\)\s*\{/.test(clCode);
+    const tagDef = /private\s+static\s+String\s+tagOf\s*\(\s*String\s+\w+\s*,\s*String\s+\w+\s*\)\s*\{/.test(clCode);
+    if (!poolDef || !tagDef) {
+      fail('CrashLog 的下载目录清理没有「按语义 tag 分池」的实现（B-3）：'
+        + '需要 downloadPoolOf(String) 与 tagOf(String,String) 两个方法的定义 —— '
         + '同一前缀里混着真崩溃与 1.3.5 之前的旧格式证据，10 份配额会把历史现场删光'
         + '（真机 101 份 Ripple-crash-* 里那 11 份 lyric-redraw 是 1.3.3 歌词根因的关键证据）');
+    } else if (!/POOL_CRASH/.test(clCode) || !/POOL_LEGACY/.test(clCode)) {
+      fail('CrashLog 的分池没有区分「真崩溃池」与「旧格式证据池」（B-3）：'
+        + '两池必须各有独立配额，否则真崩溃与历史现场仍然互挤');
     }
     if (!/POOL_NONE/.test(clCode)) {
       fail('CrashLog 没有「不属于任何清理池」的判定（B-3）：'
