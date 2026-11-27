@@ -6,6 +6,43 @@ The single source of truth for the version number is `version.json` in the root 
 
 ---
 
+## 1.3.9 — Sixteenth Version
+
+> **Basis**: on a stripped Windows 11 install the owner reported "the lyric overlay won't open, and a
+> cmd black box pops up". Investigation confirmed the WebView2 Runtime *is* installed (registry
+> `pv = 157.0.4341.42`) and the main window renders fine, so the failure is not the runtime — it is the
+> lyric window's own creation path plus an error that was being discarded.
+> **Implementation and docs by**: Deepseek V4.1 Flash.
+
+### Desktop (Windows / Linux share the same code)
+
+- **Fixed the cmd black box on Windows**: added
+  `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`; release builds are now
+  GUI-subsystem and no longer ship a console window
+- **Falls back to an opaque window when the transparent one cannot be created**: stripped Windows
+  builds often remove DWM, so a `transparent(true)` window fails outright. We now try the transparent
+  window first and, on failure, retry with an opaque one (dark background) — slightly less pretty,
+  but it **works**. Only when both attempts fail is it a real failure
+- **Fixed the lyric window failing with "not a single trace left"**: `ensure_lyric_window(...).is_ok()`
+  threw away `Err("failed to create lyric window: {e}")` — including the real system error code.
+  Replaced with a `match` that, on failure, writes a log line (`[LYRIC]` prefix, with the platform)
+  and emits a `lyric-window-error` event
+- **Failures are now visible to the user**: `bridge.js` listens for that event and shows a `warn`
+  toast with the reason, pointing at "Me → App log". This toast is exempt from the in-app
+  notification switch, because an error must always be reported
+- Extracted `log_line_at()` so Rust code itself can write to the log (previously only the
+  `log_write` command could)
+
+### Android
+
+- No changes
+
+### Linux
+
+- Shares the same Rust and frontend as Windows, so it benefits from the three fixes above
+
+---
+
 ## 1.3.8 — Fifteenth Version
 
 > **Basis**: two issues reported by the owner — (1) tapping the status-bar lyric only ever opened

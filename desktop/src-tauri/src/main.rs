@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Ripple 涟漪 · Tauri 桌面客户端入口
 //!
 //! # 设计目标：前端零改动
@@ -93,6 +95,17 @@ struct LyricState {
     /// 窗口是否已成功创建过。创建失败（无合成器 / 无 DISPLAY）时置 false，
     /// 后续 show 直接返回失败而不是反复尝试。
     window_ok: bool,
+    /*
+     * 1.3.9：窗口是否走「降级不透明」形态。
+     *
+     * 透明窗在 Windows 精简版上可能建不出来（DWM 被裁），此时退回不透明窗
+     * 保功能可用。这个标记跟着 lyric_payload 传给 lyric.html，让页面自己
+     * 铺一层深色底 —— 否则不透明窗是 WebView 默认白底，白字直接看不见。
+     *
+     * 放在 state 而不是建窗时一次性塞进 URL：payload 是现成的通道，
+     * 且首帧（页面主动 invoke lyric_overlay_sync）也能拿到，不用额外等事件。
+     */
+    opaque: bool,
 }
 
 /// 一个极小的固定大小工作池（审查 L-11）。
@@ -447,11 +460,18 @@ fn log_file_path(app: &tauri::AppHandle) -> PathBuf {
     dir.join("Ripple-log.txt")
 }
 
-/// 追加一行日志。**失败只打 stderr，不再往文件里写错误** ——
-/// 否则写盘失败会引发「记录写盘失败」的无限递归。
-#[tauri::command]
-fn log_write(app: tauri::AppHandle, line: String) {
-    let path = log_file_path(&app);
+/// 真正落盘的那一层：追加一行（带毫秒时间戳 + 超限轮转）。
+///
+/// 独立成普通函数（而不是只在命令里），是为了让 **Rust 内部**也能写日志。
+///
+/// 为什么需要这个：1.3.8 及以前，歌词窗创建失败的原因在
+/// `ensure_lyric_window(...).is_ok()` 这一句被**整个丢弃** ——
+/// 精心构造的 `Err("歌词窗口创建失败：{e}")` 里带着系统的真实错误码，
+/// 却既没进日志、也没进界面，release 版又没有可见控制台。
+/// 结果就是用户看到「点了开关没反应」，而开发者手上**一条证据都没有**。
+/// 这条排障死路修法只有一条：在错误产生的地方就把它写下来。
+fn log_line_at(app: &tauri::AppHandle, line: &str) {
+    let path = log_file_path(app);
 
     /* 超过上限就先轮转一代，避免日志长成几百 MB 把用户磁盘吃满 */
     if let Ok(meta) = std::fs::metadata(&path) {
@@ -480,6 +500,13 @@ fn log_write(app: tauri::AppHandle, line: String) {
         }
         Err(e) => eprintln!("[log] 写日志失败（{}）：{e}", path.display()),
     }
+}
+
+/// 追加一行日志。**失败只打 stderr，不再往文件里写错误** ——
+/// 否则写盘失败会引发「记录写盘失败」的无限递归。
+#[tauri::command]
+fn log_write(app: tauri::AppHandle, line: String) {
+    log_line_at(&app, &line);
 }
 
 /// 把当前日志文件路径报给前端（前端启动时取一次并缓存）。
@@ -589,6 +616,12 @@ fn lyric_payload(st: &LyricState) -> serde_json::Value {
         "lineDur": st.line_dur,
         "rate": st.rate,
         "playing": st.playing,
+        /*
+         * 1.3.9：窗口是不是降级的不透明形态。
+         * 页面据此决定要不要自己铺一层深色底 —— 透明窗铺底等于白做，
+         * 不透明窗不铺底则是白底白字（看不见）。
+         */
+        "opaque": st.opaque,
     })
 }
 
@@ -629,18 +662,83 @@ fn save_lyric_pos(dir: &std::path::Path, x: i32, y: i32) {
 /// 三个平台都能走到，但 Linux 上没有合成器时透明窗口可能创建失败 ——
 /// 那种情况下把 window_ok 置 false 并返回 Err，调用方据此让前端走降级路径
 /// （前端所有 RippleNative 调用点都有 typeof 判空，返回失败不会崩）。
-fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), String> {
+fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<bool, String> {
     if app.get_webview_window(LYRIC_WINDOW).is_some() {
-        return Ok(());
+        /* 窗口已存在：沿用它在 state 里记录的形态，不要凭猜测重算 */
+        return Ok(st.opaque);
     }
+
+    /*
+     * 1.3.9 修复（Windows 11 精简版上「歌词小窗点不开」的真凶）：
+     *
+     * 先按原本的样子建「透明 + 无边框 + 置顶」的窗口。这条路在 Windows 上
+     * 走的是 DwmEnableBlurBehindWindow + WebView2 合成控制器的组合，是
+     * 已知最容易失败的一条 —— 精简版系统常常裁掉 DWM 组件、关掉透明效果，
+     * 于是 build() 直接返回 Err。1.3.8 及以前这个 Err 被 .is_ok() 吞掉，
+     * 用户看到的只有「点了开关没反应」。
+     *
+     * 现在分两步走：**透明窗失败就退一步，用不透明窗再建一次**。
+     *   · 透明成功 → 跟以前一样，文字直接浮在桌面上（最好看）
+     *   · 透明失败 → 退成带深色底的不透明窗（难看一点，但**能用**），
+     *     并让 lyric.html 知道要自己去铺底（见 fallback 参数）
+     * 只有两步都失败才算真失败，那时才写日志 + 弹 toast。
+     *
+     * 为什么值得这样退让：歌词窗的核心价值是「在别的程序前面显示歌词」，
+     * 透明只是观感。为了观感让整个功能不可用，是本末倒置。
+     */
+    match build_lyric_window(app, st, true) {
+        Ok(()) => Ok(false), // 透明成功 = 非降级
+        Err(first_err) => {
+            log_line_at(
+                app,
+                &format!(
+                    "[LYRIC] 透明歌词窗创建失败，降级为不透明窗重试：{first_err}（平台 {}）",
+                    std::env::consts::OS
+                ),
+            );
+            match build_lyric_window(app, st, false) {
+                Ok(()) => {
+                    log_line_at(
+                        app,
+                        "[LYRIC] 已降级为不透明窗（功能可用，仅少了桌面透明观感）",
+                    );
+                    /*
+                     * 返回「是不是降级形态」而不是在这里改 state：
+                     * 本函数拿不到 State（它只收 AppHandle），
+                     * 硬塞一个全局锁反而多一处要维护的状态。
+                     * 由调用方（lyric_overlay_show）把它写进 LyricState，
+                     * 再随 payload 传给页面。
+                     */
+                    Ok(true)
+                }
+                Err(second_err) => Err(i18n::tf(
+                    "透明窗与不透明窗都创建失败：{a} / {b}",
+                    "Both the transparent and opaque lyric windows failed: {a} / {b}",
+                    &[("a", first_err), ("b", second_err)],
+                )),
+            }
+        }
+    }
+}
+
+/// 建一次歌词窗。`transparent` 为 false 时走降级形态。
+///
+/// 拆成独立函数而不是在一个大函数里写两遍，是因为两次尝试**除了透明
+/// 与背景色之外必须完全一致**（尺寸、置顶、不抢焦点、位置恢复逻辑）。
+/// 复制粘贴两份的话，以后改一处忘另一处就会变成「透明版有某个修复、
+/// 降级版没有」这种极难发现的偏差。
+fn build_lyric_window(
+    app: &tauri::AppHandle,
+    st: &LyricState,
+    transparent: bool,
+) -> Result<(), String> {
     let data_dir = app
         .path()
         .app_config_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
     let pos = read_lyric_pos(&data_dir);
 
-    // 不再需要 mut：位置改到建完窗口后统一落（见下方 M-15 注释）
-    let builder = tauri::WebviewWindowBuilder::new(
+    let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         LYRIC_WINDOW,
         tauri::WebviewUrl::App("lyric.html".into()),
@@ -651,9 +749,12 @@ fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), St
     .inner_size(360.0, 64.0)
     .min_inner_size(120.0, 32.0)
     .decorations(false)
-    /* 透明底：让文字直接浮在桌面上。没有合成器时会退化成黑底，
-    但文字仍然可读（lyric.html 自己也画了一层深色描边兜底）。 */
-    .transparent(true)
+    /*
+     * 透明底：让文字直接浮在桌面上。降级形态（transparent=false）时
+     * 不透明，并且给一个深色背景 —— 否则是一个纯白/纯黑的裸窗。
+     * 用 #0b0b12 跟主题暗底接近，白字依然清晰。
+     */
+    .transparent(transparent)
     .always_on_top(true)
     .skip_taskbar(true)
     /* 不抢焦点：用户正在别的程序里打字时，弹一句歌词不该把光标抢走 */
@@ -662,6 +763,14 @@ fn ensure_lyric_window(app: &tauri::AppHandle, st: &LyricState) -> Result<(), St
     .shadow(false)
     .visible_on_all_workspaces(true)
     .accept_first_mouse(true);
+
+    /*
+     * 降级窗铺一层深色底，避免 WebView 默认白底刺眼。
+     * (u8,u8,u8) → Color 是 tauri-utils 提供的 From 实现，不引入额外依赖。
+     */
+    if !transparent {
+        builder = builder.background_color((11u8, 11u8, 18u8).into());
+    }
 
     /*
      * M-15：这里**不再**给 builder.position()。
@@ -787,9 +896,45 @@ fn lyric_overlay_show(
 
     // 首次创建窗口。失败就如实返回 false，前端会走降级。
     if !guard.window_ok || app.get_webview_window(LYRIC_WINDOW).is_none() {
-        guard.window_ok = ensure_lyric_window(&app, &guard).is_ok();
-        if !guard.window_ok {
-            return false;
+        /*
+         * 1.3.9 修复（Windows 11 上「点了开关没反应」的排障死路）：
+         *
+         * 这里以前是 `ensure_lyric_window(...).is_ok()` —— 只留一个 bool，
+         * 把 `Err("歌词窗口创建失败：{e}")` 里那份**系统真实错误码整个丢掉**。
+         * 后果：日志里没有一行、界面上一句提示都没有、release 版又没有
+         * 可见控制台，于是「窗口为什么建不出来」在用户机器上永远查不到。
+         *
+         * 改成 match 后：成功照旧，失败时先写日志（用户能通过
+         * 「我的 → 软件日志」把它发出来），再由前端弹 toast。
+         * 这样同一个 bug 下次出现时，第一手信息就是错误原文。
+         */
+        match ensure_lyric_window(&app, &guard) {
+            Ok(opaque) => {
+                guard.window_ok = true;
+                /*
+                 * 记住这次是用哪种形态建出来的。降级窗（opaque=true）需要
+                 * 页面自己铺深色底，否则白字在白底 WebView 上看不见。
+                 * 存进 state 是为了重连（切歌、改样式）时不必重新判断。
+                 */
+                guard.opaque = opaque;
+            }
+            Err(e) => {
+                guard.window_ok = false;
+                log_line_at(
+                    &app,
+                    &format!(
+                        "[LYRIC] 歌词窗口创建失败：{e}（平台 {} / 透明窗+置顶+无边框组合）",
+                        std::env::consts::OS
+                    ),
+                );
+                /*
+                 * 同时推给前端：用户点开关是为了「看到歌词」，
+                 * 静默失败会让他以为是自己点错了或 App 卡住了。
+                 * 事件名与 bridge.js 里监听的一致。
+                 */
+                let _ = app.emit("lyric-window-error", e);
+                return false;
+            }
         }
         // 新建的窗口还没加载完页面，此时 emit 会被丢掉 ——
         // lyric.html 自己会在加载完成后主动 invoke 一次 lyric_overlay_sync

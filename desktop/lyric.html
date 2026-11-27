@@ -39,6 +39,13 @@
    */
   html,body{margin:0;padding:0;background:transparent;overflow:hidden;
     width:100%;height:100%;}
+  /*
+   * 降级形态（1.3.9）：Windows 精简版上透明合成可能建不出来，
+   * Rust 会退回不透明窗口。那时窗口有底色，页面再"透明"就是白底白字 ——
+   * 所以由 Rust 通过 opaque 字段通知，这里补一层深色底。
+   * 与 Rust 侧 background_color(11,11,18) 保持一致，避免闪一下变白。
+   */
+  html.opaque,html.opaque body{background:#0b0b12;}
   body{
     display:flex;align-items:center;justify-content:center;
     /*
@@ -124,6 +131,22 @@
 
   var invoke = TAURI.core.invoke;
   var el = document.getElementById('t');
+
+  /*
+   * 1.3.9：切换「降级不透明」形态。
+   *
+   * Rust 侧建透明窗失败时会退回不透明窗，并在状态里把 opaque 置 true。
+   * 不透明窗有底色，页面若不铺底就是白底 + 白字，等于看不见 ——
+   * 所以这里按状态给 <html> 加/去 opaque 类（样式见文件开头的 CSS）。
+   *
+   * 做成幂等且可逆：两种形态切换时不残留（虽然目前同一会话只会是一种，
+   * 但留成可逆的写法以后换形态不用再改这里）。
+   */
+  function applyOpaque(on) {
+    if (document.documentElement) {
+      document.documentElement.classList.toggle('opaque', !!on);
+    }
+  }
 
   /* 当前状态。初值与 Rust 侧 LyricState::default() 对齐。 */
   var st = {
@@ -284,6 +307,8 @@
       if (typeof d.lineDur === 'number') st.lineDur = d.lineDur;
       if (typeof d.rate === 'number') st.rate = d.rate;
       if (typeof d.playing === 'boolean') st.playing = d.playing;
+      /* 降级形态标记（见 applyOpaque）。每次全量推都带上，所以不必单独记 */
+      if (typeof d.opaque === 'boolean') applyOpaque(d.opaque);
       render();
     }).catch(function () { /* 事件系统不可用时静默降级 */ });
   }
@@ -299,6 +324,11 @@
       if (d[k] !== undefined && d[k] !== null) st[k] = d[k];
     });
     if (typeof d.baseProgress === 'number') { st.baseP = d.baseProgress; st.baseAt = performance.now(); }
+    /*
+     * 首帧也要应用：页面加载完自己 invoke 的这次，是降级窗唯一
+     * 「确定的」一次拿到 opaque 的机会（Rust 推送可能比页面起来更早被丢掉）。
+     */
+    if (typeof d.opaque === 'boolean') applyOpaque(d.opaque);
     render();
   }).catch(function () { render(); });
 

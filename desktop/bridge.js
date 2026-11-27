@@ -378,6 +378,65 @@
    */
   g.RippleNative = bridge;
 
+  /* ================= 歌词窗创建失败 → 用户可见的提示 =================
+   *
+   * 1.3.9 之前这条链路是这样断的：
+   *   Rust：`ensure_lyric_window(...).is_ok()` 把 Err 丢掉 → 无日志
+   *   JS  ：失败只 `console.warn` → release 版没有可见控制台
+   *   界面：开关拨上去了，但什么都没发生
+   *
+   * 用户因此只能得出「点了没反应」这个结论，连自己是不是点错了都不知道。
+   * 1.3.9 起 Rust 会在失败时 emit `lyric-window-error`（并同时写日志），
+   * 这里把它接住、弹一条 warn toast，把**真实原因**直接摊给用户看。
+   *
+   * 为什么放在 bridge.js 而不是 app.js：
+   *   事件名只有 Rust 与这里两处知道，它们是同一件事的两端，放在一起
+   *   才不会出现「改了 Rust 忘了改 JS」这种断链。app.js 只是被调用方。
+   *
+   * 为什么用 RippleApp.toast 而不是自己画一个：
+   *   顶栏 toast 已经处理了「设置里关掉软件内通知」「同时最多 3 条」
+   *   「连续相同内容去重」这些细节，再造一套只会分裂行为。
+   *   注意 toast 对 warn 类型**不受** inAppToast 开关影响（见 app.js 注释），
+   *   正是「出错必须告诉用户」这条原则。
+   */
+  function reportLyricWindowError(reason) {
+    const ty = (reason == null ? '' : String(reason)).trim();
+    try {
+      const app = g.RippleApp;
+      if (app && typeof app.toast === 'function') {
+        /*
+         * 第三个参数 'warn' 不能省：app.js 的 toast 在入口处统一拦
+         * 「设置 → 软件内通知」关掉的情况，但显式排除 warn/check
+         * —— 出错必须告诉用户。少了它，关过通知的用户就看不到这条。
+         */
+        app.toast(
+          '歌词小窗未能创建',
+          ty
+            ? ty + '（详细原因已写入日志，可在「我的 → 软件日志」查看）'
+            : '详细原因已写入日志，可在「我的 → 软件日志」查看',
+          'warn'
+        );
+        return;
+      }
+    } catch (e) {
+      /* toast 本身出错不能反过来把这里也变成静默失败 */
+    }
+    /*
+     * 兜底：app.js 还没跑（极早期失败）。此时 console 至少留下了现场，
+     * 而日志里已经有 Rust 写的那一行 —— 两条路都不会完全丢信息。
+     */
+    console.warn('[ripple] 歌词小窗创建失败：', ty || '(无原因)');
+  }
+
+  (function listenLyricWindowError() {
+    const ev = TAURI.event;
+    if (!ev || typeof ev.listen !== 'function') return;
+    /* listen 返回 Promise；失败只影响提示，不影响主流程，所以安静吞掉 */
+    ev.listen('lyric-window-error', (e) => {
+      reportLyricWindowError(e && e.payload);
+    }).catch(function () {});
+  })();
+
   /* ================= 窗口按钮（融进顶栏） =================
    *
    * 为什么需要它：tauri.conf.json 里设了 decorations:false（关掉系统标题栏），
