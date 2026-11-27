@@ -126,9 +126,29 @@ public class PlaybackService extends Service {
                     return;
                 }
                 long idle = System.currentTimeMillis() - lastReportAt;
+                /*
+                 * 审查 1.3.8 · M-14：sink 为 null **不等于**「没人要这个服务」。
+                 *
+                 * sink 是 WeakReference<MainActivity>，Activity 被系统回收
+                 * （内存紧张 / 多任务里被划走）后它就自动变 null —— 但播放
+                 * 可能还在继续，网页线程也还在每秒上报。以前这里只看
+                 * 「sink == null 且 idle 够久」，于是 Activity 一被回收，
+                 * 5 秒后服务自杀、通知消失：用户看到「后台播放被杀了」，
+                 * 实际上是 App 自己收的。
+                 *
+                 * 现在多一道判据：**只要还在播放就不自杀**。
+                 * 真正的「用户退出」由 MainActivity.onDestroy 的 userExiting
+                 * 分支显式调 stopAndQuit() 收尾（M-15 已改），服务不需要
+                 * 靠超时来猜测用户意图。
+                 */
+                if (playing) {
+                    lastReportAt = System.currentTimeMillis();
+                    main.postDelayed(this, IDLE_EXIT_MS);
+                    return;
+                }
                 if (lastReportAt > 0 && idle >= IDLE_EXIT_MS) {
                     LogBridge.add(PlaybackService.this, "MEDIA",
-                            "无人上报且无控制端，自动退出（idle=" + idle + "ms）");
+                            "无人上报且无控制端且未在播放，自动退出（idle=" + idle + "ms）");
                     stopAndQuit();
                     return;
                 }
@@ -298,6 +318,23 @@ public class PlaybackService extends Service {
                 CrashLog.recordAsync(this, "media-update", e);
             }
         });
+    }
+
+    /**
+     * 当前是否正在播放。
+     *
+     * 审查 1.3.8 · M-15 需要它：MainActivity.onDestroy() 要区分
+     * 「用户真的退出了」与「系统把 Activity 回收了但播放还在继续」——
+     * 判据就是这条。以前 onDestroy 无条件 stopService，于是
+     * 后台播放被系统回收 Activity 时，通知与控制入口一起消失，
+     * 用户看到的是「后台播放被杀了」。
+     *
+     * 只读 volatile 之外的字段，必须回主线程读：playing 是主线程写的普通字段。
+     * 这里做成同步 getter 会跨线程读非 volatile 字段 —— 所以直接在主线程调用
+     * （onDestroy 就在主线程）。
+     */
+    public boolean isPlaying() {
+        return playing;
     }
 
     /** 只更新进度（每秒一次），成本更低 */

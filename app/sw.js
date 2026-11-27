@@ -47,6 +47,24 @@ self.addEventListener('install', (e) => {
       if (bad.length) {
         console.warn('[sw] 预缓存失败 ' + bad.length + ' 项（其余已缓存）：', bad);
       }
+      /*
+       * ★ 全部失败时**放弃这次安装**（审查 1.3.8 的 H-2）。
+       *
+       * 逐个 catch 把「某项 404」降级成「这个文件没进缓存」是对的，
+       * 但它有个没被想到的副作用：caches.open(CACHE) 会**先**建出一个
+       * 空缓存，于是即使 SHELL 里每一项都失败，install 也照样 resolve →
+       * skipWaiting() → activate 把上一份**完整**的缓存删掉。
+       * 结果比 addAll 时代更糟：以前是「装不上，旧的继续用」，
+       * 现在是「装上了，但缓存是空的」。
+       *
+       * 全部失败 = 这次安装没有任何可用内容（最典型是首次安装就断网），
+       * 那就让 install reject：新 SW 不激活，旧 SW 与旧缓存继续服务。
+       * 抛错的代价只是「这次没升级」，下一次打开会自然重试。
+       */
+      if (bad.length === SHELL.length) {
+        throw new Error('[sw] 预缓存全部失败（' + bad.length + '/' + SHELL.length
+          + '），放弃本次安装，保留旧缓存：' + bad.join(', '));
+      }
       return self.skipWaiting();
     })
   );
@@ -57,9 +75,41 @@ self.addEventListener('message', (e) => {
   if (e.data === 'SKIP_WAITING') { self.skipWaiting(); }
 });
 
+/*
+ * activate 只删**比当前版本旧**的缓存（审查 1.3.8 的 H-2）。
+ *
+ * 以前是无条件删掉一切非当前名的缓存。配合 install 那条「部分失败也算成功」，
+ * 升级时就可能出现：新缓存残缺 + 旧缓存被删光，用户手里一份能用的都没有。
+ * 现在按缓存名里的 versionCode 比大小：只清掉序号更小的。
+ *
+ * 名字规则（CACHE 由 android/sync-version.sh 注入为 ripple-<versionCode>）：
+ *   ripple-139  → 序号 139
+ *   解析不出序号的（更早版本的 ripple-v20 之类）→ 当作最旧，删掉。
+ * 万一存在**更高**序号的缓存（用户刚降级安装过），那个也不动 ——
+ * 它可能是这次要回退到的目标，删了就没有退路了。
+ */
+function cacheSeq(name) {
+  const m = /^ripple-(\d+)$/.exec(String(name || ''));
+  return m ? Number(m[1]) : -1;
+}
+const CUR_SEQ = cacheSeq(CACHE);
+
+/*
+ * 当前缓存名解不出序号时（理论上不该发生：CACHE 由构建脚本注入），
+ * 退回老行为「非当前名一律删」。宁可多删一份同级缓存，也不能让
+ * 缓存无限堆积 —— 名字都对不上的时候我们没法判断新旧，保守清理。
+ */
+function shouldDelete(name) {
+  if (name === CACHE) return false;
+  if (CUR_SEQ < 0) return true;
+  return cacheSeq(name) < CUR_SEQ;
+}
+
 self.addEventListener('activate', (e) => {
   e.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+    caches.keys().then((keys) => Promise.all(keys
+      .filter(shouldDelete)
+      .map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -114,7 +164,27 @@ self.addEventListener('fetch', (e) => {
          * 完全指不出「离线且没缓存」这个真实原因。这类资源「要么给真身、
          * 要么明确失败」，统一回 504，和下面音频/图片的处理保持一致。
          */
-        if (isDoc) return caches.match('./index.html');
+        /*
+         * 文档兜底：缓存里没有 index.html 时**必须给一个真的 Response**
+         * （审查 1.3.8 的 M-1）。
+         *
+         * CacheStorage.match() 未命中时 resolve 成 undefined（既不 reject，
+         * 也不是 null）—— 直接把它交给 respondWith() 会让浏览器抛
+         * TypeError: The provided value is not of type 'Response'，
+         * 用户看到的是浏览器默认错误页，而不是「离线」这件事本身。
+         * 典型触发路径：首次安装就断网（预缓存全失败）+ 之后又离线打开。
+         * 这里给一个 503 的自绘离线页：至少说清楚发生了什么。
+         */
+        if (isDoc) {
+          return caches.match('./index.html').then((html) => html || new Response(
+            '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            + '<title>Ripple</title><body style="margin:0;min-height:100vh;display:flex;align-items:center;'
+            + 'justify-content:center;background:#07070B;color:#EDEDF2;font:16px/1.6 system-ui,sans-serif">'
+            + '<div style="text-align:center;padding:24px"><b>当前处于离线状态</b>'
+            + '<p style="opacity:.7;margin:8px 0 0">页面还没缓存下来，联网后重新打开即可。</p></div></body>',
+            { status: 503, statusText: 'Offline', headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+          ));
+        }
         return new Response('', { status: 504, statusText: 'Offline' });
       }))
     );

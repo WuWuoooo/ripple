@@ -246,20 +246,65 @@ print(json.load(open(sys.argv[1],encoding='utf-8')).get('version',''))
 fi
 
 if [ -f "$ROOT/desktop/src-tauri/Cargo.toml" ]; then
+  #
+  # B-4 / H-12（审查 1.3.8）：**写入侧本身也踩了 B-1 那个坑**。
+  #
+  # 这里原来是 `sed "0,/^version = \"[0-9.]*\"/s//version = \"$VN\"/"` ——
+  # `0,/re/` 是「从文件开头到第一次命中」，也就是**改文件第一处** version 键。
+  # Cargo.toml 里只要 [package] 之前还有别的带 version 的表
+  # （[profile.release] / [workspace.metadata] / [[bin]] …），版本号就写进了
+  # 错误的表，而 [package].version 纹丝不动 —— Tauri 打包实际用的正是后者，
+  # 于是发出去的桌面安装包版本是旧的，而 CI 三处检查同时报绿。
+  #
+  # 修法与 desktop/build-frontend.sh 的 sync_toml() 完全一致：
+  # **先用 python 切出 [package] 段，再只在该段内替换 version**。
+  # 下面的内联断言同样改成段内读取 —— 否则它读的仍是第一处，
+  # 「写错表 + 恰好读到刚写对的那个」→ 断言恒真，等于没有。
   CT="$ROOT/desktop/src-tauri/Cargo.toml"
-  _old="$(cat "$CT")"
-  _new="$(printf '%s\n' "$_old" | sed "0,/^version = \"[0-9.]*\"/s//version = \"$VN\"/")"
-  if [ "$_old" = "$_new" ]; then
-    echo "      Cargo.toml: 已是最新，未改动"
-  else
-    printf '%s\n' "$_new" > "$CT"
-    echo "      Cargo.toml: 已同步"
+  if ! python3 - "$CT" "$VN" <<'PY'
+import re
+import sys
+
+path, ver = sys.argv[1], sys.argv[2]
+src = open(path, encoding='utf-8').read()
+m = re.search(r'^\[package\]([\s\S]*?)(?=^\[)', src, re.M)
+if not m:
+    sys.exit('Cargo.toml 里找不到 [package] 段')
+seg = m.group(1)
+new_seg, n = re.subn(r'(?m)^(version\s*=\s*)"[^"]*"', r'\1"%s"' % ver, seg, count=1)
+if n == 0:
+    sys.exit('Cargo.toml 的 [package] 段里没有 version 行')
+if new_seg == seg:
+    print('      Cargo.toml: 已是最新，未改动')
+    sys.exit(0)
+open(path, 'w', encoding='utf-8').write(src[:m.start(1)] + new_seg + src[m.end(1):])
+print('      Cargo.toml: 已同步')
+PY
+  then
+    echo "❌ Cargo.toml 的 [package] 段处理失败（文件格式变了？）" >&2
+    exit 1
   fi
-  # 断言：[package] 段的 version 必须真的等于 $VN，否则说明格式变了、sed 没命中
-  _cv="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' "$CT" | head -1)"
+  #
+  # 断言：从 **[package] 段内**回读 version，必须等于 $VN。
+  # 不能用 `sed -n 's/^version = "..."' | head -1` —— 那是「读第一处」，
+  # 与「写第一处」共用同一个错误判据，断言恒等于改写结果（H-12 原文）。
+  #
+  _cv="$(python3 - "$CT" <<'PY'
+import re
+import sys
+
+src = open(sys.argv[1], encoding='utf-8').read()
+m = re.search(r'^\[package\]([\s\S]*?)(?=^\[)', src, re.M)
+if not m:
+    print('')
+    sys.exit(0)
+v = re.search(r'(?m)^version\s*=\s*"([^"]*)"', m.group(1))
+print(v.group(1) if v else '')
+PY
+)"
   if [ "$_cv" != "$VN" ]; then
     echo "❌ Cargo.toml 的 [package] version 同步失败（得到 '${_cv:-空}'，期望 '$VN'）" >&2
-    echo "   文件格式变了？请检查 android/sync-version.sh 里的 sed 表达式。" >&2
+    echo "   注意：这里读的是 [package] 段内，不是文件第一处 version（B-4 / H-12）。" >&2
     exit 1
   fi
 fi
@@ -294,10 +339,31 @@ fi
 # 而那些断言与「写」共用同一个判据 —— 一旦判据本身就错了（B-1 就是这种），
 # 写完+自检会一起报绿。scripts/version-facts.js 是**独立实现**
 # （尤其 Cargo.toml 走段内定位），用它复核才是真正的外部校验。
-if [ -f "$ROOT/scripts/version-facts.js" ] && command -v node >/dev/null 2>&1; then
-  if ! node "$ROOT/scripts/version-facts.js" --assert; then
-    echo "❌ 版本副本复核失败（scripts/version-facts.js --assert）" >&2
-    exit 1
-  fi
+#
+# B-4（审查 1.3.8）：这段复核以前是**静默跳过**的 ——
+#   if [ -f "$ROOT/scripts/version-facts.js" ] && command -v node >/dev/null 2>&1; then
+# 文件不存在、或者机器上没有 node，整个外部校验就消失了，脚本照旧 exit 0，
+# 产出一个版本号可能对不上的包。这与 R-27「解析失败必须报错退出」的精神相反：
+# 它不是「没有 node 也能跑」，而是「没有 node 就没人验证」。
+#
+# 现在改成**硬失败**，并区分两种缺法给出各自的修法提示。
+# 需要跳过同步的人本来就有 SKIP_VERSION_SYNC=1（脚本开头就处理了），
+# 不需要再留一个「悄悄不校验」的旁路。
+if [ ! -f "$ROOT/scripts/version-facts.js" ]; then
+  echo "❌ 缺少 scripts/version-facts.js（版本号的唯一解析器）—— 拒绝跳过复核" >&2
+  echo "   它是「版本副本一致性」的外部校验：没有它，本脚本的内联断言" >&2
+  echo "   与写入共用同一个判据，写完+自检会一起报绿（B-1 / B-4 的形态）。" >&2
+  echo "   请从仓库恢复该文件；确实要跳过整个同步请用 SKIP_VERSION_SYNC=1。" >&2
+  exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+  echo "❌ 找不到 node —— scripts/version-facts.js --assert 无法运行，拒绝跳过复核" >&2
+  echo "   本仓库的构建入口都要求 node（server.js / 测试 / 检查器都用它）。" >&2
+  echo "   请安装 node 后重跑；确实要跳过整个同步请用 SKIP_VERSION_SYNC=1。" >&2
+  exit 1
+fi
+if ! node "$ROOT/scripts/version-facts.js" --assert; then
+  echo "❌ 版本副本复核失败（scripts/version-facts.js --assert）" >&2
+  exit 1
 fi
 exit 0

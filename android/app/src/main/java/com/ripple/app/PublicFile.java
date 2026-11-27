@@ -57,36 +57,54 @@ final class PublicFile {
             Uri existing = null;
             if (overwrite) {
                 /*
-                 * L-15：查询必须同时限定 RELATIVE_PATH 与创建者。
+                 * B-3（审查 1.3.8）：这段查询**不能**把 RELATIVE_PATH 写进 selection，
+                 * 也不能要求 OWNER_PACKAGE_NAME 一定等于本包名。
                  *
-                 * 以前只按 DISPLAY_NAME 全局查 —— 用户在公共下载目录里
-                 * 手工放一个同名文件（比如自己建的 Ripple-log.txt）也会被命中，
-                 * 于是 existing 指向**别人的文件**，openOutputStream 在
-                 * Android 11+ 抛 SecurityException，被最外层 catch(Throwable) 吞掉，
-                 * 返回空串 → 调用方以为写成功了，实际日志静默丢失。
+                 * 1.3.6 修 L-15 时加了两个条件，结果把「覆盖写」彻底变成了「每次新建」：
+                 *   ① selection 里带 RELATIVE_PATH = "Download" ——
+                 *      MediaStore 实际存的是 "Download/"（带结尾斜杠），
+                 *      个别 ROM 还会存成子目录形态，等值比较直接命不中；
+                 *   ② 只在 who != null 且等于本包名时才复用 ——
+                 *      OWNER_PACKAGE_NAME 是 API 29 才引入的列，**大量 ROM 对自家
+                 *      创建的文件也返回 null**，于是 existing 永远是 null。
+                 * 两者任一成立 → 每次都 cr.insert() → MediaStore 遇同名自动改名
+                 * Ripple-log (1).txt、(2).txt… → 真机上实测已积 32 份 Ripple-log、
+                 * 32 份 Ripple-trace、101 份 Ripple-crash，日志彻底碎掉；
+                 * 而 LogBridge 记下的展示路径还停在 "Download/Ripple-log.txt"，
+                 * 设置页「查看日志」打开的还是个错误文件。
                  *
-                 * 现在多查一列 OWNER_PACKAGE_NAME：只有确实是本应用创建的文件
-                 * 才复用（覆盖写）；否则 existing 保持 null，走 insert ——
-                 * MediaStore 遇到同名会自动改名（如 Ripple-log (1).txt），
-                 * 既不碰别人的文件，自己的日志也一定落得下来。
+                 * 现在的判据：
+                 *   · 只按 DISPLAY_NAME 查（同名候选，跨目录，由下面的 sameDir 再筛）；
+                 *   · 逐条遍历而不是只看第一条 —— 公共下载目录里可能既有别人的
+                 *     同名文件、又有我们自己上次留下的那份，取第一条会取错；
+                 *   · sameDir = 该条目的 RELATIVE_PATH 归一后确实是下载目录根
+                 *     （兼容带/不带结尾斜杠、大小写，以及 null）；
+                 *   · owner 为 null（老系统 / ROM 不填）时**允许复用** ——
+                 *     这是本次修复的关键：把 null 当成「可能是自己的」，
+                 *     而不是当成「一定不是自己的」；
+                 *   · owner 非空且不等于本包名 → 明确是别人的文件，跳过（L-15 的初衷）；
+                 *   · 一个都命不中才 insert。
                  */
                 final String owner = ctx.getPackageName();
                 final String dir = Environment.DIRECTORY_DOWNLOADS;
                 Cursor c = cr.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                         new String[]{
                                 MediaStore.MediaColumns._ID,
+                                MediaStore.MediaColumns.RELATIVE_PATH,
                                 MediaStore.MediaColumns.OWNER_PACKAGE_NAME},
-                        MediaStore.MediaColumns.DISPLAY_NAME + "=? AND "
-                                + MediaStore.MediaColumns.RELATIVE_PATH + "=?",
-                        new String[]{name, dir}, null);
+                        MediaStore.MediaColumns.DISPLAY_NAME + "=?",
+                        new String[]{name}, null);
                 if (c != null) {
                     try {
-                        if (c.moveToFirst()) {
-                            String who = c.isNull(1) ? null : c.getString(1);
-                            /* null（老系统或非本应用写入的条目）一律不复用，宁可多建一个 */
-                            if (who != null && who.equals(owner)) {
+                        while (c.moveToNext()) {
+                            String rp = c.isNull(1) ? null : c.getString(1);
+                            String who = c.isNull(2) ? null : c.getString(2);
+                            if (!sameDir(rp, dir)) continue;
+                            /* owner 为 null：老系统 / ROM 没填 → 可能是我们自己的，复用 */
+                            if (who == null || who.equals(owner)) {
                                 existing = ContentUris.withAppendedId(
                                         MediaStore.Downloads.EXTERNAL_CONTENT_URI, c.getLong(0));
+                                break;
                             }
                         }
                     } finally {
@@ -113,6 +131,27 @@ final class PublicFile {
         } catch (Throwable e) {
             return "";
         }
+    }
+
+    /**
+     * 判断一条 MediaStore 记录的 RELATIVE_PATH 是否就在「下载」目录根下。
+     *
+     * 为什么要写这段而不是直接字符串比较：RELATIVE_PATH 的落库形态并不统一 ——
+     * 官方约定是目录名 + 结尾斜杠（"Download/"），但实测有 ROM 存成 "Download"，
+     * 个别实现还会带上外置存储卷前缀。用等值比较就是 B-3 的直接诱因之一。
+     *
+     * 这里只认「就是下载目录根」这一种情况（排除 "Download/子目录/"），
+     * 因为本类只往下载目录根写文件；归一后仍不同的交给调用方 insert 新条目。
+     */
+    private static boolean sameDir(String relativePath, String expectedDir) {
+        if (relativePath == null || expectedDir == null) return false;
+        String rp = relativePath.trim().replace('\\', '/');
+        /* 先统一去掉首尾斜杠："Download/" / "/Download/" → "Download" */
+        while (rp.endsWith("/")) rp = rp.substring(0, rp.length() - 1);
+        while (rp.startsWith("/")) rp = rp.substring(1);
+        /* 绝对形态（"storage/emulated/0/Download"）：只留最后一段再比 */
+        if (rp.indexOf('/') >= 0) rp = rp.substring(rp.lastIndexOf('/') + 1);
+        return rp.equalsIgnoreCase(expectedDir);
     }
 
     /** 兜底：应用专属外部目录（卸载 App 时一起清掉，不需要权限） */

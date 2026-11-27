@@ -763,6 +763,23 @@ public class LyricOverlay {
             progress = 0f;
             /* 浮层没了就停掉自驱动，避免后台空转重绘耗电 */
             stopTick();
+            /*
+             * 审查 1.3.8 · M-9：120ms 防抖的样式推送必须一起撤掉。
+             *
+             * 病灶：用户在样式页拖完色相条、**在 120ms 内**点 ✕ 关闭浮层，
+             * stylePusher 已经在队列里等着了。hide() 以前只清了 bar/dots 列表，
+             * 没清 styleDirty 也没 removeCallbacks —— 于是 120ms 后那个
+             * Runnable 照常执行，把**已经关掉的浮层**的颜色写进设置并 Store.save()。
+             * 用户看到的现象是「我没动设置，设置自己变了」。
+             *
+             * 两件事都要做：
+             *   · removeCallbacks —— 撤掉已经排进队列的那一次；
+             *   · styleDirty = false —— 万一有别的路径绕过了 removeCallbacks
+             *     （比如队列里已经有一份正在执行的副本），风格推送的守卫
+             *     会看到 dirty 为 false 直接早退，不会再写盘。
+             */
+            main.removeCallbacks(stylePusher);
+            styleDirty = false;
         });
     }
 

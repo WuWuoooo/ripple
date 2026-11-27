@@ -100,8 +100,23 @@
     /* 顺手把选择广播出去，设置页/别的脚本想知道当前档位时读这个属性即可 */
     root.setAttribute('data-perf', low ? 'low' : 'high');
     if (changed) {
+      /*
+       * ⚠️ 必须派发到 **document**，不是 window（审查 1.3.8 的 H-1）。
+       *
+       * DOM 事件的传播方向只有「target → 祖先」这一条，**不会向下**
+       * 传给子节点。window.dispatchEvent() 的 target 就是 window，
+       * 它只触发 window 自己的监听器；挂在 document 上的监听器永远收不到。
+       * 而 app.js 的监听器当初就是加在 document 上的（见那里的注释），
+       * 两边目标对象不一致 —— 这条「降级通知」通路从上线起从未生效过：
+       * 自动降级后 html.perf-low 挂上了、毛玻璃也关了，但 html.lyr-blur
+       * 还留着，每一行歌词仍是一个独立的 filter:blur 合成层，
+       * 低配降级省下的那笔开销又原样花了回来。
+       *
+       * 顺带把「自定义事件一律在 document 上派发与监听」定为约定，
+       * 免得下次又在两个目标之间各写一半。
+       */
       try {
-        g.dispatchEvent(new g.CustomEvent('ripple:perf', { detail: { low: low } }));
+        (g.document || document).dispatchEvent(new g.CustomEvent('ripple:perf', { detail: { low: low } }));
       } catch (e) {}
     }
     return low;

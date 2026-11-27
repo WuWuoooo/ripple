@@ -8,11 +8,40 @@ The single source of truth for the version number is `version.json` in the root 
 
 ## 1.3.9 — Sixteenth Version
 
-> **Basis**: on a stripped Windows 11 install the owner reported "the lyric overlay won't open, and a
-> cmd black box pops up". Investigation confirmed the WebView2 Runtime *is* installed (registry
-> `pv = 157.0.4341.42`) and the main window renders fine, so the failure is not the runtime — it is the
-> lyric window's own creation path plus an error that was being discarded.
+> **Basis**: two things. (1) On a stripped Windows 11 install the owner reported "the lyric overlay
+> won't open, and a cmd black box pops up" — investigation confirmed the WebView2 Runtime *is* installed
+> (registry `pv = 157.0.4341.42`) and the main window renders fine, so the failure is not the runtime,
+> it is the lyric window's own creation path plus an error that was being discarded.
+> (2) Two third-party reports: MiniMax M3.1's `代码审查_1.3.8.md` (53 items) and Seed 2.1 Pro's
+> `Ripple_1.3.8_Linux实测锐评.md` (9 items). **Both were re-checked line by line against the source**;
+> every reproducible item was verified locally. Items that turned out to be wrong or already fixed
+> (e.g. B-2 fixed in the previous round, M-5 already had a two-way comparison) were not re-addressed.
 > **Implementation and docs by**: Deepseek V4.1 Flash.
+
+### Shared (frontend / build chain)
+
+- **Fixed track titles and lyrics being translated in the English UI** (review B-1 / B-1a):
+  `i18n.js`'s `walk()` returned early on text nodes via `translateTextNode` **without going through
+  the `inSkip()` prune** — and `el.textContent = X` produces a *childList* mutation, which takes
+  exactly that branch. So "全部" became `All` and "深" became `Dark`, i.e. song titles, artists and
+  lyrics were replaced by English words. Also added the missing `#dockTitle` / `#dockArtist`
+- **Fixed static labels being wrongly protected** (review H-8): `.c-k` in `SKIP_SEL` holds UI labels
+  ("歌单"/"收藏"), not remote data, so the whole subtree was skipped and the home-card badge stayed
+  Chinese forever in the English UI
+- **Fixed the lyric blur layer never being removed after auto-downgrade** (review H-1): `perf.js`
+  dispatched `ripple:perf` on `window` while `app.js` listened on `document` — DOM events only bubble
+  upward, so that path never fired and dozens of `filter:blur` layers survived the downgrade
+- **Fixed Service Worker deleting old caches on a partial install** (review H-2)
+- **Fixed offline first-open white screen** (review M-1): `caches.match` resolves to `undefined` on
+  a miss, and `respondWith(undefined)` throws a TypeError
+- **Fixed restart returning to the previous track** (review H-5): the progress key is throttled by
+  12 seconds while the full save is immediate, so the two disagree; on load the stale key won
+- **Fixed tracks with `id: 0` being silently dropped** (review H-6)
+- **Fixed "1.2 万 likes" in the English UI** (review H-7)
+- **Fixed animations still waiting 300ms under reduced-motion** (review M-2)
+- **Fixed blob URLs never being freed after clearing the library** (review M-3)
+- **Fixed `mapPlaylist` blowing up the whole list on a single null** (review M-4)
+- **Fixed the overlay not receiving new parameters after a language switch** (review M-7)
 
 ### Desktop (Windows / Linux share the same code)
 
@@ -32,10 +61,96 @@ The single source of truth for the version number is `version.json` in the root 
   notification switch, because an error must always be reported
 - Extracted `log_line_at()` so Rust code itself can write to the log (previously only the
   `log_write` command could)
+- **Fixed "every request times out and the titlebar minimize/close stops responding"**
+  (owner-reported P0 on Windows 11): the network worker pool had only **2 threads**, and combined with
+  the serialized `Client` lock it degenerated into **a dead IPC channel** — `netease` returns
+  immediately and pushes the result back asynchronously, but that push goes through `win.eval` on a
+  worker thread; with a 25s per-request timeout and `status` issuing 4 sequential posts (100s worst
+  case), two workers fill instantly and **every** later task — including the titlebar minimize click —
+  queues behind them. Three fixes together: pool 2 → 8 (resource isolation — one stuck long task must
+  not starve a click), per-request timeout 25s → 12s plus a separate 6s `connect_timeout`, and result
+  delivery failures are logged as `[IPC]` instead of being swallowed by `let _ =`
+  (previously "the result never reached the page" and "the network timed out" looked identical)
+- **Fixed the lyric window position being reset on every change** (review H-3): on desktop
+  `sbX/sbY` is always `-1` (the position lives only on the Rust side and never flows back), while
+  `want_reset` treated "received a negative number" as "reset to default" — so changing a colour
+  reset it too. Now it requires both "received negative" **and** "no valid position yet", and the
+  state is seeded from `lyric-pos.json` first (otherwise the guard stays -1 and the check degenerates)
+- **Fixed the search fallback criterion disagreeing with the other two ends** (review H-4):
+  `netease.rs` only checked "is there a result.songs", missing the `code != 200` half that both
+  Java and Node have. When upstream rate-limits with `{"result":{},"code":200}` the desktop build
+  wrongly fell back to the legacy endpoint — so at the same moment the APK returned an empty result
+  while the desktop returned a different set
+- **Narrowed the window permission surface** (review H-9): `capabilities/*.json` used
+  `core:default`, which grants all default permissions of every core plugin —
+  `core:path` / `core:image` / `core:tray` / `core:menu` and more — to both windows,
+  none of which the project uses. Now listed explicitly, with a checker assertion so it cannot regress
+- **Moved 14 Tauri commands off the main thread** (review H-17): `log_write` fired on every front-end
+  `Log.add` (95 call sites) and the per-frame lyric pushes all contended on the main thread.
+  Now `#[tauri::command(async)]`, and the first `Client` construction moved into the thread pool
+- Fixed a wrong `rust-version` declaration, removed the never-registered
+  `tauri-plugin-shell` dead dependency, and stopped `open_external` from rejecting valid URLs
+  that contain `%`
 
 ### Android
 
-- No changes
+- **Fixed the log shattering into dozens of fragments** (review B-3): `PublicFile` used
+  `OWNER_PACKAGE_NAME` to decide "is this a file I wrote earlier", but that column only exists from
+  API 29 and many ROMs return null even for their own files — so every write did an `insert` and
+  MediaStore renamed it to `Ripple-log (1).txt`… **on a real device this had already accumulated
+  32 Ripple-log files and 101 Ripple-crash files**, so opening "Downloads" to troubleshoot showed
+  nothing but a pile of sub-100-byte fragments
+- **Fixed settings changing themselves after closing the overlay** (review M-9): the user drags the hue
+  wheel in the style page and taps ✕ within 120ms; the already-queued style push still ran and wrote the
+  colour of a **closed** overlay into settings and to disk
+- **Fixed background playback being killed by the app itself** (review M-14 / M-15):
+  `onDestroy` unconditionally called `stopService`, and the idle check killed the service 5 seconds
+  after the Activity was reclaimed — but `onDestroy` does not mean "the user quit". Now it distinguishes
+  "user really exited" from "system reclaimed the Activity while still playing"
+- **Unified version handling onto the single parser** (review B-4 / H-12): two workflows, one test and
+  the **write path** of `sync-version.sh` all used the wrong "read the first `version =` in the file"
+  criterion, while the correct `scripts/version-facts.js` (section-aware `[package]` lookup) was
+  **never called by CI**. Verified with an adversarial sample: put a `version` line before
+  `[package]` and both workflows still went green before the fix
+
+### Linux
+
+- **Added GStreamer decoder packages to the deb recommendations** (Linux report P0): previously only
+  `libwebkit2gtk-4.1-0` / `libgtk-3-0` were declared, so on a minimal distro the symptom was
+  "opens, browses, then reports a dead source the moment you press play" — **and that message points
+  the user in exactly the wrong direction**. Changed to `Recommends` (not `Depends`) so lightweight
+  users are not locked out
+- **Split the blanket "the source may have expired" message** (Linux report P1): `MediaError.code`
+  is actually distinguishable — 2 network, 3 decode, 4 source unavailable / unsupported format.
+  Everything used to be reported as "source expired", so users assumed the track was taken down when
+  it might have been the network or a missing codec
+- Shares the same Rust and frontend as Windows, so it benefits from all the desktop fixes
+
+### Build / CI / guardrails
+
+- **CI finally verifies the desktop build**: added `main` to the push trigger of
+  `desktop-build.yml` (desktop changes on main **never ran** desktop CI before, so the last change
+  before a release was completely unverified)
+- **The 2 karaoke layout tests no longer skip silently**: they depended on a hardcoded local path
+  `/opt/chrome/...` and were skipped wholesale when CI lacked it — yet they are the only regression
+  guard for those two 1.3.8 fixes. Now `CHROME_PATH` can override it and CI installs a browser
+- **`build-apk.sh` works on macOS**: `mapfile` needs bash 4.0+ while macOS ships 3.2, so following
+  the docs failed outright — and the error (`javac: no source files`) had nothing to do with the cause
+- **Aligned the two build paths**: `build.gradle` had `noCompress 'mp3'`, `build-apk.sh` did not
+- **Guardrails**: exemptions must carry a reason, the version-copy list in docs is compared both ways,
+  native i18n sampling switched from a hand-written list to directory scanning (with a meta-test
+  asserting full coverage), and `capabilities` may no longer use `core:default`
+
+### Server
+
+- **Fixed inconsistent CORS handling** (review H-10): the `json()` helper hardcoded
+  `Access-Control-Allow-Origin: *` and was used by the 413/500/400 paths, while the normal 200 path
+  echoed `req.headers.origin`
+- **Added security response headers** (review H-11): static assets carried no
+  `X-Content-Type-Options` / `Referrer-Policy` / `X-Frame-Options`.
+  (`csp` stays `null` — the 1.3.5 trade-off is not being overturned)
+- Fixed the upstream body limit being measured in UTF-16 code units instead of real bytes
+  (a 16MB limit could actually consume 48MB of all-Chinese text)
 
 ### Linux
 

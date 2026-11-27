@@ -467,3 +467,440 @@ test('H-9 令牌签发：伪造 Sec-Fetch 头不再能拿令牌（必须有真�
   });
   assert.strictEqual(viaOrigin.status, 200, '只带同源 Origin 时也必须能签令牌');
 });
+
+/* ===============================================================
+ * 1.3.8 服务端条目：H-10 / H-11 / L-8 / L-9
+ *
+ * 这一组用例的判据全部来自「真实 HTTP 响应」，不是读源码里的字符串 ——
+ * H-10 的病根恰恰是「两套 CORS 口径」，只 grep 源码会发现两边都写了
+ * Access-Control-Allow-Origin，看起来「都设了」，实际上一个是 * 一个是回显。
+ * =============================================================== */
+
+/** 取一份可用令牌（同源 Referer + 浏览器信号） */
+async function grabToken(p) {
+  const tk = await request(p, {
+    path: '/ripple-token.js',
+    headers: {
+      Referer: 'http://localhost:' + p + '/',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'no-cors',
+    },
+  });
+  const t = (tk.body.match(/["']([a-f0-9]{32})["']/) || [])[1];
+  assert.ok(t, '需要先拿到令牌');
+  return t;
+}
+
+/* ---------------------------------------------------------------
+ * H-11 [high]：静态资源必须带 nosniff / Referrer-Policy / X-Frame-Options
+ * --------------------------------------------------------------- */
+test('H-11 静态资源带 nosniff / Referrer-Policy / X-Frame-Options', async () => {
+  /*
+   * 挑三种扩展名分别验：HTML（页面本体）、JS（最容易被「猜成 HTML」的类型）、
+   * 以及一个 .css（样式）。以前这三种一个安全头都没有。
+   */
+  for (const p of ['/index.html', '/js/app.js', '/css/base.css']) {
+    const r = await request(port, { path: p });
+    assert.strictEqual(r.status, 200, p + ' 应可正常服务，实际 ' + r.status);
+    assert.strictEqual(r.headers['x-content-type-options'], 'nosniff',
+      p + ' 必须带 X-Content-Type-Options: nosniff');
+    assert.strictEqual(r.headers['referrer-policy'], 'no-referrer',
+      p + ' 必须带 Referrer-Policy: no-referrer');
+    assert.strictEqual(r.headers['x-frame-options'], 'SAMEORIGIN',
+      p + ' 必须带 X-Frame-Options: SAMEORIGIN');
+  }
+});
+
+test('H-11 304 命中时安全头也必须在（否则条件请求会「洗掉」防线）', async () => {
+  const first = await request(port, { path: '/index.html' });
+  const etag = first.headers.etag;
+  assert.ok(etag, '静态响应应带 ETag');
+
+  const second = await request(port, { path: '/index.html', headers: { 'If-None-Match': etag } });
+  assert.strictEqual(second.status, 304, '条件请求应命中 304');
+  /*
+   * 304 走的是同一份 headers 对象，理应一并带上。这条断言守的是「将来有人
+   * 给 304 单独写一套头」的回归 —— 那种改动会静默地让缓存命中的页面失去防线。
+   */
+  assert.strictEqual(second.headers['x-content-type-options'], 'nosniff', '304 也必须带 nosniff');
+  assert.strictEqual(second.headers['x-frame-options'], 'SAMEORIGIN', '304 也必须带 X-Frame-Options');
+});
+
+test('H-11 明确不加 CSP（1.3.5 的权衡结论，本轮不推翻）', async () => {
+  const r = await request(port, { path: '/index.html' });
+  assert.strictEqual(r.headers['content-security-policy'], undefined,
+    '本轮不动 CSP：加了会砸掉「检查更新跨域 fetch GitHub API」，必须单独评估');
+});
+/* ---------------------------------------------------------------
+ * H-10 [high]：错误路径的 CORS 不再通配，与 200 路径同口径
+ * --------------------------------------------------------------- */
+test('H-10 错误路径（413/400）不再回 ACAO:*，而是回显本次 Origin', async () => {
+  const token = await grabToken(port);
+  const origin = 'http://localhost:' + port;
+
+  /* 413：体积超限 */
+  const big = 'x'.repeat(300 * 1024);
+  const r413 = await request(port, {
+    method: 'POST',
+    path: '/ncm/search',
+    headers: {
+      Origin: origin,
+      'X-Ripple-Token': token,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(big),
+    },
+    body: big,
+  });
+  assert.strictEqual(r413.status, 413, '300KB 请求体应 413');
+  assert.strictEqual(r413.headers['access-control-allow-origin'], origin,
+    '413 必须回显本次请求的 Origin（以前是硬编码 *）');
+  assert.notStrictEqual(r413.headers['access-control-allow-origin'], '*',
+    '413 不得再出现 Access-Control-Allow-Origin: *');
+  assert.match(String(r413.headers.vary || ''), /Origin/i,
+    '413 必须带 Vary: Origin —— 否则中间层会把回显了某 origin 的响应复用给别人');
+
+  /* 400：未知命令（L-9 把它从 200 改成了 400） */
+  const r400bad = await request(port, {
+    method: 'POST',
+    path: '/ncm/definitely_not_a_command',
+    headers: { Origin: origin, 'X-Ripple-Token': token, 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.strictEqual(r400bad.status, 400, '未知命令应 400');
+  assert.strictEqual(r400bad.headers['access-control-allow-origin'], origin,
+    '400 必须回显本次请求的 Origin');
+  assert.notStrictEqual(r400bad.headers['access-control-allow-origin'], '*',
+    '400 不得再出现通配符');
+  assert.match(String(r400bad.headers.vary || ''), /Origin/i, '400 必须带 Vary: Origin');
+});
+
+test('H-10 不带 Origin 的请求：错误响应不该凭空造出 ACAO 头', async () => {
+  const token = await grabToken(port);
+  /*
+   * 与 200 路径完全同口径：`if (req.headers.origin) ...`。
+   * 以前 json() 无条件写 '*'，于是连「同源 CLI 请求」的响应都宣称可跨域读。
+   */
+  const big = 'x'.repeat(300 * 1024);
+  const r = await request(port, {
+    method: 'POST',
+    path: '/ncm/search',
+    headers: {
+      /*
+       * 故意**不带 Origin**，只带同源信号：这是「同源页面之外、但仍是本机
+       * 请求」的形状（例如 Service Worker / 无 Origin 的同源导航 fetch）。
+       * 注意不能什么信号都不给 —— 那样会在 originAllowed() 就被 403 拦下，
+       * 走不到 413 那条路径，也就测不到 json() 的 CORS 头。
+       */
+      'Sec-Fetch-Site': 'same-origin',
+      'X-Ripple-Token': token,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(big),
+    },
+    body: big,
+  });
+  assert.strictEqual(r.status, 413, '300KB 请求体应 413');
+  assert.strictEqual(r.headers['access-control-allow-origin'], undefined,
+    '没有 Origin 就不该发 Access-Control-Allow-Origin（以前这里会冒出 *）');
+});
+/* ---------------------------------------------------------------
+ * L-9 [low]：未知命令必须是 400，不是 200
+ * --------------------------------------------------------------- */
+test('L-9 未知命令返回 400 且 body 指明命令名', async () => {
+  const token = await grabToken(port);
+  const r = await request(port, {
+    method: 'POST',
+    path: '/ncm/totally_unknown_cmd',
+    headers: {
+      Origin: 'http://localhost:' + port,
+      'X-Ripple-Token': token,
+      'Content-Type': 'application/json',
+    },
+    body: '{}',
+  });
+  /*
+   * 修前这里是 200 + {"code":-2,...} —— 打错命令名在 HTTP 层完全看不出来，
+   * 排查时表现为「接口 200 但页面什么都不显示」。
+   */
+  assert.strictEqual(r.status, 400, '未知命令是客户端错误，必须 400（修前是 200）');
+  const j = JSON.parse(r.body);
+  assert.strictEqual(j.code, 400, 'body 的 code 应为 400，实际 ' + j.code);
+  assert.match(String(j.msg), /totally_unknown_cmd/,
+    'body 应指明是哪个命令不认识（排查唯一线索）');
+});
+
+/* ---------------------------------------------------------------
+ * L-8 [low]：上游响应体上限按真实字节，不按 UTF-16 码元
+ * --------------------------------------------------------------- */
+test('L-8 响应体计数器按 UTF-8 字节累计，与 data.length 判据分道扬镳', () => {
+  /*
+   * 这条是单元级对抗：这条判据没法用 e2e 测（要真让网易云吐出 16MB 中文），
+   * 所以直接拿被测的计数器与「朴素的 data.length 计数」跑同一批 chunk，
+   * 要求两者在中文/emoji 输入下给出**不同**结论 —— 如果相同，
+   * 说明有人把它改回了按码元计数，这时本用例立刻红。
+   */
+  const srv = require(path.join(ROOT, 'server.js'));
+  const LIMIT = 48;                       // 48 字节，方便构造边界
+  const chunks = ['中文', '中文', '中文'];   // 每个 6 字节 = 2 码元
+
+  /* 真实现：按字节 */
+  const counted = srv.makeByteCounter(LIMIT);
+  let naiveLength = 0;
+  for (const c of chunks) {
+    naiveLength += c.length;
+    counted.add(c);
+  }
+  assert.strictEqual(counted.bytes, 18, '6 字节 × 3 块 = 18 字节，实际 ' + counted.bytes);
+  assert.strictEqual(naiveLength, 6, '（对照）按码元只数到 6，这是修前的错误判据');
+
+  /* 边界：刚好等于上限不算超限 */
+  const at = srv.makeByteCounter(LIMIT);
+  assert.strictEqual(at.add('x'.repeat(LIMIT)), false, '恰好等于上限时不该判定超限');
+  /* 多一个字节就算超限 */
+  const over = srv.makeByteCounter(LIMIT);
+  assert.strictEqual(over.add('x'.repeat(LIMIT + 1)), true, '超出一个字节必须判超限');
+
+  /*
+   * 关键分歧演示：用 16MB 真实上限，喂「全中文」的等价负载。
+   * 按字节 3n > 16MB 时触发；按码元要等到 n > 16MB 才触发 —— 相差约 3 倍。
+   * 这里用小一点的等价比例做演示，避免真的分配 48MB 字符串。
+   */
+  const MB = 1024 * 1024;
+  const piece = '中'.repeat(1024);         // 1024 个中文字 = 3072 字节 = 1024 码元
+  const real = srv.makeByteCounter(16 * MB);
+  let realTripped = 0;
+  let realBytes = 0;
+  let codeUnits = 0;
+  while (realTripped === 0 && codeUnits < 20 * MB) {
+    realTripped = real.add(piece) ? 1 : 0;
+    realBytes += Buffer.byteLength(piece, 'utf8');
+    codeUnits += piece.length;
+  }
+  assert.strictEqual(realTripped, 1, '全中文负载超过 16MB 后必须触发');
+  assert.ok(realBytes > 16 * MB, '（前提）触发时真实字节确实已超 16MB');
+  assert.ok(codeUnits < 16 * MB,
+    '（关键）触发时 UTF-16 码元数 ' + codeUnits + ' 仍小于 16MB —— '
+    + '修前按 data.length 判就永远等不到这一下，上限实际放宽到 ~48MB');
+});
+/* ---------------------------------------------------------------
+ * 元测试：证明上面这组断言真的会红
+ *
+ * 判据来自真实 HTTP 响应，所以「把修复改坏」不能靠 monkey-patch 进程内的
+ * 变量 —— 必须真的起一个「旧实现」的服务实例。这里直接用 git HEAD 版本的
+ * server.js 起子进程，跑同一批关键字判据，要求它们呈现修复前的样子。
+ * --------------------------------------------------------------- */
+
+/** 在指定的代码根目录起一个服务实例（元测试要用「修复前」的 server.js） */
+function startServerIn(rootDir) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ripple-e2e-'));
+  const pick = require('node:child_process').spawnSync(process.execPath, ['-e',
+    'const net = require("net"); const s = net.createServer();'
+    + ' s.listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });'],
+    { encoding: 'utf8' });
+  const chosen = Number(String(pick.stdout || '').trim()) || 18311;
+  const child = require('node:child_process').spawn(
+    process.execPath,
+    [path.join(rootDir, 'server.js'), String(chosen), '--data-dir', dataDir],
+    { cwd: rootDir, stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+  return {
+    dataDir: dataDir,
+    child: child,
+    ready: new Promise((resolve, reject) => {
+      let out = '';
+      const timer = setTimeout(() => reject(new Error('旧实例启动超时，输出：' + out)), 12000);
+      child.stdout.on('data', (c) => {
+        out += c.toString();
+        if (/已启动/.test(out)) { clearTimeout(timer); resolve(chosen); }
+      });
+      child.stderr.on('data', (c) => { out += c.toString(); });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        reject(new Error('旧实例提前退出 code=' + code + ' 输出：' + out));
+      });
+    }),
+    stop: () => { try { child.kill('SIGKILL'); } catch (e) {} },
+  };
+}
+
+test('元测试：把三处修复逐个改回旧写法，上面的判据必须真的红', async () => {
+  /*
+   * 为什么不用 git HEAD 当基准：修复一旦提交，HEAD 就自带修复，
+   * 这条元测试会静默失去意义（或者更糟：永久变红）。所以基准必须是
+   * 「当前源码」——在临时目录里把修复**逐处改回旧写法**，再起同一个服务。
+   *
+   * 三处变异（与报告里的三条一一对应）：
+   *   ① H-11：把三条静态安全头删掉；
+   *   ② H-10：把 ACAO 通配符塞回 json()；
+   *   ③ L-9：未知命令改回 return 200。
+   * 每处变异都必须真的改动源码（否则元测试自己是假的）。
+   */
+  const oldDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ripple-old-'));
+  let oldEnv = null;
+  try {
+    const good = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+
+    /* ① H-11 → 删掉三条安全头 */
+    const noSecHeaders = good.replace(
+      /\n      'X-Content-Type-Options': 'nosniff',\n      'Referrer-Policy': 'no-referrer',\n      'X-Frame-Options': 'SAMEORIGIN',\n/,
+      '\n'
+    );
+    assert.notEqual(noSecHeaders, good, '变异 ① 必须真的删掉安全头（否则元测试自欺）');
+
+    /*
+     * ② H-10 → 回显 origin 那行改回通配符。
+     * 注意必须改**这一行**而不是往 headers 字面量里塞：json() 里
+     * \`if (org) headers['...'] = org\` 在字面量之后执行，会把塞进去的 '*'
+     * 覆盖掉 —— 那种「变异」根本改不了行为，元测试就变成自欺了。
+     */
+    const wildcard = noSecHeaders.replace(
+      "  if (org) headers['Access-Control-Allow-Origin'] = org;",
+      "  headers['Access-Control-Allow-Origin'] = '*';  // 变异：回到修复前"
+    );
+    assert.notEqual(wildcard, noSecHeaders, '变异 ② 必须真的改回 ACAO 通配符');
+
+    /* ③ L-9 → 未知命令改回 return 200 */
+    const unknown200 = wildcard.replace(
+      "      throw badRequest('未知命令 ' + cmd);",
+      "      return JSON.stringify({ code: -2, msg: '未知命令 ' + cmd });"
+    );
+    assert.notEqual(unknown200, wildcard, '变异 ③ 必须真的把未知命令改回 200');
+
+    fs.writeFileSync(path.join(oldDir, 'server.js'), unknown200);
+    fs.copyFileSync(path.join(ROOT, 'server-security.js'), path.join(oldDir, 'server-security.js'));
+    fs.symlinkSync(path.join(ROOT, 'app'), path.join(oldDir, 'app'), 'dir');
+
+    oldEnv = startServerIn(oldDir);
+    const oldPort = await oldEnv.ready;
+
+    /* ① H-11：旧实现没有安全头 */
+    const stat = await request(oldPort, { path: '/index.html' });
+    assert.strictEqual(stat.status, 200, '（元测试）旧实现也应能正常服务静态文件');
+    assert.notStrictEqual(stat.headers['x-content-type-options'], 'nosniff',
+      '（元测试）旧实现的静态响应不该已经带 nosniff，否则上面 H-11 的断言测不出东西');
+    assert.strictEqual(stat.headers['x-frame-options'], undefined,
+      '（元测试）旧实现没有 X-Frame-Options');
+
+    /* ② H-10：旧实现的 413 是通配符 */
+    const tk = await grabToken(oldPort);
+    const big = 'x'.repeat(300 * 1024);
+    const r413 = await request(oldPort, {
+      method: 'POST',
+      path: '/ncm/search',
+      headers: {
+        Origin: 'http://localhost:' + oldPort,
+        'X-Ripple-Token': tk,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(big),
+      },
+      body: big,
+    });
+    assert.strictEqual(r413.status, 413, '（元测试）旧实现也应先到 413');
+    assert.strictEqual(r413.headers['access-control-allow-origin'], '*',
+      '（元测试）旧实现的 413 必须是 ACAO:* —— 这正是 H-10 要修的');
+
+    /* ③ L-9：旧实现的未知命令是 200 */
+    const rUnknown = await request(oldPort, {
+      method: 'POST',
+      path: '/ncm/totally_unknown_cmd',
+      headers: {
+        Origin: 'http://localhost:' + oldPort,
+        'X-Ripple-Token': tk,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    assert.strictEqual(rUnknown.status, 200,
+      '（元测试）旧实现的未知命令必须是 200 —— 这正是 L-9 要修的');
+  } finally {
+    if (oldEnv) {
+      oldEnv.stop();
+      try { fs.rmSync(oldEnv.dataDir, { recursive: true, force: true }); } catch (e) {}
+    }
+    try { fs.rmSync(oldDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+/* ---------------------------------------------------------------
+ * L-8 的**接线**用例：不止计数器本身对，服务端真的用了它
+ *
+ * 上面那条只能证明 makeByteCounter 本身按字节算。它测不到「服务端有没有用它」——
+ * 变异测试证实了这一点：把 ncmPost 里的 `seen.add(c)` 改回 `data.length > LIMIT`，
+ * 上面那条依然全绿。所以这里补一条**真行为**用例：
+ * 拦截 https.request 造一个「全中文超大响应」的上游，断言 /ncm/ 走到「上游响应体过大」。
+ *
+ * 为什么这个形状能区分两种判据：
+ *   · 负载 = 6M 个中文字 = 18MB 真实字节，但只有 6M UTF-16 码元；
+ *   · 按字节判：18MB > 16MB → 立刻触发（期望行为）；
+ *   · 按 data.length 判：6M < 16M 码元 → **不会**触发（修前的错误行为，本用例会红）。
+ */
+test('L-8 服务端真的按字节判：全中文 18MB 上游响应必须被拦下', async () => {
+  const https = require('node:https');
+  const { EventEmitter } = require('node:events');
+  const srv = require(path.join(ROOT, 'server.js'));
+
+  /* 在进程内起一个独立实例（不占用上面的 env，也不碰它的 data-dir） */
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ripple-l8-'));
+  const origRequest = https.request;
+  let stubbed = 0;
+  try {
+    /* 用假的 https.request 顶掉真实上游 */
+    https.request = function (opts, cb) {
+      stubbed += 1;
+      const reqEmitter = new EventEmitter();
+      reqEmitter.write = () => {};
+      reqEmitter.end = () => {
+        /* 回调在下一拍触发，模拟真实异步 */
+        setImmediate(() => {
+          const resEmitter = new EventEmitter();
+          resEmitter.setEncoding = () => {};
+          resEmitter.headers = {};
+          resEmitter.complete = true;
+          cb(resEmitter);
+          /* 分 12 块推 500K 个中文字 = 每块 1.5MB 字节，合计 18MB 字节 / 6M 码元 */
+          const chunk = '中'.repeat(500000);
+          let n = 0;
+          const pump = () => {
+            if (n >= 12) {
+              resEmitter.emit('end');
+              reqEmitter.emit('close');
+              return;
+            }
+            n += 1;
+            resEmitter.emit('data', chunk);
+            /* 用宏任务推进，让超限分支的 destroy 有机会生效 */
+            if (!reqEmitter.__destroyed) setImmediate(pump);
+          };
+          setImmediate(pump);
+        });
+      };
+      reqEmitter.destroy = () => { reqEmitter.__destroyed = true; };
+      reqEmitter.setTimeout = () => {};
+      return reqEmitter;
+    };
+
+    await new Promise((resolve) => srv.server.listen(0, '127.0.0.1', resolve));
+    const p = srv.server.address().port;
+    const tk = await grabToken(p);
+
+    const r = await request(p, {
+      method: 'POST',
+      path: '/ncm/lyric',
+      headers: {
+        Origin: 'http://localhost:' + p,
+        'X-Ripple-Token': tk,
+        'Content-Type': 'application/json',
+      },
+      body: '{"id":"1"}',
+    });
+
+    assert.ok(stubbed >= 1, '假上游必须真的被调用到（否则这条用例测的是空气）');
+    assert.strictEqual(r.status, 502, '上游响应体超限应回 502（上游失败），实际 ' + r.status);
+    assert.match(r.body, /上游响应体过大/,
+      '响应必须是「上游响应体过大」，实际：' + r.body.slice(0, 200));
+    assert.match(r.body, /16MB/, '错误文案应说明是 16MB 上限');
+  } finally {
+    https.request = origRequest;
+    try { await new Promise((res) => srv.server.close(res)); } catch (e) {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});

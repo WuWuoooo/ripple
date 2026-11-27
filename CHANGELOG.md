@@ -9,10 +9,42 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
 
 ## 1.3.9 — 第十六个版本
 
-> **本次依据**：Windows 11 精简版用户实测「状态栏歌词点不开，且弹出一块 cmd 黑框」。
-> 排查确认 WebView2 运行时装着（注册表 pv = 157.0.4341.42），主窗口能正常渲染，
+> **本次依据**：两件事。
+> ① 用户实测「Windows 11 精简版上状态栏歌词点不开，且弹出一块 cmd 黑框」——
+> 排查确认 WebView2 运行时装着（注册表 pv = 157.0.4341.42）、主窗口能正常渲染，
 > 所以失败点不在运行时，而在歌词窗自身的创建路径与「错误被吞掉」。
+> ② 两份第三方报告：MiniMax M3.1 的 `代码审查_1.3.8.md`（53 条）与
+> Seed 2.1 Pro 的 `Ripple_1.3.8_Linux实测锐评.md`（9 项）。**两份都逐条回源码复核过**，
+> 可复现项全部本机实测；报告里不成立或已修的（如 B-2 已在上一轮修掉、M-5 已有双向比对）不重复改。
 > **实现与文档**：Deepseek V4.1 Flash。
+
+### 三端共同（共用前端 / 构建链）
+
+- **修英文界面下歌名与歌词被翻译**（审查 B-1 / B-1a）：`i18n.js` 的 `walk()` 对文本节点
+  直接 `translateTextNode` 早退，**没走 `inSkip()` 剪枝** —— 而 `el.textContent = X` 在 DOM 层
+  产生的是 childList 变更，正好走这一支。于是「全部」→ `All`、「深」→ `Dark`，
+  歌名/艺人/歌词在英文界面被替换成英文单词。同时补上漏项的 `#dockTitle` / `#dockArtist`
+- **修首页卡片角标不翻译**（审查 H-8）：`SKIP_SEL` 里的 `.c-k` 装的是「歌单/收藏」这种
+  **界面标签**而不是远程数据，被整棵子树跳过 → 首页卡片角标在英文界面永远是中文。移出名单
+- **修自动降级后歌词模糊层永远不摘**（审查 H-1）：`perf.js` 把 `ripple:perf` 派发到
+  `window`，`app.js` 却在 `document` 上监听 —— DOM 事件只向上冒泡，这条通路从未生效，
+  低端机降级后几十个 `filter:blur` 合成层照旧，降级白做
+- **修 Service Worker 部分安装就删旧缓存**（审查 H-2）：`addAll` 改成逐个 `add` 后，
+  20 项失败 3 项也算「安装成功」→ `skipWaiting` → `activate` 把旧缓存整个删掉。
+  现在**全部失败才放弃安装**（保留旧完整缓存），`activate` 只删比当前版本旧的
+- **修离线首开白屏**（审查 M-1）：`caches.match` 未命中 resolve 成 `undefined`，
+  `respondWith(undefined)` 抛 TypeError → 改成自绘离线页 + HTTP 503
+- **修重启回到上一首**（审查 H-5）：进度小键有 12 秒节流、整份存档是即时写，两者长期不一致；
+  加载时无条件让旧的小键覆盖 `lastTrackId` → 换个歌 12 秒内重启就回上一首
+- **修 `id: 0` 曲目被静默丢弃**（审查 H-6）：`mapSongs` 用 `t.neId` 真值判断把 `0` 当假值；
+  同时 `mapSong` 对缺失 id 产出 `'ne_undefined'` 这种假 id → 改为显式 `!== undefined/null/''`
+- **修英文界面「1.2 万 likes」**（审查 H-7）：`fmtN` 把中文量级词「万」直接拼进数字，
+  翻译发生在插值**之后**，单位没被翻。英文改用 K；`fmtN(total) + ' 条'` 的字符串拼接改走词典模板
+- **修 reduced-motion 下动画仍等 300ms**（审查 M-2）：`aniDurationMs()` 读的是 CSS 变量标称值，
+  而 `prefers-reduced-motion` 把实际 `animation-duration` 压成 0.001ms
+- **修清空曲库后 blob URL 永不回收**（审查 M-3）：`clearLocal()` 返回值被调用方整个丢弃
+- **修 `mapPlaylist` 遇 null 整块歌单空掉**（审查 M-4）：裸 `.map` 无防御
+- **修切语言后浮层不收新参数**（审查 M-7）：`setLang()` 清了四个签名，漏了 `_sbApplySig`
 
 ### 桌面端（Windows / Linux 共用）
 
@@ -20,22 +52,88 @@ Gradle / Java / 网页 / Service Worker 缓存名（`app/sw.js` 的 `CACHE`）�
   发布版从此是 GUI 子系统，不再附赠控制台窗口
 - **透明窗建不出来时自动降级为不透明窗**：Windows 精简版常裁掉 DWM，
   `transparent(true)` 的窗口直接建失败。现在先试透明窗，失败就退一步用
-  不透明窗（深色底）再建一次 —— 观感差一点，但**功能能用**。
-  只有两步都失败才算真失败
+  不透明窗（深色底）再建一次 —— 观感差一点，但**功能能用**。只有两步都失败才算真失败
 - **修歌词小窗创建失败时「一点信息都不留」**：`ensure_lyric_window(...).is_ok()` 会把
   `Err("歌词窗口创建失败：{e}")` 里那份系统真实错误码整个丢弃。改为 `match`：
   失败时写日志（`[LYRIC]` 前缀，带平台名）+ emit `lyric-window-error` 事件
 - **失败时给用户可见提示**：`bridge.js` 监听上述事件，弹 `warn` 级 toast 说明原因，
   并指向「我的 → 软件日志」；该提示不受「软件内通知」开关影响（出错必须告知）
 - 抽出 `log_line_at()` 让 Rust 内部也能写日志（原本只有 `log_write` 命令能写）
+- **修「所有请求超时 + 顶栏最小化/关闭点了没反应」**（用户实测 P0，Windows 11）：
+  网络工作池只有 **2 个线程**，配合 `Client` 上的串行锁，网络一差就退化成**整个 IPC 通道堵死** ——
+  `netease` 是「立刻返回、结果异步推回」，而回调要由 worker 线程里的 `win.eval` 投递；
+  `reqwest` 单请求超时 25 秒、`status` 内部还串行发 4 次要 100 秒，2 个 worker 瞬间占满，
+  之后**任何**新任务（包括用户点最小化要走的命令）只能在通道里排队。
+  三处一起改：worker 池 2 → 8（资源隔离，一个卡住的长任务不该饿死一次点击）、
+  单请求超时 25s → 12s + `connect_timeout` 6s（连不上和连上没响应分开处理）、
+  结果投递失败不再 `let _ =` 静默吞掉而是记 `[IPC]` 日志
+  （以前「结果没送进页面」和「网络请求超时」在日志里长得一模一样）
+- **修歌词窗位置「一拖就弹回去」**（审查 H-3）：桌面端 `sbX/sbY` 恒为 `-1`（位置只存在
+  Rust 侧、从不回流到前端），而 `want_reset` 把「收到负数」当成「恢复默认」→
+  改个颜色都会重置。改为需同时满足「收到负数」且「当前也没有有效位置」，
+  并在判定前先从 `lyric-pos.json` 回填 state（否则 guard 恒为 -1，判据退化成恒真）
+- **修搜索回落判据与另两端不一致**（审查 H-4）：`netease.rs` 只判断「有没有 result.songs」，
+  少了 Java/Node 都有的 `code != 200` 那一半。上游限流返回 `{"result":{},"code":200}` 时
+  桌面端会错误回落老接口 → 同一时刻 APK 给空结果、桌面端给另一批数据
+- **收窄窗口权限面**（审查 H-9）：`capabilities/*.json` 用了 `core:default`，把
+  `core:path` / `core:image` / `core:tray` / `core:menu` 等全部默认权限开给两个窗口，
+  而项目一项都没用到。改成按需显式列举；并在 checker 加断言禁止 `core:default` 复发
+- **修 14 个 Tauri 命令全跑在主线程**（审查 H-17）：`log_write` 每次前端 `Log.add` 都触发
+  （95 处调用点），歌词逐帧推送也全在主线程抢锁 —— 改为 `#[tauri::command(async)]`，
+  并把首次 `Client` 构造移进线程池
+- 修 `rust-version` 声明错误（`1.77` → 实际要求更高）、删掉从未注册的
+  `tauri-plugin-shell` 死依赖、`open_external` 不再误拦合法 URL 里的 `%`
 
 ### Android
 
-- 无改动
+- **修日志碎成几十份**（审查 B-3）：`PublicFile` 用 `OWNER_PACKAGE_NAME` 判断「是不是自己
+  上次写的文件」，而该列 API 29 才有、且很多 ROM 对自家文件也返回 null → 每次写日志都
+  `insert` → MediaStore 自动改名成 `Ripple-log (1).txt`…**真机上已积 32 份 Ripple-log、
+  101 个 Ripple-crash**，排障时打开「下载」看到的全是几十字节的碎片
+- **修关闭浮层后设置自己变**（审查 M-9）：用户在样式页拖完色相、120ms 内点 ✕ 关闭，
+  已排队的样式推送照样执行，把**已关闭浮层**的颜色写进设置并落盘
+- **修后台播放被自己停掉**（审查 M-14 / M-15）：`onDestroy` 无条件 `stopService`、
+  空闲检查在 Activity 被回收后 5 秒自杀 —— 而 `onDestroy` 不等于「用户退出」，
+  系统回收 Activity 时播放还在继续。现在区分「用户真退出」与「被回收」
+- **版图统一到单一解析器**（审查 B-4 / H-12）：两个 workflow + 一个测试 + `sync-version.sh`
+  的**写入侧**都在用「读文件第一处 `version =`」的错误判据，而正确的
+  `scripts/version-facts.js`（`[package]` 段内定位）**从未被 CI 调用**。
+  构造对抗样本实测：`[package]` 前塞一行 `version`，修复前两个 workflow 同时报绿
 
 ### Linux
 
-- 与 Windows 共用同一份 Rust 与前端，同样受益于上面三条
+- **deb 补 GStreamer 解码器依赖**（Linux 实测报告 P0）：以前只声明
+  `libwebkit2gtk-4.1-0 / libgtk-3-0`，极简发行版装完的表现是「能开、能翻、一放就报
+  音源失效」——**而这个提示刚好把人引向错误方向**。改为 `Recommends`
+  （而非 `Depends`，不把轻量用户挡在门外）
+- **拆开「音源可能已失效」这刀切**（Linux 实测报告 P1）：`MediaError.code` 本来可分
+  ——2 网络中断 / 3 解码失败 / 4 源不可用或格式不支持。以前全部说成「音源失效」，
+  用户以为歌下线了，实际可能是网络或解码器。现在按 code 给不同提示
+- 与 Windows 共用同一份 Rust 与前端，同样受益于桌面端全部修复
+
+### 构建 / CI / 护栏
+
+- **CI 首次真正校验桌面端**：`desktop-build.yml` 的 push 触发补上 `main`
+  （以前 main 上的桌面改动**从不自动跑**桌面 CI，发版前最后一次改动完全没验证过）
+- **2 条卡拉OK 布局测试不再静默 skip**：它们依赖本机绝对路径 `/opt/chrome/...`，
+  CI 上没有就整个 skip —— 而这正是 1.3.8 那两条修复的唯一回归防线。改为支持
+  `CHROME_PATH` 环境变量覆盖，CI 里装上浏览器让它们真跑
+- **`build-apk.sh` 兼容 macOS**：`mapfile` 需要 bash 4.0+，而 macOS 自带的是 3.2
+  → 按文档操作会直接失败，且报错信息（`javac: no source files`）与真实原因完全无关
+- **两条构建路径产物对齐**：`build.gradle` 有 `noCompress 'mp3'`、`build-apk.sh` 没有
+- **护栏补齐**：`SKIP_SEL` 豁免必须带理由、文档侧版本副本清单改双向比对、
+  原生 i18n 取样从手写清单改成扫目录自动发现（并加元测试断言覆盖完整）、
+  禁止 `capabilities` 出现 `core:default`
+
+### 服务端
+
+- **修 CORS 口径不一致**（审查 H-10）：`json()` 辅助函数硬编码
+  `Access-Control-Allow-Origin: *`，413/500/400 三条路径都在用，
+  而正常 200 路径用的是回显 `req.headers.origin`
+- **补安全响应头**（审查 H-11）：静态资源以前没有任何
+  `X-Content-Type-Options` / `Referrer-Policy` / `X-Frame-Options`。
+  （`csp` 仍留 `null` —— 1.3.5 评估过的权衡不推翻）
+- 修响应体上限按 UTF-16 码元而非真实字节判定（全中文时 16MB 上限实际能吃 48MB）
 
 ---
 

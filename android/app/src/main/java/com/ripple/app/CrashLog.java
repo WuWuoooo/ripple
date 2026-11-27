@@ -65,6 +65,23 @@ final class CrashLog {
     /** 崩溃文件保留份数：只留最近这么多份，避免下载目录被历史崩溃刷爆 */
     private static final int MAX_CRASH_FILES = 10;
     /**
+     * B-3（审查 1.3.8）：**旧格式**崩溃池的配额，单独一池、保留更多。
+     *
+     * 1.3.6 之前 recordAsync 也写 "Ripple-crash-" 前缀（错误日志与真崩溃共用），
+     * 而 pruneDownloadFiles 是**按前缀**分池的 —— 于是「清真崩溃池」这一步
+     * 会把历史上所有 Ripple-crash-*-lyric-redraw.txt / -exit-info.txt 一起算进来，
+     * 按名字倒序只留 10 份。真机上就有 101 份 Ripple-crash-*，
+     * 其中 11 份 Ripple-crash-20261124-0629xx-lyric-redraw.txt 正是
+     * 1.3.3「状态栏歌词根因」的关键证据 —— 它们会被静默删光。
+     *
+     * 现在按**语义 tag** 分池（见 poolOf）：
+     *   · tag 以 uncaught 开头 → 真崩溃池，保留 MAX_CRASH_FILES 份；
+     *   · 其它旧格式（lyric-redraw / cookie-init / exit-info …）→ 旧证据池，
+     *     保留 LEGACY_CRASH_FILES 份，且**永远不会被真崩溃池的配额挤掉**；
+     *   · Ripple-err- → 错误池，ERR_KEEP_FILES 份（AND-04 / H-16 的独立配额）。
+     */
+    private static final int LEGACY_CRASH_FILES = 60;
+    /**
      * 审查 AND-04：非崩溃错误日志用**独立前缀与独立配额**。
      *
      * 以前 recordAsync（35 个真实调用点：LyricOverlay 9 + MainActivity 19 +
@@ -428,11 +445,13 @@ final class CrashLog {
     /**
      * 写下载目录。
      *
-     * @param prefix 非覆盖写时的文件名前缀（H-16）：
-     *               "Ripple-crash-" = 真崩溃（配额 MAX_CRASH_FILES=10）；
-     *               "Ripple-err-"   = 非崩溃错误（配额 ERR_KEEP_FILES=20，独立清理）。
-     *               前缀是清理逻辑唯一的判据，所以两套配额互不侵占 ——
-     *               与私有目录那份（crash- / err-）保持同一套设计。
+     * @param prefix 非覆盖写时的文件名前缀：
+     *               "Ripple-crash-" = 崩溃路径（真正的 uncaught 崩溃）；
+     *               "Ripple-err-"   = 非崩溃错误（ERR_KEEP_FILES=20，独立清理）。
+     *               ⚠️ B-3：前缀**不再是**清理逻辑唯一的判据 —— 同一个
+     *               "Ripple-crash-" 前缀下还混着 1.3.5 之前的旧格式证据
+     *               （tag 不是 uncaught-*），它们单独成池、单独配额。
+     *               见 pruneDownloadsByPool()。
      */
     private static void writeDownloads(Context ctx, String tag, String text,
                                        boolean overwrite, String prefix) {
@@ -449,26 +468,26 @@ final class CrashLog {
         PublicFile.write(ctx, name, data, overwrite);
         if (!overwrite) {
             /*
-             * H-16：按前缀走各自的淘汰逻辑。
-             * 以前这里无条件同时清 crash 相关的两个池子，而下载目录里
-             * 错误日志也带 "Ripple-crash-" 前缀 → 两者挤同一个 10 份配额。
-             * 现在错误日志写 "Ripple-err-"，只清错误池；崩溃只清崩溃池。
+             * H-16 + B-3：淘汰逻辑按**语义 tag** 分池，不按文件名前缀。
+             *
+             * 按前缀分池会踩两个坑：
+             *   ① 前缀同时也被错误日志用过（1.3.6 之前 recordAsync 也写
+             *      "Ripple-crash-"）→ 错误刷屏会挤掉真崩溃（H-16 已用
+             *      "Ripple-err-" 独立前缀缓解）；
+             *   ② 同一个 "Ripple-crash-" 前缀里还躺着 1.3.5 之前的旧格式证据
+             *      （-lyric-redraw / -exit-info / -cookie-init …），它们是
+             *      **历史现场**而不是本次崩溃，却和真崩溃挤同一个 10 份配额 →
+             *      真机上 101 份里那 11 份 1.3.3 歌词根因证据会被删光（B-3）。
+             *
+             * 现在 poolOf() 只看 tag：uncaught-* 才是真崩溃池，其余旧格式
+             * 单独一池保留 LEGACY_CRASH_FILES 份。
              */
-            if ("Ripple-err-".equals(prefix)) {
-                prunePrivateErrFiles(ctx);
-                pruneDownloadFiles(ctx, "Ripple-err-", ERR_KEEP_FILES);
-            } else {
-                prunePrivateCrashFiles(ctx);
-                pruneDownloadFiles(ctx, "Ripple-crash-", MAX_CRASH_FILES);
-            }
+            prunePrivateCrashFiles(ctx);
+            prunePrivateErrFiles(ctx);
+            pruneDownloadFiles(ctx);
         }
     }
 
-    /**
-     * 只保留最近 MAX_CRASH_FILES 份崩溃文件。
-     * 文件名形如 crash-yyyyMMdd-HHmmss-tag.txt：时间戳是零填充的，
-     * 所以按名字倒序排就是「新 → 旧」，删尾部的即可。
-     */
     /**
      * 审查 AND-04：错误日志独立的淘汰逻辑（配额 ERR_KEEP_FILES）。
      * 与 prunePrivateCrashFiles 完全分开 —— 两套文件互不影响。
@@ -495,44 +514,166 @@ final class CrashLog {
         }
     }
 
+    /**
+     * 私有目录里的崩溃文件按**语义 tag 分池**清理（B-3）。
+     *
+     * 文件名形如 crash-yyyyMMdd-HHmmss-tag.txt：时间戳零填充，
+     * 所以同一池内按名字倒序排就是「新 → 旧」，删尾部的即可。
+     *
+     * 分池规则见 tagOf / isUncaught：
+     *   · tag 以 uncaught 开头 → 真崩溃池（MAX_CRASH_FILES 份）；
+     *   · 其余 tag → 1.3.6 之前混进同前缀的旧格式证据池（LEGACY_CRASH_FILES 份）。
+     * 两池各自计时，真崩溃不会因为久病成堆的错误日志被顶掉，反之亦然。
+     */
     private static void prunePrivateCrashFiles(Context ctx) {
         try {
             File dir = ctx.getFilesDir();
             if (dir == null) return;
             File[] all = dir.listFiles((d, n) -> n.startsWith("crash-") && n.endsWith(".txt"));
-            if (all == null || all.length <= MAX_CRASH_FILES) return;
-            Arrays.sort(all, Comparator.comparing(File::getName).reversed());
-            for (int i = MAX_CRASH_FILES; i < all.length; i++) {
-                // 只删自己命名规则内的文件，且确认在 files 目录里
-                try {
-                    if (all[i].getParentFile() != null
-                            && all[i].getParentFile().getAbsolutePath()
-                                    .equals(dir.getAbsolutePath())) {
-                        //noinspection ResultOfMethodCallIgnored
-                        all[i].delete();
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
+            if (all == null || all.length == 0) return;
+            prunePrivatePool(dir, all, true, MAX_CRASH_FILES);
+            prunePrivatePool(dir, all, false, LEGACY_CRASH_FILES);
         } catch (Throwable ignored) {
         }
     }
 
     /**
-     * 下载目录里的取证文件按前缀分池清理（H-16）。
+     * 私有目录里**某一池**的淘汰。
+     *
+     * @param uncaught true = 只处理真崩溃（tag 以 uncaught 开头）；
+     *                 false = 只处理旧格式证据
+     * @param keep     该池保留份数
+     */
+    private static void prunePrivatePool(File dir, File[] all, boolean uncaught, int keep) {
+        java.util.List<File> pool = new java.util.ArrayList<>();
+        for (File f : all) {
+            String tag = tagOf(f.getName(), "crash-");
+            if (isUncaught(tag) == uncaught) pool.add(f);
+        }
+        if (pool.size() <= keep) return;
+        pool.sort(Comparator.comparing(File::getName).reversed());
+        for (int i = keep; i < pool.size(); i++) {
+            // 只删自己命名规则内的文件，且确认在 files 目录里
+            try {
+                File f = pool.get(i);
+                if (f.getParentFile() != null
+                        && f.getParentFile().getAbsolutePath()
+                                .equals(dir.getAbsolutePath())) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /* ==================== 下载目录取证文件的「分池」定义 ====================
+     *
+     * B-3 的核心：**池的界限是语义 tag，不是文件名前缀。**
+     *
+     * 旧实现按前缀分池，"Ripple-crash-" 这一个前缀里同时躺着三类完全不同的东西：
+     *   · 真正的 uncaught 崩溃（tag 以 uncaught- 开头）—— 最该保住；
+     *   · 1.3.6 之前用同前缀写的非崩溃错误（lyric-redraw / cookie-init …）；
+     *   · 1.3.5 之前的旧格式取证（exit-info 等），是**历史现场**。
+     * 它们挤同一个 10 份配额 → 真机上 101 份里那 11 份
+     * Ripple-crash-*-lyric-redraw.txt（1.3.3 歌词根因证据）会被静默删光。
+     *
+     * 现在按 tag 分三池，各留各的：
+     *   POOL_CRASH  tag 以 uncaught 开头      → MAX_CRASH_FILES
+     *   POOL_LEGACY 其余 crash- 前缀的旧格式  → LEGACY_CRASH_FILES
+     *   POOL_ERR    err- 前缀（AND-04）       → ERR_KEEP_FILES
+     * 新增池时在这里加一个常量 + downloadPoolOf 里一条判断，配额各自独立。
+     * ==================================================================== */
+    private static final int POOL_NONE = -1;
+    private static final int POOL_CRASH = 0;
+    private static final int POOL_LEGACY = 1;
+    private static final int POOL_ERR = 2;
+
+    /** 各池的保留份数（下标 = 池 id） */
+    private static int keepOf(int pool) {
+        if (pool == POOL_CRASH) return MAX_CRASH_FILES;
+        if (pool == POOL_LEGACY) return LEGACY_CRASH_FILES;
+        if (pool == POOL_ERR) return ERR_KEEP_FILES;
+        return 0;
+    }
+
+    /**
+     * 从一个文件名里取出**语义 tag**。
+     *
+     * 支持两种名字：
+     *   · 下载目录  "Ripple-crash-20261124-0629xx-lyric-redraw.txt"
+     *   · 私有目录  "crash-20261124-0629xx-lyric-redraw.txt"
+     * 以及 MediaStore 自动改名后的 "….txt" → " (3).txt" 形态
+     * （B-3 的碎片正是这么来的，所以清理逻辑必须能认出来）。
+     *
+     * @return tag（不含 .txt / 不含改名后缀）；不是该前缀的返回 ""
+     */
+    private static String tagOf(String fileName, String prefix) {
+        if (fileName == null || prefix == null || !fileName.startsWith(prefix)) return "";
+        String base = stripTxt(fileName.substring(prefix.length()));
+        /* 形如 yyyyMMdd-HHmmss-tag：跳过前两段 */
+        int i1 = base.indexOf('-');
+        if (i1 < 0) return "";
+        int i2 = base.indexOf('-', i1 + 1);
+        if (i2 < 0) return "";
+        return base.substring(i2 + 1);
+    }
+
+    /** 去掉结尾的 ".txt"，再去掉 MediaStore 自动改名后缀 " (3)" */
+    private static String stripTxt(String name) {
+        if (name == null) return "";
+        String base = name;
+        if (base.endsWith(".txt")) base = base.substring(0, base.length() - 4);
+        int p = base.lastIndexOf(" (");
+        if (p > 0 && base.endsWith(")")) {
+            String tail = base.substring(p + 2, base.length() - 1);
+            if (allDigits(tail)) base = base.substring(0, p);
+        }
+        return base;
+    }
+
+    private static boolean allDigits(String s) {
+        if (s == null || s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) return false;
+        }
+        return true;
+    }
+
+    /** 真崩溃的判据：tag 以 uncaught 开头（record 的调用点统一这么拼） */
+    private static boolean isUncaught(String tag) {
+        return tag != null && tag.startsWith("uncaught");
+    }
+
+    /**
+     * 下载目录里的一个文件名属于哪个池。
+     *
+     * 只处理**带时间戳的取证文件**（Ripple-crash- 与 Ripple-err- 两个前缀）；
+     * Ripple-log.txt / Ripple-trace.txt / Ripple-exit-info.txt 是固定名覆盖写的
+     * 单份文件（J-11），永远不该被任何池的配额删掉 → POOL_NONE。
+     */
+    private static int downloadPoolOf(String displayName) {
+        if (displayName == null) return POOL_NONE;
+        if (displayName.startsWith("Ripple-err-")) return POOL_ERR;
+        if (!displayName.startsWith("Ripple-crash-")) return POOL_NONE;
+        String tag = tagOf(displayName, "Ripple-crash-");
+        if (tag.isEmpty()) return POOL_NONE;
+        return isUncaught(tag) ? POOL_CRASH : POOL_LEGACY;
+    }
+
+    /**
+     * 下载目录里的取证文件分池清理（H-16 + B-3）。
      *
      * 私有目录那份清掉了，但这才是用户真正能翻到、也真正会越攒越多的那份
-     * （proot 里 /sdcard/Download 直接可见）。以前一个都不会删。
-     * 用 MediaStore 按 DISPLAY_NAME 前缀查询，取出来按名字排序后删最老的。
+     * （proot 里 /sdcard/Download 直接可见）。
      *
-     * @param prefix 文件名前缀，同时也是**配额的作用域**：
-     *               "Ripple-crash-" 留 keep 份真崩溃、"Ripple-err-" 留 keep 份错误日志。
-     *               两池互不侵占 —— 故障期的错误刷屏不会再把真崩溃报告挤出去。
-     * @param keep   该池保留份数
+     * 一次查询把所有 "Ripple-*" 条目取回来，按 downloadPoolOf 归类，
+     * 再对每个池独立地「按名字倒序排、删掉配额之外的老文件」。
+     * 池与池之间没有任何耦合 —— 这是 B-3 要的效果。
      */
-    private static void pruneDownloadFiles(Context ctx, String prefix, int keep) {
+    private static void pruneDownloadFiles(Context ctx) {
         if (Build.VERSION.SDK_INT < 29) return;   // 29 以下兜底目录由私有目录那套思路覆盖
-        if (prefix == null || prefix.isEmpty()) return;
+        if (ctx == null) return;
         try {
             android.content.ContentResolver cr = ctx.getContentResolver();
             android.database.Cursor c = cr.query(
@@ -541,9 +682,9 @@ final class CrashLog {
                             android.provider.MediaStore.MediaColumns._ID,
                             android.provider.MediaStore.MediaColumns.DISPLAY_NAME},
                     android.provider.MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?",
-                    new String[]{prefix + "%"}, null);
+                    new String[]{"Ripple-%"}, null);
             if (c == null) return;
-            // (名字, id) 收起来一次处理，别在游标打开时做删除
+            /* (名字, id) 收起来一次处理，别在游标打开时做删除 */
             java.util.List<String[]> rows = new java.util.ArrayList<>();
             try {
                 while (c.moveToNext()) {
@@ -552,19 +693,26 @@ final class CrashLog {
             } finally {
                 c.close();
             }
-            if (rows.size() <= keep) return;
-            rows.sort((a, b) -> {
-                String na = a[0] == null ? "" : a[0];
-                String nb = b[0] == null ? "" : b[0];
-                return nb.compareTo(na);      // 新 → 旧
-            });
-            for (int i = keep; i < rows.size(); i++) {
-                try {
-                    android.net.Uri u = android.content.ContentUris.withAppendedId(
-                            android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                            Long.parseLong(rows.get(i)[1]));
-                    cr.delete(u, null, null);
-                } catch (Throwable ignored) {
+            for (int pool = POOL_CRASH; pool <= POOL_ERR; pool++) {
+                java.util.List<String[]> mine = new java.util.ArrayList<>();
+                for (String[] row : rows) {
+                    if (downloadPoolOf(row[0]) == pool) mine.add(row);
+                }
+                int keep = keepOf(pool);
+                if (mine.size() <= keep) continue;
+                mine.sort((a, b) -> {
+                    String na = a[0] == null ? "" : a[0];
+                    String nb = b[0] == null ? "" : b[0];
+                    return nb.compareTo(na);      // 新 → 旧
+                });
+                for (int i = keep; i < mine.size(); i++) {
+                    try {
+                        android.net.Uri u = android.content.ContentUris.withAppendedId(
+                                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                                Long.parseLong(mine.get(i)[1]));
+                        cr.delete(u, null, null);
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         } catch (Throwable ignored) {

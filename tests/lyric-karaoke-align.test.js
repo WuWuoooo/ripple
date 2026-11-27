@@ -22,7 +22,18 @@
  *   并把 base.css 原样喂进去 —— 改坏了就会红。
  *
  * 跑法：node --test tests/lyric-karaoke-align.test.js
- * 依赖：本机 /opt/chrome/chrome-linux64/chrome（没有就整体 skip，不报红）
+ * 依赖：一个 Chrome / Chromium 可执行文件。按下面的顺序找：
+ *         ① 环境变量 CHROME_PATH（CI 用这个；本机想换版本也用它）
+ *         ② 本机既有安装 /opt/chrome/chrome-linux64/chrome
+ *         ③ PATH 上的 google-chrome / chromium / chromium-browser / chrome
+ *       一个都找不到才整体 skip，且**打印显式的 skip 告警**（不静默）。
+ *
+ * 为什么必须支持环境变量（审查 1.3.8 的 H-16）：
+ *   以前 CHROME 是写死的本机绝对路径，SKIP = !fs.existsSync(CHROME)。
+ *   GitHub Actions 的 ubuntu runner 没有 /opt/chrome/chrome-linux64/chrome，
+ *   于是这两条 1.3.8 最关键的回归防线（卡拉OK 染色对齐 / 封面尺寸抖动）
+ *   在 CI 上**永远 skip** —— 本地绿、CI 也绿，但那条防线在 CI 上根本不存在。
+ *   现在 CI 会装 chromium 并把它指到 CHROME_PATH，这两条真的会跑。
  */
 'use strict';
 
@@ -35,8 +46,68 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
-const CHROME = '/opt/chrome/chrome-linux64/chrome';
-const SKIP = !fs.existsSync(CHROME);
+
+/**
+ * 找 Chrome 可执行文件（H-16）。
+ *
+ * 顺序：CHROME_PATH 环境变量 → 本机既有安装 → PATH 上的常见名字。
+ * 返回的可能是 PATH 上的裸命令名（如 "chromium"），此时 existsSync 为假
+ * 但 spawn 仍能跑，所以「是否存在」用一个宽松判定（resolveChrome 里处理）。
+ */
+function resolveChrome() {
+  const candidates = [];
+  if (process.env.CHROME_PATH) candidates.push(process.env.CHROME_PATH);
+  candidates.push('/opt/chrome/chrome-linux64/chrome');   // 本机既有安装
+  candidates.push('/usr/bin/google-chrome');              // CI: google-chrome 包
+  candidates.push('/usr/bin/chromium');                   // CI: chromium 包
+  candidates.push('/usr/bin/chromium-browser');           // Debian/Ubuntu 旧名
+  candidates.push('google-chrome', 'chromium', 'chromium-browser', 'chrome');
+
+  for (const c of candidates) {
+    if (!c) continue;
+    if (c.includes(path.sep)) {
+      if (fs.existsSync(c)) return c;
+    } else {
+      /* 裸命令名：在 PATH 里找一遍（不真的执行它） */
+      const dirs = (process.env.PATH || '').split(path.delimiter);
+      for (const d of dirs) {
+        if (!d) continue;
+        const full = path.join(d, c);
+        if (fs.existsSync(full)) return full;
+      }
+    }
+  }
+  return '';
+}
+
+const CHROME = resolveChrome();
+const SKIP = !CHROME;
+
+/*
+ * 显式告警（H-16 的 (c)）：真要 skip 的时候不能在 CI 上静默过去。
+ *
+ * 本地没装 Chrome 时这是一条普通提示；但在 CI 里它意味着「两条最关键的
+ * 回归防线不存在」—— 所以顺便把 CI 环境标出来，让这条 skip 在日志里显眼。
+ *
+ * 另外，**CHROME_PATH 被显式设置却解析不到**必须是硬失败，不能静默 skip：
+ * 在 CI 里那意味着「workflow 装了浏览器，但路径写错了」——degrade 成 skip
+ * 之后防线又不存在了，而且这次连告警都看不出是配置错。
+ */
+const IN_CI = !!(process.env.CI || process.env.GITHUB_ACTIONS);
+if (process.env.CHROME_PATH && !CHROME) {
+  throw new Error('CHROME_PATH 已设置但指向的不是可执行的 Chrome/Chromium：'
+    + process.env.CHROME_PATH
+    + '（CI 里这说明 workflow 装浏览器的步骤与这里不一致；'
+    + ' 若确实要跳过，请取消 CHROME_PATH 并接受「跳过」告警）');
+}
+if (SKIP) {
+  const msg = '⚠️ 跳过卡拉OK/封面两条真浏览器测试：找不到 Chrome/Chromium'
+    + '（可用 CHROME_PATH 指定）';
+  console.error(IN_CI ? '::warning::' + msg : msg);
+} else {
+  /* 让 CI 日志能直接看到「到底用了哪个浏览器」—— 排查 skip / 版本问题时省一轮 */
+  console.error('真浏览器测试将使用：' + CHROME);
+}
 
 /* ------------------------------------------------------------ 工具 */
 

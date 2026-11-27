@@ -329,11 +329,51 @@ function implementedNames(srcRaw, kind) {
 /*
  * 这些命令是纯前端 / 纯本地能力，不该出现在三端的命令表里 ——
  * 它们**豁免**「三端都必须实现」的断言（这是历史结论，不是漏项）。
+ *
+ * 审查 1.3.8 · M-18：这里以前是无理由的 Set（`new Set(['logout','comment_add'])`），
+ * 谁都能往里面塞一个命令就把断言绕过去，而且没人知道为什么它在里面。
+ * 现在改成 Map —— **值必须是豁免理由**，且空理由会被判定为不合格。
+ * 这条规则对标同文件 SHELL_EXTRA_ALLOWED（「每一项都必须写明为什么」），
+ * 全仓库只保留一种豁免标准，不再有第二套宽松口径。
  */
-const LOCAL_ONLY = new Set(['logout', 'comment_add']);
+const LOCAL_ONLY = new Map([
+  [
+    'logout',
+    /* 纯本地动作：只清本机 cookie / 登录态并刷新 UI，不需要打上游接口，
+       所以三端都没有对应实现，也不该有。 */
+    '纯本地动作：只清本机 cookie 与登录态并刷新 UI，不打上游接口，三端本就无实现',
+  ],
+  [
+    'comment_add',
+    /* 走的是已登录态下的表单提交，前端在 app.js 里直接拼 payload 后
+       复用 comment 系的桥；没有独立的上游 path，故不参与路径比对。 */
+    '走已登录态的表单提交，复用 comment 系桥，没有独立上游 path，故不参与路径比对',
+  ],
+]);
+
+/*
+ * 豁免判定：光在名单里不够，**必须带非空理由**。
+ *
+ * 这条函数就是 M-18 的机械防线 —— 以后有人往 LOCAL_ONLY 里加命令却
+ * 不写为什么，这里会直接报红（在 [A/B] 检查开头统一扫一遍），
+ * 而不是让一条无名豁免悄悄改变断言语义。
+ */
+function isExemptLocalOnly(cmd) {
+  if (!LOCAL_ONLY.has(cmd)) return false;
+  const why = String(LOCAL_ONLY.get(cmd) || '').trim();
+  return why.length > 0;
+}
 
 function checkCommandsAndPaths() {
   console.log('\n[A/B] 三端命令名与上游路径');
+
+  /* 先校验豁免名单本身的合法性（M-18）：每一项都必须写明理由 */
+  for (const [cmd, why] of LOCAL_ONLY) {
+    if (!String(why || '').trim()) {
+      fail(`LOCAL_ONLY 里的 "${cmd}" 没有写明豁免理由`
+        + '（豁免必须带为什么，否则它就是一个无约束的口子）');
+    }
+  }
 
   const fe = frontendCommands();
   const javaSrc = read('android/app/src/main/java/com/ripple/app/NeteaseClient.java');
@@ -354,7 +394,7 @@ function checkCommandsAndPaths() {
   /* ---- A. 命令名：每条命令三端都要有实现，缺哪端明确报出来 ---- */
   const allCmds = new Set([...fe, ...node, ...java, ...rust]);
   for (const cmd of [...allCmds].sort()) {
-    if (LOCAL_ONLY.has(cmd)) continue;
+    if (isExemptLocalOnly(cmd)) continue;
     const missing = [];
     if (!node.has(cmd)) missing.push('server.js');
     if (!java.has(cmd)) missing.push('Java');
@@ -373,7 +413,7 @@ function checkCommandsAndPaths() {
   for (const cmd of [...allCmds].sort()) {
     /* 只看三端都有实现的命令；缺端的情况 A 已经报过，不重复报 */
     if (!ends.every(([, , names]) => names.has(cmd))) continue;
-    if (LOCAL_ONLY.has(cmd)) continue;
+    if (isExemptLocalOnly(cmd)) continue;
 
     const detail = ends
       .map(([name, paths]) => `${name}=${JSON.stringify(paths.get(cmd) || [])}`)
@@ -665,6 +705,81 @@ function parseSyncTargets() {
   return list;
 }
 
+/* ---------------------------------------------------------------
+ * H：桌面端 capabilities 不得用 core:default（审查 1.3.8 · H-9 配套）
+ *
+ * 为什么要这条：`core:default` 一次性把 core:path / core:image /
+ * core:tray / core:menu / core:webview 等**全部**默认权限开给窗口，
+ * 而本项目一个都没用到。其中 core:path 的 resolve_directory 能解析出
+ * 用户主目录/文档目录的绝对路径 —— 今天不可利用（没有 XSS），
+ * 但它是「零成本就能拥有的探针」，一旦将来引入任何注入点就立刻有价值。
+ *
+ * 加权限应该是**有意为之**的动作，而不是复制一个 core:default 就顺带全开。
+ * 所以这里直接禁止，需要哪项就显式列哪项。
+ * --------------------------------------------------------------- */
+function checkCapabilityScopes() {
+  console.log('\n[H] 桌面端 capabilities 权限面（禁止 core:default）');
+
+  const before = failures;
+  const dir = 'desktop/src-tauri/capabilities';
+  let files = [];
+  try {
+    files = fs.readdirSync(path.join(ROOT, dir)).filter((f) => f.endsWith('.json'));
+  } catch (e) {
+    fail(`读不到 ${dir}/：${e && e.message}`);
+    return;
+  }
+  if (!files.length) {
+    fail(`${dir}/ 里没有 .json 能力文件（桌面端窗口将无任何权限）`);
+    return;
+  }
+
+  for (const f of files.sort()) {
+    const src = read(`${dir}/${f}`);
+    let json;
+    try {
+      json = JSON.parse(src);
+    } catch (e) {
+      fail(`${dir}/${f} 不是合法 JSON：${e && e.message}`);
+      continue;
+    }
+    const perms = Array.isArray(json.permissions) ? json.permissions : [];
+    if (perms.includes('core:default')) {
+      fail(`${dir}/${f} 用了 core:default`
+        + '（它会把 core:path / core:image / core:tray / core:menu 等全部默认权限开给窗口，'
+        + '本项目一项都没用到；请按需显式列出具体权限）');
+    }
+  }
+
+  if (failures === before) {
+    ok(`${files.length} 个能力文件都没有 core:default（权限面按需显式）`);
+  }
+}
+
+/*
+ * 从 CONTRIBUTING.md 的「版本同步清单」表格里提取**文档声称的**版本副本路径。
+ *
+ * 只认表格里用反引号包起来的、看起来像文件路径的条目 ——
+ * 不扫全文反引号，否则「跑 `bash android/sync-version.sh`」这种命令
+ * 也会被当成路径，反向比对立刻全是假阳性。
+ */
+function versionCopyPathsMentionedIn(doc) {
+  const out = new Set();
+  /* 表格行：以 | 开头，首列就是被描述的文件路径 */
+  for (const line of doc.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('|')) continue;
+    const m = t.match(/^\|\s*`([^`]+)`/);
+    if (!m) continue;
+    const p = m[1].trim();
+    /* 过滤掉明显不是路径的（含空格 / 以 bash 开头 / 是命令） */
+    if (!p || /\s/.test(p)) continue;
+    if (!/\.(json|js|gradle|java|toml|lock)$/.test(p)) continue;
+    out.add(p);
+  }
+  return [...out];
+}
+
 function checkVersionTargetsAgree() {
   console.log('\n[G] 版本副本清单三方一致（解析器 / 同步脚本 / 文档）');
 
@@ -693,7 +808,14 @@ function checkVersionTargetsAgree() {
     }
   }
 
-  /* ② CONTRIBUTING.md 的版本同步清单表格 */
+  /* ② CONTRIBUTING.md 的版本同步清单表格 —— **双向**比对（审查 1.3.8 · M-17）
+   *
+   * 以前只查一个方向（文档漏列解析器里的路径），于是文档里**凭空多列**一个
+   * 根本不存在的文件也能报绿 —— 那份表格的标题是「三方一致」，
+   * 单向比对配不上这个措辞。现在两个方向都查：
+   *   · 解析器有、文档没有 → 改这处的人不知道要跑 sync-version.sh（原有方向）
+   *   · 文档有、解析器没有 → 文档在骗人（新加方向）
+   */
   const doc = read('CONTRIBUTING.md');
   const backendMissing = factsCopyPaths.filter((p) => !doc.includes('`' + p + '`'));
   if (backendMissing.length) {
@@ -702,8 +824,236 @@ function checkVersionTargetsAgree() {
       + '（文档少列一处 = 改这处的人不知道要跑 sync-version.sh）');
   }
 
+  /*
+   * 反方向：文档里列了、但解析器里根本没有这个副本。
+   *
+   * 为什么这条重要：这份表格的语义是「这些文件里有版本号，改了一个要同步」。
+   * 文档多列一个不存在的文件，读者会去找一个不存在的路径；
+   * 更糟的是它会掩盖「真副本被删了但文档没同步」这件事。
+   */
+  const docListed = versionCopyPathsMentionedIn(doc);
+  const ghostInDoc = docListed.filter((p) => !factsCopyPaths.includes(p));
+  if (ghostInDoc.length) {
+    fail('CONTRIBUTING.md 的「版本同步清单」表格列了这些路径，'
+      + '但 scripts/version-facts.js 的 COPIES 里没有它们：'
+      + ghostInDoc.map((p) => '`' + p + '`').join('、')
+      + '（文档在描述不存在的副本 = 读者会去找一个没有的文件）');
+  }
+
   if (failures === before) {
-    ok(`版本副本 ${factsCopyPaths.length} 处：解析器 / sync-version.sh / CONTRIBUTING.md 三方一致`);
+    ok(`版本副本 ${factsCopyPaths.length} 处：解析器 / sync-version.sh / CONTRIBUTING.md 三方一致（双向）`);
+  }
+}
+
+/* ---------------------------------------------------------------
+ * I：构建链的「判据不许再抄一份」机械防护（审查 1.3.8 的 B-3 / B-4 / H-12 ~ H-16）
+ *
+ * 思路与 A/B 一致：不是「这次把某处改对」，而是让**复发本身被拦住**。
+ * 每条都对着报告里一个已发生的缺陷：
+ *   B-4  —— 两个 workflow + 一个测试里各有一份「读 Cargo.toml 第一处 version」
+ *   H-12 —— sync-version.sh 的**写入侧**也是「改第一处」
+ *   H-14 —— build-apk.sh 用 mapfile（bash 4+，macOS 3.2 不可用）
+ *   H-15 —— build-apk.sh 没有与 build.gradle noCompress 等价参数
+ *   H-13 —— desktop-build.yml 的 push 触发缺 main
+ *   B-3  —— PublicFile 用 RELATIVE_PATH 等值 + 强制 owner 非 null 当复用判据
+ *
+ * 这些文件在 tests/manifest-consistency.test.js 的「临时副本」里大多不存在，
+ * 所以每项都做「锚点不存在 ⇒ 跳过」，而不是 ENOENT 把整段打崩。
+ * --------------------------------------------------------------- */
+
+/** 读文件，不存在返回 null（用于可选锚点） */
+function readIfExists(rel) {
+  return exists(rel) ? read(rel) : null;
+}
+
+/**
+ * 去掉 YAML / shell 的**整行注释**，只留下真正会执行的文本。
+ *
+ * 为什么必须有这一步：下面几条断言要禁的是「代码里再用错误判据」，
+ * 而注释里恰恰会**引用**那些被禁的写法（"以前这里是 sed ..."）。
+ * 不剥注释就会把修复说明本身判成违规 —— 这是「机械检查器误报」的典型形态，
+ * 一旦发生，下一个人就会去删掉注释里的历史解释，把知识一起扔掉。
+ */
+function stripLineComments(src) {
+  if (!src) return '';
+  return src
+    .split('\n')
+    .filter((line) => !/^[ \t]*#/.test(line))
+    .join('\n');
+}
+
+/** 是否含「读 Cargo.toml 第一处 version」的判据（B-4 的形态） */
+function hasFirstVersionHeuristic(src) {
+  if (!src) return false;
+  return /^.*sed[^\n]*\^version/m.test(src)
+    || /^.*awk[^\n]*\^version/m.test(src)
+    || /match\(\/\^version = /.test(src);
+}
+
+function checkBuildChainGuards() {
+  console.log('\n[I] 构建链判据不重复 / 平台下限 / 产物等价');
+
+  const before = failures;
+  let checked = 0;
+
+  /* ---------- B-4：CI 必须调唯一解析器，不许再抄第一处判据 ---------- */
+  const wfDir = '.github/workflows';
+  let wfiles = null;
+  try {
+    wfiles = fs.readdirSync(path.join(ROOT, wfDir)).filter((f) => /[.]ya?ml$/.test(f));
+  } catch (e) {
+    wfiles = null;
+  }
+  if (!wfiles) {
+    console.log('  （临时副本里没有 .github/workflows，跳过 CI 判据检查）');
+  } else {
+    checked++;
+    const calledIn = new Set();
+    for (const f of wfiles.sort()) {
+      const rel = wfDir + '/' + f;
+      const raw = readIfExists(rel);
+      if (raw === null) continue;
+      /* 只看可执行文本（YAML 里 "#" 开头是注释；工作流正文都是 shell） */
+      const src = stripLineComments(raw);
+      if (/version-facts[.]js[^\n]*--assert/.test(src)) calledIn.add(f);
+      if (src.includes('Cargo.toml') && hasFirstVersionHeuristic(src)) {
+        fail(rel + ' 里仍有「读 Cargo.toml 第一处 version」的判据'
+          + '（B-4：只要 [package] 之前出现一个 version 键就会读到错的表而报绿。'
+          + ' 请改成 node scripts/version-facts.js --assert）');
+      }
+    }
+    if (calledIn.size === 0) {
+      fail('没有任何 workflow 调用 scripts/version-facts.js --assert'
+        + '（B-4：版本判据必须以唯一解析器为唯一入口，否则迟早再抄出第四份）');
+    } else {
+      for (const need of ['build.yml', 'desktop-build.yml']) {
+        if (!wfiles.includes(need)) continue;
+        if (!calledIn.has(need)) {
+          fail(wfDir + '/' + need + ' 没有调用 scripts/version-facts.js --assert'
+            + '（它自己那套版本校验必须整段交给唯一解析器）');
+        }
+      }
+    }
+  }
+
+  /* ---------- H-12：写入侧不许「改第一处」，且必须是 [package] 段内 ---------- */
+  const syncShRaw = readIfExists('android/sync-version.sh');
+  if (syncShRaw !== null) {
+    checked++;
+    const syncSh = stripLineComments(syncShRaw);
+    if (/0,\/\^version/.test(syncSh)) {
+      fail('android/sync-version.sh 里仍有 sed "0,/^version = .../" —— 那是「改文件第一处 version」'
+        + '（H-12：会把版本号写进 [profile.release] 之类的表，而 [package].version 纹丝不动）。'
+        + '请改成 [package] 段内定位，与 desktop/build-frontend.sh 的 sync_toml() 同一套实现');
+    }
+    if (!/\[package\]/.test(syncSh)) {
+      fail('android/sync-version.sh 的 Cargo.toml 写入侧没有 [package] 段内定位的痕迹（H-12）');
+    }
+    if (/^[ \t]*if \[ -f "\$ROOT\/scripts\/version-facts\.js" \] && command -v node/m.test(syncSh)) {
+      fail('android/sync-version.sh 的收尾复核仍是「文件与 node 都在才跑」的条件式 —— '
+        + 'B-4：那等于「脚本还能跑，但没人验证」，必须改成缺失即硬失败');
+    }
+  }
+
+  /* ---------- H-14：不许用 bash 4+ 才有的语法 ---------- */
+  for (const rel of ['android/build-apk.sh', 'android/sync-version.sh', 'tests/run.sh']) {
+    const src = readIfExists(rel);
+    if (src === null) continue;
+    checked++;
+    /* 先去注释再判，避免注释里解释 mapfile 历史被误报 */
+    const code = stripComments(src);
+    if (/^[ \t]*mapfile\b/m.test(code)) {
+      fail(rel + ' 用了 mapfile（bash 4.0+）——'
+        + 'H-14：macOS 自带 /bin/bash 是 3.2，会报 "mapfile: command not found"，'
+        + '紧接着下游工具收到空参数列表、报出与真实原因无关的错。请改用 xargs -0');
+    }
+  }
+
+  /* ---------- H-15：两条构建路径的「不压缩扩展名」必须一致 ---------- */
+  const gradle = readIfExists('android/app/build.gradle');
+  const apkSh = readIfExists('android/build-apk.sh');
+  if (gradle !== null && apkSh !== null) {
+    checked++;
+    const gm = gradle.match(/aaptOptions\s*\{([\s\S]*?)\n\s*\}/);
+    const gradleExts = [];
+    if (gm) {
+      for (const m of gm[1].matchAll(/noCompress\s+((?:'[^']*'\s*,?\s*)+)/g)) {
+        for (const q of m[1].matchAll(/'([^']*)'/g)) gradleExts.push(q[1]);
+      }
+    }
+    /* build-apk.sh 侧：NO_COMPRESS_REGEX='\\.mp3$' → 抽出扩展名 */
+    const rm = apkSh.match(/NO_COMPRESS_REGEX=['"]([^'"]+)['"]/);
+    const shExts = [];
+    if (rm) {
+      for (const m of rm[1].matchAll(/\.([A-Za-z0-9]+)\$/g)) shExts.push(m[1]);
+    }
+    const norm = (arr) => [...new Set(arr.map((s) => s.trim().toLowerCase()).filter(Boolean))].sort();
+    const a = norm(gradleExts);
+    const b = norm(shExts);
+    if (a.join(',') !== b.join(',')) {
+      fail('两条构建路径的「不压缩扩展名」不一致：'
+        + 'android/app/build.gradle = [' + a.join(', ') + ']，'
+        + 'android/build-apk.sh = [' + b.join(', ') + ']'
+        + '（H-15：Gradle 与 build-apk.sh 出的 APK 不是同一个包。'
+        + ' aapt2 的 --no-compress 是布尔开关、不吃扩展名，等价参数是 --no-compress-regex）');
+    }
+    /* 只看 shell 的可执行文本：注释里正是在解释「报告建议的 --no-compress mp3 会炸」 */
+    if (/--no-compress[ \t]+[a-zA-Z0-9]/.test(stripLineComments(apkSh))) {
+      fail('android/build-apk.sh 里出现了 --no-compress <扩展名> —— '
+        + 'aapt2 link 的 --no-compress 是布尔开关，会把扩展名当成**输入文件**'
+        + '（实测：mp3: error: failed to open file）。请用 --no-compress-regex');
+    }
+  }
+
+  /* ---------- H-13：桌面端 CI 的 push 触发必须包含 main ---------- */
+  const desktopYml = readIfExists(wfDir + '/desktop-build.yml');
+  if (desktopYml !== null) {
+    checked++;
+    const pushBlock = desktopYml.match(/\n\s*push:\s*\n([\s\S]*?)(?=\n\s*(?:pull_request|workflow_dispatch|concurrency):)/);
+    if (!pushBlock) {
+      fail('.github/workflows/desktop-build.yml 里找不到 push 触发块');
+    } else if (!/^\s*-\s*main\s*$/m.test(pushBlock[1])) {
+      fail('.github/workflows/desktop-build.yml 的 push 触发里没有 main —— '
+        + 'H-13：在 main 上直接提交（不走 PR）时桌面端 CI 一次都不跑，'
+        + '发版前最后一次改动完全没被验证过');
+    }
+  }
+
+  /* ---------- B-3：PublicFile 的 MediaStore 复用判据 ---------- */
+  const pf = readIfExists('android/app/src/main/java/com/ripple/app/PublicFile.java');
+  const cl = readIfExists('android/app/src/main/java/com/ripple/app/CrashLog.java');
+  if (pf !== null) {
+    checked++;
+    const code = stripComments(pf);
+    const sel = code.match(/cr\.query\(MediaStore\.Downloads\.EXTERNAL_CONTENT_URI[\s\S]*?\);/);
+    if (sel && /RELATIVE_PATH\s*\+\s*"=\?"/.test(sel[0])) {
+      fail('PublicFile.writeMediaStore 的查询 selection 里带上了 RELATIVE_PATH（B-3）：'
+        + 'MediaStore 落库的是 "Download/"，等值比较命不中 → 每次 insert → '
+        + 'MediaStore 自动改名 → 日志碎成几十份（真机实测 32 份 Ripple-log）');
+    }
+    if (!/who\s*==\s*null\s*\|\|\s*who\.equals\(owner\)/.test(code)) {
+      fail('PublicFile.writeMediaStore 的复用判据没有容忍「OWNER_PACKAGE_NAME 为 null」（B-3）：'
+        + '该列 API 29 才引入、且大量 ROM 对自家文件也返回 null，强制非 null '
+        + '会让覆盖写永远失效（1.3.6 的 L-15 修复就这样把日志写碎了）');
+    }
+  }
+  if (cl !== null) {
+    checked++;
+    const clCode = stripComments(cl);
+    if (!/downloadPoolOf\s*\(/.test(clCode) || !/tagOf\s*\(/.test(clCode)) {
+      fail('CrashLog 的下载目录清理仍只按文件名前缀分池（B-3）：'
+        + '同一前缀里混着真崩溃与 1.3.5 之前的旧格式证据，10 份配额会把历史现场删光'
+        + '（真机 101 份 Ripple-crash-* 里那 11 份 lyric-redraw 是 1.3.3 歌词根因的关键证据）');
+    }
+    if (!/POOL_NONE/.test(clCode)) {
+      fail('CrashLog 没有「不属于任何清理池」的判定（B-3）：'
+        + '固定名覆盖写的高频文件（Ripple-log / Ripple-trace / Ripple-exit-info）'
+        + '是单份文件，不能被任何配额逻辑删掉');
+    }
+  }
+
+  if (failures === before) {
+    ok('构建链 ' + checked + ' 项防护通过（版本判据 / 平台下限 / 产物等价 / 触发分支 / 日志复用）');
   }
 }
 
@@ -715,8 +1065,10 @@ runSection('A/B', checkCommandsAndPaths);
 runSection('C', checkQrCodes);
 runSection('D', checkVersions);
 runSection('E', checkCacheInvalidation);
+runSection('H', checkCapabilityScopes);
 runSection('F', checkServiceWorkerShell);
 runSection('G', checkVersionTargetsAgree);
+runSection('I', checkBuildChainGuards);
 
 console.log('');
 if (failures === 0) {

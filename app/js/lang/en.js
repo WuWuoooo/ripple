@@ -760,5 +760,36 @@
     "当前 {cur} → 最新": "Current {cur} → latest",
     "准备下载…": "Preparing download…",
     "以后再说": "Not now",
+
+    /* ---- 1.3.9 补：代码审查 1.3.8 的 H-7 / Linux 实测报告的 P1 ----
+     *
+     * 键必须与 app.js 里的字面量**逐字相同**，否则 TT() 查不到词典、
+     * 静默回落中文 —— 那正是 i18n 覆盖率测试要抓的东西。
+     * 下面每条后面都标了它在源码里的出处，方便以后核对。 */
+
+    /* [H-7] app.js:4981 —— fmtN(total) + ' 条' 的字符串拼接改走 TT 模板。
+       这里只管后缀；数字本身由 fmtN 按语言决定用「万」还是 K。 */
+    "{n} 条": "{n} comments",
+
+    /* [Linux P1] app.js:1691 —— 歌单空状态：整段 HTML 一起登记。
+       注意 en 版把双引号换成单引号（HTML 属性引号在译文里换掉不影响解析，
+       但能避免与外层 JS 双引号打架），这是本文件既有条目的写法惯例。 */
+    "<div class=\"empty\" style=\"padding:26px 10px\"><b>还没有绑定网易云账号</b><p>在「我的」里登录，就能看到你的歌单与收藏</p></div>":
+      "<div class='empty' style='padding:26px 10px'><b>Not signed in to NetEase Cloud</b><p>Sign in under Me to see your playlists and likes</p></div>",
+
+    /* [Linux P1] app.js:2441/2443/2445 —— MediaError 按 code 分类后的三条提示。
+       原来看起来只有「音源可能已失效」一条，把网络中断/解码失败/格式不支持
+       全混在一起，用户被引向「歌下线了」这个错误方向。分类后每类都要有独立英文。 */
+    "网络中断了，检查一下网络再重试":
+      "The connection dropped — check your network and try again",
+    "这首的音频解不开（可能是格式不支持），试试下一首":
+      "This track's audio can't be decoded (unsupported format?) — try the next one",
+    "拿不到音频：可能音源失效、格式不支持，或当前网络连不上音源服务器":
+      "Couldn't load the audio: the source may be gone, the format unsupported, or the network can't reach the audio server",
+
+    /* [M-3] app.js:6634 —— store.clearLocal() 返回值终于被调用方处理（以前整个丢弃，
+       正在播放那首的 blob URL 永不回收）。清理后要告诉用户「那一首先留着」。 */
+    "正在播放的那首会在切歌后回收":
+      "The one currently playing will be freed after you switch tracks",
   });
 })(window);

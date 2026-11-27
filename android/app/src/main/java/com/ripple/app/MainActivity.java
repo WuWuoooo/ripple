@@ -1510,20 +1510,55 @@ public class MainActivity extends Activity {
          * 保留这次调用顺序：先 setSink(null) → stopService → stopAndQuit，
          * stopAndQuit 里的补前台动作才是真正销账的那一步。
          */
+        /*
+         * 审查 1.3.8 · M-15：onDestroy ≠ 用户退出。
+         *
+         * Android 在「进程还活着、但 Activity 被系统回收」（内存紧张、
+         * 多任务里被划走、配置变更走不到 onDestroy 的路径）时也会调它。
+         * 以前的写法**无条件** stopService + stopAndQuit，于是后台播放中
+         * 被系统回收 Activity 时，播放服务被自己停掉、通知和控制入口一起消失
+         * —— 用户报的「后台播放被系统杀了」里，有一半是 App 自己造成的。
+         *
+         * 现在的口径分两种：
+         *   · isFinishing() == true  → 用户真的退出了（返回键/杀任务），
+         *     照旧全套收尾（E-06 的兜底不能丢）；
+         *   · isChangingConfigurations() 或服务还在播 → Activity 是被回收的，
+         *     只断开 Sink（不再向前台推送），**保留服务与通知**，
+         *     让播放继续，用户重新打开 App 时 sink 会重新接上。
+         *
+         * 注意：isFinishing 在「被系统低内存回收」时是 false，这正是本修法要区分的。
+         */
+        final boolean userExiting = isFinishing() && !isChangingConfigurations();
+        PlaybackService liveSvc = null;
+        try {
+            liveSvc = PlaybackService.get();
+        } catch (Throwable ignored) {
+        }
+        final boolean stillPlaying = liveSvc != null && liveSvc.isPlaying();
+
         try {
             PlaybackService.setSink(null);
         } catch (Throwable ignored) {
         }
-        try {
-            stopService(new Intent(this, PlaybackService.class));
-        } catch (Throwable ignored) {
+
+        if (userExiting || !stillPlaying) {
+            /* 用户退出、或本来就没在播 —— 照旧全套收尾 */
+            try {
+                stopService(new Intent(this, PlaybackService.class));
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (liveSvc != null) liveSvc.stopAndQuit();
+            } catch (Throwable ignored) {
+            }
+            cancelPlaybackNotification();
+        } else {
+            /*
+             * Activity 被系统回收但还在播：只解绑，不动服务。
+             * 留一条日志，方便下次在真机上分辨「用户退出」和「被回收」。
+             */
+            LogBridge.add(this, "LIFE", "onDestroy 但仍在播放且非用户退出 → 保留播放服务");
         }
-        try {
-            PlaybackService svc = PlaybackService.get();
-            if (svc != null) svc.stopAndQuit();
-        } catch (Throwable ignored) {
-        }
-        cancelPlaybackNotification();
 
         // A-2：歌词浮层是静态单例，不主动收掉的话它会留在桌面上变成一个关不掉的幽灵窗口
         try {

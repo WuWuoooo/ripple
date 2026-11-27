@@ -66,21 +66,56 @@
    *      容器：行内新增任何一个显示远程数据的元素，只要容器整行跳过就天然安全，
    *      不必再回来加一条规则。
    *
+   * ③ 名单里的选择器必须分清**两类**，只有前一类该进来：
+   *    · 远程数据容器 —— 整棵子树装的是歌名/歌词/评论（.row / #cmtBody …）；
+   *    · 静态界面标签**不要**列进来（`.c-k` 就是踩过的坑：它装的是
+   *      netease.js 里的两个中文字面量 '歌单' / '收藏'，是界面文案，
+   *      列进来之后首页卡片角标在英文界面永远是中文）。
+   *      静态标签若确实长在被跳过容器的**内部**，放进下面的 UNSKIP_SEL。
+   *
    * data-i18n-skip 是给以后的动态内容留的显式逃生口。
    */
   var SKIP_SEL = [
     '.lyric',            // 展开歌词（整篇 LRC，#npLyric）
     '.np-lyric',         // 收起态三行歌词（#npLyricMini）
     '#npTitle', '#npArtist', '#npMeta',          // 播放页歌名/艺人
+    '#dockTitle', '#dockArtist',                 // 底部 dock 歌名/艺人（与播放页同源数据）
     '.row', '.qitem', '.plrow',                  // 一行 = 一首远程歌 / 一个歌单
     '.r-tx', '.r-fmt', '.r-du',                  // 行内歌名/艺人/音质/时长（容器之外也兜一层）
-    '.gcard', '.c-card', '.c-k',                 // 网格卡 / 首页卡片
+    '.gcard', '.c-card',                         // 网格卡 / 首页卡片（.c-k 见 UNSKIP_SEL）
     '#plTracks', '#npQueue',                     // 歌单曲目 / 播放队列
     '#cmtBody',                                  // 评论列表（真 id）
     '#searchBody',                               // 搜索结果
     '.cmt-body',
     '[data-i18n-skip]'
   ].join(',');
+
+  /**
+   * 长在「远程数据容器」**内部**的静态界面标签：即使祖先命中 SKIP_SEL 也要翻。
+   *
+   * 为什么需要第二条名单（H-8 的根因）：
+   *   首页横滑卡片 .c-card 整张都要跳过（aria-label 里是「歌名 - 艺人」，
+   *   .c-tx 里是歌单标题，全是远程数据），但它左上角的 .c-k 是
+   *   app.js:919 写死的 `<div class="c-k">${esc(it.kind || '歌单')}</div>` ——
+   *   kind 来自 netease.js 的两个字面量 '歌单' / '收藏'，是本 App 的界面文案。
+   *
+   *   把 .c-k 单独从 SKIP_SEL 里摘掉**并不够**：walk() 在 .c-card 那一层就
+   *   整棵剪掉了，根本走不到 .c-k —— jsdom 实测「只去掉 .c-k」后它仍是中文。
+   *   所以需要这份「反剪枝」名单：inSkip 向上遍历时**最近的一层命中生效**，
+   *   遇到 UNSKIP_SEL 就判定「要翻」；walk 剪枝时对 UNSKIP_HOST_SEL 里的
+   *   容器补一次子查询，把这些标签单独捞出来翻译。
+   *
+   * 维护规则：只放**只装界面文案**的元素。一个元素里只要还混着远程数据
+   * （歌名 / 评论正文 / 用户名），它就不能进这里。
+   */
+  var UNSKIP_SEL = '.c-k';
+
+  /**
+   * UNSKIP_SEL 里的标签可能出现在哪些「被跳过」的容器里。
+   * 剪枝时只对这几个容器补一次 querySelectorAll —— 它们都是卡片级小容器；
+   * 不去深入 #cmtBody / .lyric 那种大子树，避免把剪枝的性能收益吃掉。
+   */
+  var UNSKIP_HOST_SEL = '.c-card';
 
   /** 这些标签整体跳过（脚本/样式/图形） */
   var SKIP_TAG = {
@@ -111,8 +146,52 @@
     if (el.nodeType !== 1) el = el.parentElement;   // 文本节点/属性节点都从父元素起算
     while (el) {
       if (el.nodeType === 1) {
+        /*
+         * **就近命中生效**：先看反剪枝（UNSKIP_SEL），命中就判定「要翻」。
+         * 这条必须排在 SKIP_SEL 前面 —— `.c-k` 的祖先 `.c-card` 也在
+         * SKIP_SEL 里，若先判 SKIP_SEL 就永远走不到这条。
+         * 用「就近」而不是「有没有」是为了让嵌套关系说得清：
+         * 谁离文本更近，谁的那条规则说了算。
+         */
+        if (el.matches && el.matches(UNSKIP_SEL)) return false;
         if (SKIP_TAG[el.tagName]) return true;
         if (el.matches && el.matches(SKIP_SEL)) return true;
+      }
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  /**
+   * 容器整棵被剪掉时，把它内部**反剪枝名单**里的静态标签单独捞出来翻。
+   *
+   * 不加这一步会怎样：`.c-card` 命中 SKIP_SEL 就 return，`.c-k` 根本没有
+   * 被访问到的机会 —— 实测「只把 .c-k 从 SKIP_SEL 里删掉」之后它仍是「歌单」。
+   *
+   * 为什么要限定 UNSKIP_HOST_SEL：querySelectorAll 要遍历整棵子树，
+   * 被剪的容器里有 `#cmtBody`（几百条评论）、`.lyric`（整篇 LRC）这种大子树，
+   * 对它们做全量查询会把剪枝的性能收益吃掉。只对卡片级小容器补扫。
+   */
+  function walkUnskip(node) {
+    if (!node.matches || !node.matches(UNSKIP_HOST_SEL)) return;
+    var picks = node.querySelectorAll(UNSKIP_SEL);
+    for (var i = 0; i < picks.length; i++) walk(picks[i], false);
+  }
+
+  /**
+   * 这个节点的**最近一层**剪枝规则决定它要不要翻（UNSKIP 优先）。
+   * 与 inSkip 的「就近命中」保持一致，单独抽出来是因为下面要区分
+   * 「因为反剪枝才翻」和「本来就不该翻」，两者的善后动作不同。
+   */
+  function inUnskip(node) {
+    var el = node;
+    if (!el) return false;
+    if (el.nodeType !== 1) el = el.parentElement;
+    while (el) {
+      if (el.nodeType === 1) {
+        if (el.matches && el.matches(UNSKIP_SEL)) return true;
+        if (SKIP_TAG[el.tagName]) return false;
+        if (el.matches && el.matches(SKIP_SEL)) return false;
       }
       el = el.parentElement;
     }
@@ -381,6 +460,26 @@
     var mine = (typeof node.__i18nLast === 'string' && node.__i18nLast === raw);
     if (!mine || typeof node.__i18nSrc !== 'string') node.__i18nSrc = core;
 
+    /*
+     * 反剪枝名单里的元素：写 DOM 之前把**原文**留在属性上。
+     *
+     * 为什么（H-8 修复的连带风险，实测出来的）：
+     *   app.js:5902 打开歌单详情页时会读 `.c-k` 的 textContent 当数据用 ——
+     *     kind: (plEl.querySelector('.c-k') || {}).textContent
+     *   然后写进 #plKind（app.js:5290）。在「.c-k 不翻译」（1.3.8 之前）时
+     *   读到的永远是中文原文，这条链路是自洽的；但 .c-k 一旦按 H-8 翻成英文，
+     *   读回来的就是 "Playlists" —— 实测切回中文后 #plKind 上仍留着英文。
+     *
+     *   根治要改 app.js 那行（读事实源而不是读显示文本），但 app.js 不属于
+     *   本文件的写入范围。所以这里先把原文暴露成 data-i18n-src 属性，
+     *   让那边有地方可读；这个属性本身也是「这段文字的事实源是什么」的显式记录。
+     */
+    if (inUnskip(node) && node.parentElement) {
+      /* 必须写 __i18nSrc（缓存的原文），不是 core —— 英文态下 core 就是
+         当前 DOM 里的译文，写进去等于把译文当原文存下来。 */
+      node.parentElement.setAttribute('data-i18n-src', node.__i18nSrc);
+    }
+
     var next = CUR === 'zh' ? node.__i18nSrc : T(node.__i18nSrc);
     var full = parts[0] + next + parts[2];
     if (full !== raw) {
@@ -433,11 +532,32 @@
    */
   function walk(node, isRoot) {
     if (!node) return;
-    if (node.nodeType === 3) { translateTextNode(node); return; }
+    if (node.nodeType === 3) {
+      /*
+       * ★ B-1（1.3.8 blocker）：文本节点这一支也必须过 inSkip。
+       *
+       * 漏了这一行的后果：`el.textContent = X` 在 DOM 层产生的是 **childList**
+       * 变更（删旧文本节点 + 插新文本节点），走 childList 分支 → walk(新节点, true)
+       * → 这里 nodeType===3 直接翻译并 return，剪枝被**完全绕过**。
+       * 于是 `$('#npTitle').textContent = t.title` 把歌名「全部」写进去之后，
+       * 观察器接住它，界面上歌名真的变成了 All（歌词同理）。
+       *
+       * 为什么不是只在入口（isRoot）判：childList 分支传进来的可能就是文本
+       * 节点自己（`#npTitle` 整棵被替换时），它的父元素才是脏的 —— inSkip
+       * 本身就是从父元素起算、向上遍历的，所以这里无条件调用是对的。
+       */
+      if (inSkip(node)) return;
+      translateTextNode(node);
+      return;
+    }
     if (node.nodeType !== 1) return;
 
     if (isRoot ? inSkip(node) : (SKIP_TAG[node.tagName] ||
-        (node.matches && node.matches(SKIP_SEL)))) return;
+        (node.matches && node.matches(SKIP_SEL)))) {
+      /* 整棵被剪掉，但内部可能藏着反剪枝名单里的静态标签（如 .c-card > .c-k） */
+      walkUnskip(node);
+      return;
+    }
 
     for (var i = 0; i < ATTRS.length; i++) translateAttr(node, ATTRS[i]);
 

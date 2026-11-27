@@ -424,6 +424,16 @@
        给一个未声明的名字赋值，严格模式下直接抛 ReferenceError。 */
     App._homeSig = '';
     App._libSig = '';
+    /*
+     * 状态栏浮层也要作废签名（审查 1.3.8 的 M-7）。
+     *
+     * applySbOverlay() 的 sig 里只有颜色 / 位置 / 字号 / 填充这些**参数**，
+     * 没有语言项 —— 切语言后参数一个都没变，下一次非 force 的调用就会
+     * 因「签名未变」早退，浮层收不到重推。而原生侧文案（原生控制条的
+     * 按钮标题、样式页标签）是跟着语言走的，需要这一次重推才会更新。
+     * 清掉签名 = 下一次调用一定会真的跨桥。
+     */
+    _sbApplySig = '';
     try { renderAll(); } catch (e) { Log.err('I18N', e, 'renderAll'); }
     /* 播放页与设置页的分组标题也是内部拼的，重刷一次 */
     try { renderNP(); } catch (e) {}
@@ -945,6 +955,32 @@
       ${artHTML(p, 'th')}
       <b>${esc(p.title)}</b><span>${esc(p.sub || '')}</span>
     </div>`;
+  }
+
+  /**
+   * 回收「清空本机曲库」时被 store 保留下来的那几个 blob URL。
+   *
+   * 背景（审查 1.3.8 的 M-3）：store.js 的 clearLocal() 为了不掐断正在听的歌，
+   * 会跳过当前曲目的 blob revoke，并把它的 id 放进返回值 kept。
+   * 这里负责把 kept 里对应的 blob 真正回收掉 —— 否则它会一直挂在内存里
+   * 直到页面关闭（导入过多张大专辑后很明显）。
+   *
+   * 为什么要按 id 再查一遍曲目：调用方拿到 kept 之后可能已经过了几帧，
+   * 曲目对象从 localTracks 里删掉后 src 就拿不到了 —— 所以这里接受
+   * 「曲目 id → src」的兜底映射，调用方在清空前抓一份即可（见 clearLocal 调用点）。
+   * 取不到就什么都不做：泄漏一个 blob 远比误 revoke 正在播的音频轻。
+   */
+  function revokeKeptLocalBlobs(ids, srcById) {
+    if (!ids || !ids.length) return;
+    const map = srcById || App._clearedSrcById || {};
+    ids.forEach((id) => {
+      const src = map[id];
+      if (!src || !/^blob:/i.test(String(src))) return;
+      /* 正在播就不 revoke —— 和 store.js 的判据保持同一套，避免两边互相拆台 */
+      const cur = Player.track;
+      if (cur && cur.id === id && cur.src === src) return;
+      try { URL.revokeObjectURL(src); } catch (e) {}
+    });
   }
 
   function renderAll() {
@@ -1643,8 +1679,16 @@
     if (!Netease.loggedIn) {
       $('#myPlTitle').textContent = '我的歌单';
       $('#myPlHint').textContent = '登录后可见';
-      box.innerHTML = `<div class="empty" style="padding:26px 10px">
-        <b>还没有绑定网易云账号</b><p>在「我的」里登录，就能看到你的歌单与收藏</p></div>`;
+      /*
+       * 空状态必须走 TT()（Linux 实测报告 P1：切 English 后这一整段仍是中文）。
+       * 以前这里是纯中文字面量，词典里当然没有它 —— 而 i18n.js 只翻译
+       * 「已经渲染进 DOM 的文本节点」，一个从头到尾没进过词典的句子
+       * 会被当成「远程数据」跳过（.empty 不在 SKIP_SEL 里，但整串查不到
+       * 命中就原样留着），于是英文界面里它永远是中文。
+       * 这里按 i18n 的既有约定把整段 HTML 作为键（与 en.js 里
+       * '<div class="empty"><b>还没有专辑</b>…' 那几条同一形状）。
+       */
+      box.innerHTML = TT('<div class="empty" style="padding:26px 10px"><b>还没有绑定网易云账号</b><p>在「我的」里登录，就能看到你的歌单与收藏</p></div>');
       return;
     }
     if (App._myPl) {
@@ -2367,6 +2411,50 @@
     }
   }
 
+  /**
+   * 把 <audio> 的 MediaError 翻成一句人话。
+   *
+   * 返回 { code, desc }：code 是 MediaError.code（取不到时 0），
+   * desc 是已经走过 TT() 的提示文案。
+   *
+   * 为什么会话里要判两处：Player 的 error 事件来自三个 <audio>，
+   * 事件只带曲目对象、不带错误码 —— 真正的码在元素上。
+   * 这里优先读 Player.el，拿不到再退到 Player.elA/elB/elC 里任一有 error 的。
+   */
+  function mediaErrorInfo() {
+    let err = null;
+    try {
+      const els = [];
+      if (Player && Player.el) els.push(Player.el);
+      ['elA', 'elB', 'elC'].forEach((k) => {
+        const el = Player && Player[k];
+        if (el && els.indexOf(el) < 0) els.push(el);
+      });
+      for (const el of els) {
+        if (el && el.error && el.error.code) { err = el.error; break; }
+      }
+    } catch (e) { err = null; }
+    const code = err && err.code ? Number(err.code) : 0;
+    let desc;
+    if (code === 2) {
+      /* 网络中断：重试有意义，所以文案要说「重试」而不是「换一首」 */
+      desc = TT('网络中断了，检查一下网络再重试');
+    } else if (code === 3) {
+      desc = TT('这首的音频解不开（可能是格式不支持），试试下一首');
+    } else if (code === 4) {
+      desc = TT('拿不到音频：可能音源失效、格式不支持，或当前网络连不上音源服务器');
+    } else if (code === 0) {
+      /* 完全拿不到 MediaError：最典型的来源是 Player.load() 里 new URL() 抛错
+         （用户从「从链接添加」粘了一个非法地址），这种情况根本不存在「音源失效」。 */
+      desc = TT('无法获取播放地址');
+    } else {
+      desc = TT('音源可能已失效，试试下一首');
+    }
+    /* 把原始错误码记进日志：排障时「码是什么」比「弹了什么」有用得多 */
+    try { Log.add('PLAY', 'media error code=' + code + (err && err.message ? ' msg=' + err.message : '')); } catch (e) {}
+    return { code: code, desc: desc };
+  }
+
   function bindPlayer() {
     Player.on('track', (t) => {
       /*
@@ -2379,6 +2467,20 @@
        * 恢复路径由 restoreLast 打上 App._restoring 标记，这里整段跳过清零。
        */
       if (t && !App._restoring) { S().lastPosition = 0; rememberProgress(true); }
+      /*
+       * 「清空本机曲库」时为在播曲目保留下来的 blob，在切歌后到这里回收。
+       *
+       * 为什么挂在 track 事件上而不是定时器：切歌是「那条 blob 不再被需要」
+       * 的唯一可靠信号 —— 播放器换到别的曲目（或同元素换了 src）之后，
+       * 旧 blob 就再也不会被读取了。定时器猜不准，还会在用户反复切歌时重复跑。
+       * revokeKeptLocalBlobs 内部还会再核一次「这条是不是当前在播的」，
+       * 所以即使这里判错也不会误 revoke 正在用的音源。
+       */
+      if (App._clearedSrcById) {
+        try { revokeKeptLocalBlobs(Object.keys(App._clearedSrcById), App._clearedSrcById); } catch (e) {}
+        /* 只回收一次：之后这张表就没有意义了（对应曲目已不在曲库里） */
+        App._clearedSrcById = null;
+      }
       paletteFor(t);
       updateDock();
       // renderNP() 内部已经把封面/背景/队列/歌词/模式按钮都刷过了，
@@ -2498,7 +2600,32 @@
       const dock = document.getElementById('dockInner');
       if (dock) dock.classList.toggle('buffering', !!on);
     });
-    Player.on('error', () => toast('播放出错', '音源可能已失效，试试下一首', 'warn'));
+    /*
+     * 播放失败按 MediaError 分类提示（Linux 实测报告 P1）。
+     *
+     * 以前所有 error 一刀切弹「音源可能已失效，试试下一首」—— 而实测
+     * （Ubuntu 无 GPU 容器，WebKit 拒绝播放）的真实错误码是 4
+     * （MEDIA_ERR_SRC_NOT_SUPPORTED），它同时覆盖「源 404 / 被删」、
+     * 「WebView 缺解码器」、「WebView 连不上外网」三种完全不同的原因。
+     * 把它们统一说成「音源失效」会把人引向错误方向：用户以为是歌下线了，
+     * 实际要装解码器，或者代理没配到 WebView 上。
+     *
+     * MediaError.code 的四种取值：
+     *   1 ABORTED            —— 播放被主动中止（切歌 / pause 触发的假错误）
+     *   2 NETWORK            —— 网络中断，重试可能好
+     *   3 DECODE             —— 解码失败，多半是编码 / 解码器问题
+     *   4 SRC_NOT_SUPPORTED  —— 源不可用或格式不支持（最常见，也最含糊）
+     * 拿不到 element 或没有 error 时按原来的兜底文案走。
+     */
+    Player.on('error', () => {
+      const m = mediaErrorInfo();
+      if (m.code === 1) {
+        /* ABORTED：切歌瞬间可能触发，属于噪音，不打扰用户 */
+        Log.add('PLAY', 'media error aborted (ignored)');
+        return;
+      }
+      toast('播放出错', m.desc, 'warn');
+    });
     Player.on('sourcefail', (t) => {
       Log.add('PLAY', 'sourcefail: ' + (t && t.title) + ' neId=' + (t && t.neId)
         + ' hasSrc=' + !!(t && t.src) + ' trial=' + !!(t && t.trial)
@@ -4450,6 +4577,19 @@
    * 表现就是「收起完了还要愣一下才能再点展开」。
    */
   function aniDurationMs() {
+    /*
+     * 「移除动画」（prefers-reduced-motion: reduce）时直接返回 0（审查 1.3.8 的 M-2）。
+     *
+     * responsive.css 在这条媒体查询里把所有 animation-duration 压到 .001ms，
+     * 但 --dur-ani 这个**变量**没被覆盖 —— 于是下面读到的还是标称值 300ms，
+     * 摘 .collapsing 的定时器要等 300ms 才跑：动画早就瞬间结束，界面上
+     * 却是「瞬间消失 + 三行愣 300ms 后才出现」，正是这次改动要消灭的那份不对称，
+     * 在无障碍用户身上原样重现。
+     * 返回 0 不是「少一点动画」而是「与实际生效时长对齐」。
+     */
+    try {
+      if (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches) return 0;
+    } catch (e) { /* matchMedia 不可用（极老内核）：按标称值走 */ }
     try {
       const v = getComputedStyle(document.documentElement)
         .getPropertyValue('--dur-ani').trim();
@@ -4821,7 +4961,21 @@
       return;
     }
 
-    const fmtN = (n) => (n >= 10000 ? (n / 10000).toFixed(1) + ' 万' : String(n));
+    /*
+     * 数量格式化：中文用「万」，英文用「K」（审查 1.3.8 的 H-7）。
+     *
+     * 以前是无条件拼「万」——英文界面于是显示「1.2 万 likes」：TT('{n} 赞')
+     * 翻掉的是模板，被插进 {n} 的**量级单位本身**没人翻，英文读者既不懂
+     * 「万」也不知道那是 12000。这里照 perf.js 已有的做法：
+     * 判据看 I18n.lang，数值单位跟着语言换（中文 万 / 英文 K）。
+     * 12,345 → 中文「1.2 万」、英文「12.3K」（12000/1000 = 12.3）。
+     */
+    const isEn = !!(window.I18n && window.I18n.lang === 'en');
+    const fmtN = (n) => {
+      const v = Number(n) || 0;
+      if (v < 10000) return String(v);
+      return isEn ? (v / 1000).toFixed(1) + 'K' : (v / 10000).toFixed(1) + ' 万';
+    };
     const line = (c) => `<div class="cmt">
         <div class="ava"><img src="${safeCover(c.avatar)}" alt="" loading="lazy"></div>
         <div class="bd">
@@ -4837,7 +4991,12 @@
       ? `<div class="cmt-hd">${esc(TT('最新评论 · {n}', { n: fmtN(data.total) }))}</div>${data.list.map(line).join('')}`
       : '<div class="empty" style="padding:26px 0"><b>还没有评论</b></div>';
 
-    $('#cmtCount').textContent = fmtN(data.total) + ' 条';
+    /*
+     * 走 TT 模板而不是字符串拼接（审查 1.3.8 的 H-7）。
+     * 以前是 fmtN(total) + ' 条' —— 整串查不到词典，英文界面下这一格
+     * 永远是「1.2 万 条」。'{n} 条' 由组长加进 en.js。
+     */
+    $('#cmtCount').textContent = TT('{n} 条', { n: fmtN(data.total) });
     $('#cmtBody').innerHTML = hot + list;
     $('#cmtBody').scrollTop = 0;
   }
@@ -5740,7 +5899,22 @@
           title: (plEl.querySelector('b') || {}).textContent,
           sub: (plEl.querySelector('.c-tx span, .tx span') || {}).textContent,
           cover: (plEl.querySelector('img') || {}).src,
-          kind: (plEl.querySelector('.c-k') || {}).textContent,
+          /*
+           * 审查 1.3.8 · H-8 的连带修复（由 i18n 那边发现、这里根治）：
+           *
+           * .c-k 以前在 SKIP_SEL 里，整棵子树跳过翻译，所以这里读 textContent
+           * 拿到的永远是中文原文「歌单」/「收藏」，链路自洽。
+           * H-8 把它移出 SKIP_SEL 之后，「歌单」会被翻成 "Playlists" ——
+           * 于是这里读回来就是英文，塞进 #plKind 之后**切回中文也还是英文**（真回归）。
+           *
+           * i18n.js 在翻译时会同时把原文写进 data-i18n-src（:480），
+           * 所以优先读那个：有就是原文，没有（未翻译过的中文态）就退回 textContent。
+           * 这样英文态读回「歌单」、界面按当前语言自己再翻一遍，两边都正确。
+           */
+          kind:
+            (plEl.querySelector('.c-k') || {}).getAttribute &&
+            (plEl.querySelector('.c-k') || {}).getAttribute('data-i18n-src') ||
+            (plEl.querySelector('.c-k') || {}).textContent,
         });
         return;
       }
@@ -6467,9 +6641,42 @@
     $('#clearLocal').addEventListener('click', async () => {
       if (!Store.localTracks.length) return toast('没有可清空的音乐', '', 'info');
       if (!(await confirmDialog('清空已导入的音乐？', '会删除本机保存的音频文件'))) return;
-      await Store.clearLocal();
+      /*
+       * 收下 clearLocal() 的返回值（审查 1.3.8 的 M-3）。
+       *
+       * store.js 那边为了「不掐断正在听的歌」会**保留在播曲目的 blob**，
+       * 并把它的 id 放进 kept 交回来 —— 但这里以前整个丢弃，于是：
+       *   ① 那个 blob URL 再也没人 revoke（内存泄漏到页面关闭）；
+       *   ② store.js:966-971 文档承诺的「正在播放的歌已从曲库移除」提示
+       *      根本没实现（grep kept/revoked → 0 命中）。
+       * 现在恢复播放器之后（那时 blob 已经不在用）回收 kept 里的那几条，
+       * 并把「这首歌的音频还在内存里、切歌后才回收」这件事告诉用户。
+       */
+      /* 清空之前先记一份「曲目 id → blob src」：清空后 localTracks 就空了，
+         之后拿不到 src，kept 里的 blob 就永远回收不了（M-3）。 */
+      const srcById = {};
+      (Store.localTracks || []).forEach((t) => { if (t && t.id) srcById[t.id] = t.src; });
+      App._clearedSrcById = srcById;
+      const res = await Store.clearLocal();
       renderAll();
-      toast('已清空', '本地导入的音乐已删除', 'trash');
+      const kept = (res && Array.isArray(res.kept)) ? res.kept : [];
+      if (kept.length) {
+        /*
+         * kept = 正在播、被 store 故意留下没 revoke 的那一条。
+         *
+         * 不能立刻 revoke：那会掐断正在响的音源 —— 这正是 store 当初
+         * 跳过它的全部理由。所以两张牌：
+         *   ① 这张「id → src」表挂到 App 上，等 Player 的 track 事件
+         *      （用户真的切歌了）再回收，见 Player.on('track') 里那段；
+         *   ② 这里立刻调一次 helper —— 它内部会自判「这条还是不是当前在播」，
+         *      如果清空这一瞬间播放器已经不在用它（比如刚好在换歌），
+         *      就能当场收掉，不必等下一次切歌。
+         */
+        try { revokeKeptLocalBlobs(kept, srcById); } catch (e) { Log.err('STORE', e, 'revoke kept local blobs'); }
+        toast('已清空', TT('正在播放的那首会在切歌后回收'), 'trash');
+      } else {
+        toast('已清空', '本地导入的音乐已删除', 'trash');
+      }
     });
     $('#rowClearHistory').addEventListener('click', async () => {
       /* H-9：相邻的「清空已导入的音乐」有二次确认，这条却没有 ——

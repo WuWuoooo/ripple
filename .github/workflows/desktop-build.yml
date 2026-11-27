@@ -7,13 +7,23 @@ name: desktop
 # 便于排查（需登录、14 天过期）。
 #
 # 触发：
+#   · push 到 main → 只跑检查与打包（test / frontend / bundle），**不发 Release**
+#     （发版走手动 dispatch；release job 的条件里显式要求 workflow_dispatch）
 #   · push 到 feat/desktop-tauri 等桌面分支 → 自动构建，产出 Artifacts
 #   · workflow_dispatch（手动）→ 在 main 上触发时会走 release job，
 #     把 Linux / Windows 产物并进该版本的 Release（本项目不产出 macOS 包）
-#   · push 到 main 时只跑检查与打包，不自动发 Release（发版走手动 dispatch）
+#
+# H-13（审查 1.3.8）：以前下面的 branches 列表里**没有 main**。
+#   而 pull_request 触发对所有分支生效 —— 于是「在 main 上直接提交（不走 PR）」
+#   时桌面端 CI **一次都不跑**；分支上开发时 push 会跑，但合并进 main 之后
+#   不再跑一次。真实后果是「发版前最后一次改动完全没被桌面 CI 验证过」
+#   （1.3.8 的 main.rs 改了 19 行，只被 cargo fmt 覆盖）。
+#   上面那句「push 到 main 时只跑检查与打包」以前描述的行为并不存在
+#   —— 注释与触发器自相矛盾，现在补上 main 让这句话成真。
 on:
   push:
     branches:
+      - main
       - feat/desktop-tauri
       - feat/desktop-*
     paths:
@@ -117,20 +127,28 @@ jobs:
       #
       # 现在挪到前面，同时加上 Cargo.toml 的 [package] version（D-02 的
       # 那个漂移点），三条链一起校。
+      # ------------------------------------------------------------------
+      # B-4 / H-12（审查 1.3.8）：这段手写校验**删掉**，改为调唯一解析器。
+      #
+      # 原来这里的 Cargo.toml 一行是：
+      #   CV=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)
+      # ↑ 读的是文件**第一处** version =，不是 [package] 段内。
+      #
+      # 实测（对抗样本，见 docs/code_review_report 的 B-4）：
+      #   [profile.release] 里写 version = "1.3.9"（= version.json）
+      #   [package]         里写 version = "1.2.0"
+      # 老判据读到 1.3.9 → 报绿；而 cargo/tauri 打包用的是 1.2.0
+      # （[package].version）→ 桌面安装包版本号是旧的，CI 却全绿。
+      #
+      # 位置本身也要保持「在组装之前」：组装脚本会写 tauri.conf.json，
+      # 先组装再校验等于让检查者先把被检查的文件改成期望值（D-03 恒真）。
+      # 现在校验完全交给 scripts/version-facts.js --assert —— 它是段内定位。
+      # ------------------------------------------------------------------
       - name: 版本号与 version.json 一致（必须在组装之前）
         run: |
-          V=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
-          CONF=$(python3 -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")
-          CV=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)
-          # Cargo.lock 里 ripple-desktop 的 version 在 name 行的下一行，用 awk 精确取
-          CLV=$(awk '/^name = "ripple-desktop"$/{f=1;next} f && /^version = /{gsub(/[^0-9.]/,"");print;exit}' \
-                  desktop/src-tauri/Cargo.lock)
-          echo "version.json=$V tauri.conf.json=$CONF Cargo.toml=$CV Cargo.lock=$CLV"
-          rc=0
-          [ "$V" = "$CONF" ] || { echo "::error::tauri.conf.json $CONF ≠ version.json $V"; rc=1; }
-          [ "$V" = "$CV" ]   || { echo "::error::Cargo.toml $CV ≠ version.json $V"; rc=1; }
-          [ "$V" = "$CLV" ]  || { echo "::error::Cargo.lock $CLV ≠ version.json $V"; rc=1; }
-          exit $rc
+          # 只允许这一种校验方式。加副本改 scripts/version-facts.js 的 COPIES，
+          # 不要在这里再抄一份正则（B-4 就是三次抄本累积的结果）。
+          node scripts/version-facts.js --assert
 
       - name: 组装桌面端前端包
         run: bash desktop/build-frontend.sh

@@ -69,6 +69,34 @@ jobs:
       - name: 名单一致性（三端命令/路径/状态码/版本号）
         run: node scripts/check-manifest-consistency.js
 
+      # H-16：这两条 1.3.8 最关键的回归测试（卡拉OK 染色对齐 / 封面尺寸抖动）
+      # 需要一个**真浏览器**，而以前 tests/lyric-karaoke-align.test.js 里写死的是
+      # 本机绝对路径 /opt/chrome/chrome-linux64/chrome。CI runner 上没有那个路径，
+      # 于是两条测试永远 skip —— 本地绿、CI 绿，但 CI 上那条防线根本不存在。
+      #
+      # 现在：① 测试脚本按 CHROME_PATH 环境变量 + PATH 常见名字解析浏览器；
+      #       ② 这里先装 chromium 并把路径写进 $GITHUB_ENV，下面的「单元测试」
+      #          步骤就会真的跑那两条（而不是静默 skip）。
+      # 用 apt 的 chromium 包而不是 npx playwright install：本仓库刻意不引入
+      # npm 依赖（见 CONTRIBUTING），apt 一步到位且不需要 package.json。
+      - name: 安装 headless Chrome（H-16：让卡拉OK/封面测试在 CI 上真跑）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends chromium-browser chromium || \
+            sudo apt-get install -y --no-install-recommends chromium
+          CHROME_BIN=""
+          for c in /usr/bin/chromium-browser /usr/bin/chromium /usr/bin/google-chrome /snap/bin/chromium; do
+            if [ -x "$c" ]; then CHROME_BIN="$c"; break; fi
+          done
+          if [ -z "$CHROME_BIN" ]; then
+            # 装不上就明确告警：这两条会被 skip，但不能让这件事静默发生
+            echo "::warning::CI 上装不上 chromium，卡拉OK/封面两条真浏览器测试将被 skip"
+          else
+            echo "CHROME_PATH=$CHROME_BIN" >> "$GITHUB_ENV"
+            echo "已安装 Chrome：$CHROME_BIN"
+            "$CHROME_BIN" --version || true
+          fi
+
       - name: 单元测试
         run: bash tests/run.sh
 
@@ -179,85 +207,30 @@ jobs:
           done
           exit $bad
 
-      - name: 版本号一致性
+      # ------------------------------------------------------------------
+      # B-4（审查 1.3.8）：整段手写版本校验**删掉**，改为调唯一解析器。
+      #
+      # 这里原来是一大段 grep/sed/awk 抄本，其中桌面端三处用的是
+      #   CV=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)
+      # 也就是「读文件**第一处** version =」。Cargo.toml 里只要 [package]
+      # 之前还有一个带 version 的表（[profile.release] / [workspace.metadata]
+      # / [[bin]] …），读到的就是那张表的版本 —— 实测构造对抗样本后，
+      # [package].version 写 1.2.0、第一处 version 写 1.3.9，
+      # 老判据报绿 PASS，而 Tauri 打包实际用的是 1.2.0。
+      #
+      # 这是同一个缺陷的**第三次复发**（1.3.0 的 D-02、1.3.5 的 B-1、1.3.8 的 B-4），
+      # 每次换一个漂移点。所以这次不再「把这处改对」，而是让所有消费方
+      # 都调 scripts/version-facts.js —— Cargo.toml 在那里是**段内定位**。
+      #
+      # version-facts.js 覆盖了原来这整段的全部断言（8 处副本：build.gradle
+      # 的 code/name、CrashLog、RippleApp、version.js、sw.js 的 CACHE、
+      # tauri.conf.json、Cargo.toml、Cargo.lock），退出码 0/1 语义完备。
+      # ------------------------------------------------------------------
+      - name: 版本号一致性（唯一解析器 scripts/version-facts.js）
         run: |
-          if [ ! -f version.json ]; then
-            echo "::error::缺少 version.json"
-            exit 1
-          fi
-          VC=$(sed -n 's/.*"versionCode"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' version.json | head -1)
-          VN=$(sed -n 's/.*"versionName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' version.json | head -1)
-          echo "version.json → $VN ($VC)"
-          if [ -z "$VC" ] || [ -z "$VN" ]; then
-            echo "::error::version.json 解析失败"
-            exit 1
-          fi
-          # 这几处由 build-apk.sh 自动同步；不一致说明有人手改了，必须失败而不是告警。
-          # 注意用词边界：`grep -q "versionCode 11"` 会命中 `versionCode 110`，
-          # 那样 110 和 11 互相通过，等于没校验。必须要求数字后紧跟非数字或行尾。
-          bad=0
-          grep -Eq "versionCode[[:space:]]+$VC([^0-9]|$)" android/app/build.gradle \
-            || { echo "::error::build.gradle versionCode 与 version.json 不一致（期望 $VC）"; bad=1; }
-          grep -Eq "versionName[[:space:]]+'$VN'([^0-9.]|$)" android/app/build.gradle \
-            || { echo "::error::build.gradle versionName 与 version.json 不一致（期望 $VN）"; bad=1; }
-          # version.js 由脚本生成但必须入库（网页版直接引用），这里校验内容已同步
-          if [ -f app/js/version.js ]; then
-            grep -Eq "name: '$VN'" app/js/version.js \
-              || { echo "::error::app/js/version.js 的 name 与 version.json 不一致"; bad=1; }
-            grep -Eq "code: $VC([^0-9]|$)" app/js/version.js \
-              || { echo "::error::app/js/version.js 的 code 与 version.json 不一致"; bad=1; }
-          else
-            echo "::error::缺少 app/js/version.js（网页版会 404，请先跑一次 build-apk.sh）"
-            bad=1
-          fi
-          # 两个 Java 文件里的版本号也由 sync-version.sh 同步，同样入库，
-          # 仓库里跑构建会写回它们 —— 忘了跑会出现「代码里写 1.1.0，version.json 已 1.2.0」。
-          grep -qF "version: $VN (\" + $VC + \")" \
-              android/app/src/main/java/com/ripple/app/CrashLog.java \
-            || { echo "::error::CrashLog.java 的 version 行与 version.json 不一致（期望 version: $VN (\" + $VC + \")）"; bad=1; }
-          grep -qF "version=$VN($VC)" \
-              android/app/src/main/java/com/ripple/app/RippleApp.java \
-            || { echo "::error::RippleApp.java 的 version= 与 version.json 不一致（期望 version=$VN($VC)）"; bad=1; }
-          # Service Worker 的缓存名必须等于 ripple-<versionCode>（没有 v 前缀）。
-          # 这一条以前没有，于是「忘了提升 versionCode」在 CI 里是查不出来的：
-          # 已装用户会继续跑旧壳，表现为「改了没生效」。
-          if [ -f app/sw.js ]; then
-            SWC=$(sed -n "s/^const CACHE = '\([^']*\)'.*/\1/p" app/sw.js | head -1)
-            echo "app/sw.js → CACHE='$SWC'"
-            if [ "$SWC" != "ripple-$VC" ]; then
-              echo "::error::app/sw.js 的 CACHE 应为 'ripple-$VC'（实际 '$SWC'）。它由 sync-version.sh 按 versionCode 自动同步，请改 version.json 后重跑构建，不要手改。"
-              bad=1
-            fi
-          else
-            echo "::error::缺少 app/sw.js"
-            bad=1
-          fi
-
-          # ------------------------------------------------------------------
-          # 审查 U-05：桌面端三处版本副本也必须在这里校验。
-          #
-          # 以前这段只覆盖 Android 侧 5 处，桌面端两个副本（Cargo.toml / Cargo.lock）
-          # 无人看管 —— 这正是 D-02「Cargo.toml 停在 1.2.3」能长期存活的原因。
-          # 现在两个 workflow 交叉校验：Android 这边也查桌面端。
-          # ------------------------------------------------------------------
-          if [ -f desktop/src-tauri/tauri.conf.json ]; then
-            CONF=$(python3 -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")
-            [ "$CONF" = "$VN" ] \
-              || { echo "::error::desktop/src-tauri/tauri.conf.json 版本 $CONF ≠ version.json $VN"; bad=1; }
-            CV=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)
-            [ "$CV" = "$VN" ] \
-              || { echo "::error::Cargo.toml [package] version $CV ≠ version.json $VN"; bad=1; }
-            CLV=$(awk '/^name = "ripple-desktop"$/{f=1;next} f && /^version = /{gsub(/[^0-9.]/,"");print;exit}' \
-                    desktop/src-tauri/Cargo.lock)
-            [ "$CLV" = "$VN" ] \
-              || { echo "::error::Cargo.lock 的 ripple-desktop 版本 $CLV ≠ version.json $VN"; bad=1; }
-            echo "桌面端版本副本：tauri.conf.json=$CONF Cargo.toml=$CV Cargo.lock=$CLV"
-          else
-            echo "::error::缺少 desktop/src-tauri/ 目录"
-            bad=1
-          fi
-
-          exit $bad
+          # 只允许这一种校验方式。以后要加副本，改 scripts/version-facts.js 的 COPIES，
+          # 不要再在这里抄一份正则 —— 那正是 B-4 的成因。
+          node scripts/version-facts.js --assert
 
   build:
     name: 构建 APK

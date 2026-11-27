@@ -175,9 +175,28 @@ impl WorkerPool {
 }
 
 /// 进程内唯一的网络工作池。
+///
+/// 1.3.9 修复（Windows 上「所有请求超时 + 顶栏最小化/关闭点了没反应」）：
+///
+/// 以前是 **2 个线程**。配合 `Client` 上那把串行锁，这个组合在网络不好时
+/// 会退化成**整个 IPC 通道堵死**：
+///   · `netease` 命令本身是「立刻返回、结果异步推回」，前端等的是回调；
+///   · 回调由 worker 线程里的 `win.eval` 投递；
+///   · 而 `reqwest` 的单请求超时是 25 秒，`status` 命令内部还要**串行**发 4 次
+///     （账号 → vip → level → like）—— 最坏就是 100 秒占着 2 个 worker 里的 1 个。
+///
+/// 首页一进来就并发拉「每日推荐 + 推荐歌单 + 排行榜 + 状态」，再叠加歌词窗
+/// 每秒一次的进度推送，2 个 worker 瞬间被占满。之后**任何**新任务（包括
+/// 用户点最小化要走的 `window` 命令）都只能在通道里排队 ——
+/// 表现就是「点了没反应」+「所有请求 22 秒超时」。
+///
+/// 现在改成 8 个：不是为了让网络请求更快（那把锁仍然串行），
+/// 而是保证**即使有几条请求卡在网络上，通道里也永远有空闲 worker 接手
+/// 短小的 UI 任务**。这是「资源隔离」而不是「提高吞吐」——
+/// 一个卡住的长任务不该饿死一个点击。
 fn worker_pool() -> &'static WorkerPool {
     static POOL: std::sync::OnceLock<WorkerPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| WorkerPool::new(2))
+    POOL.get_or_init(|| WorkerPool::new(8))
 }
 
 /// 惰性初始化共享 Client：首次调用时建，之后所有命令共用同一个实例。
@@ -268,8 +287,21 @@ fn netease(
      * 前端确实会并发（首页一次性拉每日推荐 + 推荐歌单 + 排行榜），
      * 所以这不是理论问题。改成 Arc<Mutex<Client>> 后，所有命令共享同一份
      * cookie_jar，锁只包住真正访问 client 的那一小段。
+     *
+     * H-17（审查报告，1.3.8）：`get_or_init_client` 的调用点已经挪到下面的
+     * worker 池内部（见 pool.execute 里的第一段），这里只留需要的值。
+     *
+     * 为什么必须挪：首次调用会走 `netease::Client::new()` →
+     * `reqwest::blocking::Client::builder().build()`，上游会在内部 **spawn 一个
+     * 线程并在里面建 tokio current-thread runtime、初始化 TLS**。那是几百毫秒
+     * 级的阻塞工作，而它以前跑在**命令线程**上 —— 同步 command 默认跑主线程，
+     * 表现就是首次登录 / 首次搜索时窗口白屏卡一下。
+     *
+     * 注意不能直接把 `&state` 塞进闭包：池的闭包要求 `'static`，而
+     * `State<'_, AppState>` 借的是本次命令的栈。所以闭包里改用
+     * `app2.state::<AppState>()` 重新取一个 —— AppHandle 本身是
+     * `Clone + Send + 'static`，取到的 State 生命周期落在闭包体内，用完即弃。
      */
-    let client = get_or_init_client(&state, &data_dir)?;
     let app2 = app.clone();
 
     /*
@@ -280,9 +312,11 @@ fn netease(
      * 用户来回切页时命令数可以无界增长，每个线程都阻塞在一把 Mutex 上排队。
      * 线程栈白占内存，且没有任何反压机制。
      *
-     * 现在投到一个固定大小（2）的 worker 池：多出来的任务在通道里排队，
-     * 线程数恒定，内存可预期。之所以是 2 —— Client 的网络请求本来就串行
-     * （受那把 Mutex 保护），多开线程只会排队抢锁，不会提高吞吐。
+     * 现在投到一个固定大小的 worker 池：多出来的任务在通道里排队，
+     * 线程数恒定，内存可预期。池的大小见 `worker_pool()` 的注释 ——
+     * 那里解释了为什么最终定在 8 而不是更小（资源隔离，避免长请求
+     * 饿死短小的 UI 任务，而不是为了提高网络吞吐：Client 的请求本来
+     * 就受那把 Mutex 保护、是串行的）。
      *
      * 关于「把 HTTP 请求移出锁保护范围」这半个建议：**本轮不做**，理由如下。
      * `netease::Client::call(&mut self, ...)` 内部会读 cookie_jar 拼请求、
@@ -294,6 +328,40 @@ fn netease(
      */
     let pool = worker_pool();
     pool.execute(move || {
+        /*
+         * 第一次进入时在这里建共享 Client（见上方 H-17 注释）。失败必须
+         * **自己**回一条结果给前端：命令本体早已 `return Ok(())`，
+         * invoke 的 Promise 已经 resolve 过了 —— 此时若静默返回，
+         * 前端 pending 表要干等 22 秒超时，日志里只有「请求超时」，
+         * 真实原因（建 Client 失败，多半是数据目录不可写）反而丢了。
+         * 投递口径与下面的正常结果一致：typeof 守卫 + 投给所有 webview。
+         */
+        let client = {
+            let st = app2.state::<AppState>();
+            match get_or_init_client(&st, &data_dir) {
+                Ok(c) => c,
+                Err(e) => {
+                    /* 与成功路径同一个取证习惯：失败先落日志，再回前端 */
+                    log_line_at(&app2, &format!("[IPC] 建共享 Client 失败 cb={cb_id}: {e}"));
+                    let text = format!(
+                        r#"{{"code":-1,"message":{}}}"#,
+                        serde_json::Value::String(e).to_string()
+                    );
+                    /* cb_id 下面还要用，所以这里 clone —— 别为了省一次分配
+                    把后面那行弄成 move-after-move。 */
+                    let js = format!(
+                        "if (typeof window.__rippleNativeResult === 'function') {{ window.__rippleNativeResult({}, {}); }}",
+                        serde_json::Value::String(cb_id.clone()).to_string(),
+                        serde_json::Value::String(text).to_string()
+                    );
+                    for (_label, win) in app2.webview_windows() {
+                        let _ = win.eval(&js);
+                    }
+                    return;
+                }
+            }
+        };
+
         let text = {
             // 锁的范围：只包住这一次网络请求。同类请求会串行，
             // 但桌面端请求量本来就不高，且能保证 cookie 不被并发写坏。
@@ -336,8 +404,34 @@ fn netease(
             serde_json::Value::String(cb_id).to_string(),
             serde_json::Value::String(text).to_string()
         );
-        for (_label, win) in app2.webview_windows() {
-            let _ = win.eval(&js);
+        /*
+         * 1.3.9：投递失败必须留下痕迹。
+         *
+         * 这里是整个「请求 → 前端」链路的**最后一跳**。以前是 `let _ = win.eval()`
+         * —— 投递失败（窗口已关、webview 正在销毁）时一条记录都没有，
+         * 前端只能干等 22 秒超时，日志里也只看到「请求超时」这个**结果**，
+         * 看不到「结果其实已经拿到了，只是没能送进页面」这个**原因**。
+         *
+         * 现在成功/失败都记一行（含窗口标签）。同一个 cbId 若出现
+         * 「有投递失败」+「前端报超时」，就能立刻判定是渲染侧的问题
+         * 而不是网络侧 —— 这两种情况以前在日志里长得一模一样。
+         */
+        let mut delivered = 0usize;
+        for (label, win) in app2.webview_windows() {
+            match win.eval(&js) {
+                Ok(()) => delivered += 1,
+                Err(e) => log_line_at(
+                    &app2,
+                    &format!("[IPC] 结果投递失败 win={label} cb={cb_id}: {e}"),
+                ),
+            }
+        }
+        if delivered == 0 {
+            /* 一个窗口都没投进去（比如都关了）—— 前端注定要超时，先记下来 */
+            log_line_at(
+                &app2,
+                &format!("[IPC] 没有任何窗口接收结果 cb={cb_id}（前端会等到超时）"),
+            );
         }
     });
 
@@ -348,8 +442,9 @@ fn netease(
 ///
 /// 为什么不引入 `tauri-plugin-opener` 或 shell 插件：
 ///   本机构建是 `--offline --locked`，加依赖会直接失败（审查报告也记过
-///   缺 `adler2` 那件事）；而 `tauri-plugin-shell` 虽然在 Cargo.toml 里
-///   但从未注册，贸然启用还要配 capability 权限。
+///   缺 `adler2` 那件事）。shell 插件的依赖已经按审查 L-10 从 Cargo.toml
+///   删掉了 —— 它从未注册、也从未使用，留着只会让人误以为桌面端支持
+///   执行任意命令。
 ///   这里只做一件事 —— 让系统按 URL 打开默认浏览器，各平台各有现成命令，
 ///   直接 `Command::spawn` 是最小且可靠的做法。
 ///
@@ -365,24 +460,34 @@ fn open_external(url: String) -> bool {
     }
 
     /*
-     * 审查 L-3：Windows 分支用 `cmd /C start`，而 cmd 会把**整条命令行**
-     * 重新拼起来再解析一遍 —— `Command::args` 分参数传并不构成保护。
-     * URL 里的 `&` `|` `>` `^` 对 cmd 是命令分隔符/转义符，
-     * 于是在 Windows 上 `https://x/?a=1&b=2` 可能被解析成两条命令。
+     * 审查 L-3 + L-12（1.3.8）：Windows 上**不再走 `cmd /C start`**。
      *
-     * 今天不可利用：唯一调用点是 app.js 里硬编码的 GitHub releases 地址。
-     * 但这是一枚埋着的雷 —— 任何将来「把远程 URL / 用户输入传进来」的
-     * 改动都会立刻变成命令注入。所以在入口处就拦住，而不是等出事再想。
+     * L-3 的问题：cmd 会把整条命令行重新拼起来再解析一遍，`Command::args`
+     * 分参数传并不构成保护 —— URL 里的 `&` `|` `>` `^` 对 cmd 是命令分隔符/
+     * 转义符，于是 `https://x/?a=1&b=2` 可能被解析成两条命令。
+     * 当时的第一版修法是「在入口处拦掉这些元字符」，它挡住了注入，
+     * 但顺手也拦掉了 `%` —— 而 `%` 是 URL 百分号编码的起始符
+     * （`%20` / `%E4%B8%AD` 到处都是）。结果是**合法的百分号编码链接被
+     * 整个拒绝 → 静默失败**（调用点的 `.catch()` 是空的，用户看不到任何提示）。
+     * 审查报告实测：带 `%20` 的 Release 链接打不开。
      *
-     * 只对 Windows 生效：Linux 的 xdg-open / macOS 的 open 都是
-     * 直接 execve，不经过 shell，`&` 在那两个平台只是普通字符。
+     * L-12 的修法：换掉执行方式，而不是继续加/减黑名单。
+     * `rundll32 url.dll,FileProtocolHandler <url>` 直接调 ShellExecute，
+     * **不经过 cmd 解析**，于是 `&` `|` `%` `^` 全都只是普通字符 ——
+     * 既没有注入面，也不会误伤合法 URL。安全性来自「不走 shell」这个
+     * 结构性事实，而不是来自一份永远可能漏项的黑名单。
+     *
+     * 仍然保留一个**极窄**的兜底检查（见下）：只拦控制字符与换行。
+     * 理由不是安全（已经不走 shell 了），而是 `rundll32` 的命令行本身
+     * 以空格分隔参数 —— URL 里若混入 `\r`/`\n`，Windows 的命令行解析
+     * 可能把它切断成两段。这条与平台无关的检查顺手也保护了另外两个平台。
+     *
+     * 只对 Windows 生效的部分：Linux 的 xdg-open / macOS 的 open 都是
+     * 直接 execve，不经过 shell，`&` `%` 在那两个平台只是普通字符。
      */
-    #[cfg(target_os = "windows")]
-    {
-        if u.contains(['&', '|', '<', '>', '"', '^', '%']) {
-            eprintln!("open_external: 拒绝含 shell 元字符的链接");
-            return false;
-        }
+    if u.chars().any(|c| c.is_control()) {
+        eprintln!("open_external: 拒绝含控制字符的链接");
+        return false;
     }
 
     #[cfg(target_os = "linux")]
@@ -396,12 +501,17 @@ fn open_external(url: String) -> bool {
     #[cfg(target_os = "windows")]
     {
         /*
-         * Windows 上不能直接 `start url`（那是 cmd 内建命令）。
-         * `cmd /C start "" "url"` 是标准做法；第一个空参数是窗口标题占位，
-         * 少了它，带引号的 URL 会被当成窗口标题而不打开。
+         * 用 rundll32 而不是 `cmd /C start`（L-12，见上方注释）。
+         *
+         * `url.dll,FileProtocolHandler` 是 Windows 上打开 URL 的经典入口，
+         * 内部走 ShellExecute，**不经过 cmd**，所以 URL 里的元字符不会被
+         * 二次解析。两个参数必须**一起**作为一个参数传给 rundll32：
+         * 逗号分隔的 `url.dll,FileProtocolHandler` 是它要求的模块+入口写法，
+         * 拆成两个参数会被它当成两个独立的 DLL 参数而失败。
          */
-        return std::process::Command::new("cmd")
-            .args(["/C", "start", "", u])
+        return std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(u)
             .spawn()
             .is_ok();
     }
@@ -504,13 +614,13 @@ fn log_line_at(app: &tauri::AppHandle, line: &str) {
 
 /// 追加一行日志。**失败只打 stderr，不再往文件里写错误** ——
 /// 否则写盘失败会引发「记录写盘失败」的无限递归。
-#[tauri::command]
+#[tauri::command(async)]
 fn log_write(app: tauri::AppHandle, line: String) {
     log_line_at(&app, &line);
 }
 
 /// 把当前日志文件路径报给前端（前端启动时取一次并缓存）。
-#[tauri::command]
+#[tauri::command(async)]
 fn log_path(app: tauri::AppHandle) -> String {
     log_file_path(&app).display().to_string()
 }
@@ -655,6 +765,59 @@ fn save_lyric_pos(dir: &std::path::Path, x: i32, y: i32) {
     if let Err(e) = std::fs::write(&p, body) {
         eprintln!("[lyric] 位置保存失败（{}）：{e}", p.display());
     }
+}
+
+/// 判断这次 `lyric_overlay_show` 是不是真的要「恢复默认位置」（审查 H-3）。
+///
+/// 三个条件必须**同时**成立：
+///   1. 前端传来的 x 是负数；
+///   2. 前端传来的 y 是负数；
+///   3. state 里当前没有有效位置（x、y 也都是负数）。
+///
+/// 为什么第 1、2 条要用「且」而不是「或」：以前是或 —— 任何一个负值就算
+/// 重置。而 x/y 是成对传的，只有一个负数意味着调用方传错了参数；
+/// 那种情况应该老老实实保留原位置，而不是把窗口甩回默认点。
+///
+/// 为什么第 3 条不能省：桌面端前端**永远**传 -1（S().sbX/sbY 恒为 -1，
+/// 因为没有 __rippleLyricMoved 回流），于是前两条恒真。少了第 3 条，
+/// 每一次推送都会重置位置 —— 这正是「一拖就弹回去」的根因。
+///
+/// 加上第 3 条之后的语义：
+///   · 已知位置无效（首次创建 / 刚从旧版本升上来）→ 重置到默认位置，
+///     **并且**顺便把默认位置写进 state（调用方在 want_reset 分支里做），
+///     于是下一次推送时第 3 条就不成立了，不会再重置；
+///   · 已知位置有效 → 忽略前端的负值占位，继续用 state 里的位置。
+///
+/// ===== 这条判据的功能代价（必须如实写明，不要假装没有）=====
+///
+/// 桌面端的「恢复默认位置」按钮**会失效**。原因：按钮的实现是
+/// `S().sbX = -1; S().sbY = -1; Store.save(); applySbOverlay()`
+/// （app/js/app.js 的 #sbAct reset 分支），它传下来的 -1 与
+/// 「前端没有位置」的占位 -1 **完全同形** —— bridge.js 的 10 参数
+/// 载荷里没有第二个通道能表达「这是重置而不是占位」。
+/// 于是本判据无法区分两者：只要 Rust 侧有有效位置，就一律按占位处理
+/// （不重置）。用户点按钮的观感是「点了没用」。
+///
+/// 为什么这个代价可以接受：
+///   · 修之前是**反过来的更严重故障** —— 每次改设置都把窗口弹回默认，
+///     用户连位置都保不住，功能等于不可用（这是 H-3 要修的东西）；
+///   · 修之后正常的「拖动 → 记住位置」完全成立，这才是主路径；
+///   · 要彻底修好按钮，得给桥加一个显式的 reset 参数（改 bridge.js 的
+///     签名 + app.js 的调用点）。那两处不在本任务的写入范围内
+///     （本任务只许可改 main.rs / netease.rs / capabilities / Cargo /
+///     lyric.html），而且改签名会波及 Android 三端一致的形状约定，
+///     应该单独评估。已作为遗留项写进回报，由 Lead 决定是否开单。
+///
+/// 一旦桥有了显式 reset 信号，只需把这里换成
+/// `x_neg_and_explicit_reset && ...`，本函数是唯一的改动点。
+///
+/// 另外：真正「首次启动 / 存档损坏」的情形仍然会重置，因为那种情况下
+/// state 里确实没有位置（guard 读不到 lyric-pos.json）—— 那一侧的行为
+/// 与修之前完全一致，没有退化。
+fn want_reset_pos(x: &str, y: &str, cur_x: i32, cur_y: i32) -> bool {
+    let x_neg = x.trim().parse::<i32>().map(|v| v < 0).unwrap_or(false);
+    let y_neg = y.trim().parse::<i32>().map(|v| v < 0).unwrap_or(false);
+    x_neg && y_neg && cur_x < 0 && cur_y < 0
 }
 
 /// 惰性创建歌词窗口；已存在则直接返回。
@@ -826,7 +989,7 @@ fn build_lyric_window(
 ///
 /// 解析容错与 Android 一致：解析失败就沿用旧值，而不是报错让调用方失败 ——
 /// 一次脏数据不该让整条歌词链路停摆。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_overlay_show(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -868,9 +1031,55 @@ fn lyric_overlay_show(
      *   · 收到 < 0 → 视为「恢复默认」：删掉位置文件、把 state 也清成 -1、
      *     并对**已存在的窗口**真的 set_position 到默认位置；
      *   · 收到 >= 0 → 正常保存（逻辑坐标，见 lyric_save_pos 的 D-03 说明）。
+     *
+     * ===== H-3（审查报告，1.3.8）：为何还要「且当前已知位置也无效」=====
+     *
+     * 只判「收到的是不是负数」在桌面端是**恒真**的，因为前端永远传 -1：
+     *   · app.js 的 applySbOverlay 传 String(s.sbX == null ? -1 : s.sbX)；
+     *   · 而 S().sbX / S().sbY 在桌面端**永远是 -1** —— 它们只由
+     *     window.__rippleLyricMoved 写入，那是 Android 原生浮层拖动后
+     *     回推的钩子，桌面端没有任何地方调用它。桌面端的位置只存在
+     *     Rust 侧的 lyric-pos.json 与 LyricState.x/y，从不回流到前端 settings。
+     *
+     * 后果：applySbOverlay 有 11 处调用点（改颜色、改字号、切播放态、
+     * 改锁定……），每次都会走到这里、每次都被判成「恢复默认」——
+     * 用户拖完歌词窗、下一次点任何设置它就被弹回默认位置，
+     * 表现就是「一拖就弹回去 / 位置保存不了」。
+     *
+     * 修法（报告推荐方案）：把「前端要求重置」与「真有位置要重置」两个
+     * 条件取交集 —— 只有当前确实有位置时，重置才有意义。判据抽成
+     * want_reset_pos()，让「什么算重置」只有一个定义点。
+     *
+     * ===== 光有交集还不够：判定前必须先把存档读回 state =====
+     *
+     * want_reset_pos 的第三个条件（cur_x/cur_y < 0）只有在 guard 里真的
+     * 存着有效位置时才有意义。而 guard 的有效值只有两个来源，都覆盖不到
+     * 「进程刚启动后的第一次 show」：
+     *   · lyric_save_pos（拖动落盘）→ 要用户先拖一次才会写；
+     *   · build_lyric_window 建窗落位 → 它只 save_lyric_pos 写**文件**，
+     *     拿的是 &LyricState（只读），算出来的位置**回不到 guard**。
+     * 于是进程启动后 guard.x/y 一直是 LyricState::default() 的 -1，
+     * want_reset_pos 的第三个条件恒真 —— 判据退化成和修之前一模一样，
+     * 而且更糟：建窗时明明已按 lyric-pos.json 把窗口摆到了存档位置，
+     * 紧接着这里又判「要重置」把它甩回默认位置、还删掉了位置文件。
+     * 用户看到的就是「位置保存不了，每次重开都回默认」。
+     *
+     * 所以先把存档读进 state，让「已知位置」这个状态在进程启动后
+     * 第一次判定时就正确。读不到（真·首次运行）才保持 -1，那时重置
+     * 才是符合预期的行为。
      */
-    let want_reset = x.trim().parse::<i32>().map(|v| v < 0).unwrap_or(false)
-        || y.trim().parse::<i32>().map(|v| v < 0).unwrap_or(false);
+    if guard.x < 0 && guard.y < 0 {
+        let dir = app
+            .path()
+            .app_config_dir()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        if let Some((sx, sy)) = read_lyric_pos(&dir) {
+            guard.x = sx;
+            guard.y = sy;
+        }
+    }
+
+    let want_reset = want_reset_pos(&x, &y, guard.x, guard.y);
     if want_reset {
         guard.x = -1;
         guard.y = -1;
@@ -880,11 +1089,23 @@ fn lyric_overlay_show(
             .unwrap_or_else(|_| PathBuf::from("."));
         let _ = std::fs::remove_file(dir.join("lyric-pos.json"));
     } else {
+        /*
+         * H-3：负值不再是合法坐标 —— 它是「前端没给位置」的占位。
+         *
+         * 以前这里无条件写入，于是 guard 被 -1 污染：下一次调用又满足
+         * 「state 里没有有效位置」这个条件，窗口位置在两次调用之间反复横跳。
+         * 只接受 >= 0 的值，让「已知位置」这个状态是**单调**的
+         * （一旦有真位置，就不会被占位值覆盖回去）。
+         */
         if let Ok(v) = x.trim().parse::<i32>() {
-            guard.x = v;
+            if v >= 0 {
+                guard.x = v;
+            }
         }
         if let Ok(v) = y.trim().parse::<i32>() {
-            guard.y = v;
+            if v >= 0 {
+                guard.y = v;
+            }
         }
     }
     guard.bold = bold == "true";
@@ -1011,7 +1232,7 @@ fn default_lyric_pos_logical(win: &tauri::WebviewWindow) -> Result<(i32, i32), (
 }
 
 /// 更新歌词文字。与 Android `updateLyricOverlay` 同语义。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_overlay_text(app: tauri::AppHandle, state: State<'_, AppState>, text: String) {
     let mut guard = match state.lyric.lock() {
         Ok(g) => g,
@@ -1038,7 +1259,7 @@ fn lyric_overlay_text(app: tauri::AppHandle, state: State<'_, AppState>, text: S
 ///
 /// ⚠️ 语义是**句内**进度，不是整首进度 —— 与 1.3.3 改过的前端一致。
 /// 桌面端这里不做任何「除以时长」的换算，直接当 --p 用。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_overlay_progress(app: tauri::AppHandle, state: State<'_, AppState>, progress: String) {
     let mut guard = match state.lyric.lock() {
         Ok(g) => g,
@@ -1071,7 +1292,7 @@ fn lyric_overlay_progress(app: tauri::AppHandle, state: State<'_, AppState>, pro
 /// 为什么外推在 lyric.html 里做、不在这里开定时器：
 ///   那个窗口自己可见，rAF 照常运行；而在 Rust 侧要多开一个线程、
 ///   多一处启停逻辑，还要处理跨进程时钟对齐 —— 不值得。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_overlay_timing(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1110,7 +1331,7 @@ fn lyric_overlay_timing(
 ///
 /// 销毁而不是 hide：与 Android 那头 `wm.removeView` 一致，
 /// 也更省资源 —— 用户关掉状态栏歌词后不该还挂着一个看不见的 webview。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_overlay_hide(app: tauri::AppHandle, state: State<'_, AppState>) {
     if let Some(win) = app.get_webview_window(LYRIC_WINDOW) {
         let _ = win.close();
@@ -1126,7 +1347,7 @@ fn lyric_overlay_hide(app: tauri::AppHandle, state: State<'_, AppState>) {
 ///
 /// 为什么需要它：窗口创建和页面加载是异步的，Rust 那边 push 首帧时
 /// webview 可能还没跑起来，事件就被丢了。让页面自己来要一次最稳妥。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_overlay_sync(state: State<'_, AppState>) -> serde_json::Value {
     let guard = match state.lyric.lock() {
         Ok(g) => g,
@@ -1140,7 +1361,7 @@ fn lyric_overlay_sync(state: State<'_, AppState>) -> serde_json::Value {
 }
 
 /// 歌词窗拖动结束后回报新位置并落盘。
-#[tauri::command]
+#[tauri::command(async)]
 fn lyric_save_pos(app: tauri::AppHandle, state: State<'_, AppState>, x: i32, y: i32) {
     /*
      * D-03（审查报告，1.3.4）：这里收到的 x/y 是**物理像素**，

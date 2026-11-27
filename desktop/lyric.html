@@ -55,15 +55,28 @@
     font-family:"PingFang SC","HarmonyOS Sans SC","Microsoft YaHei",
       system-ui,-apple-system,"Segoe UI",sans-serif;
     /*
-     * 窗口可以拖动。tauri 的 drag-region 脚本要求属性写在**真正被点到的
-     * 那个元素**上（bare 空值只认 composedPath[0]），所以这里写 "deep"，
-     * 让子节点上的按下也能触发拖动。
-     * 锁定态时 Rust 侧已经把整个窗口设成鼠标穿透了，拖动自然不会发生，
-     * 所以不需要在 JS 里再判断锁定。
+     * 拖动区（L-11，审查 1.3.8）。
+     *
+     * 以前的写法是给 #wrap 加 data-tauri-drag-region="deep" —— 那等于把
+     * **整行歌词**都变成拖动区。而 tauri 的 drag.js 对拖动区按下时会
+     * preventDefault()，于是文字永远选不中、复制不了。
+     *
+     * 现在把拖动区挪到 body（窗口的空白区域），并给 #t 显式写
+     * data-tauri-drag-region="false"：drag.js 的 isDragRegion() 从
+     * composedPath[0] 往上走，碰到 "false" 立刻返回 false —— 所以
+     * 点在**文字上**不拖动（可以正常选中复制），点在文字以外的空白处拖动窗口。
+     * 歌词窗是 360x64 而文字只有一行，上下有大片空白，拖动并不难按。
+     *
+     * 属性不是写死在 HTML 里，而是由 applyDragRegion() 按 locked 状态挂/摘：
+     * 锁定时窗口整块鼠标穿透（Rust side set_ignore_cursor_events），
+     * 此时页面再留一个拖动区毫无意义，还会让 st.locked 变成一个死状态。
      */
     -webkit-user-select:none;user-select:none;
     cursor:default;
   }
+  /* 文字本身可选中复制（未锁定时）；锁定时整窗穿透，选不中也无需选 */
+  #t{-webkit-user-select:text;user-select:text;cursor:text;}
+  html.locked #t{-webkit-user-select:none;user-select:none;cursor:default;}
   #wrap{
     /* 内边距让文字不贴窗口边缘，视觉上更像一条「药丸」 */
     padding:4px 10px;max-width:100%;box-sizing:border-box;
@@ -119,7 +132,13 @@
 </style>
 </head>
 <body>
-<div id="wrap" data-tauri-drag-region="deep"><span id="t" class="idle">Ripple</span></div>
+<!--
+  L-11：拖动区在 <html>（由 applyDragRegion 按锁定状态挂/摘），
+  而文字 #t 显式写 drag-region="false" —— drag.js 从 composedPath[0]
+  向上遍历时先命中它并立即返回 false，于是点在文字上不拖动、可以正常
+  选中复制；点在文字以外的空白处才拖窗口。
+-->
+<div id="wrap"><span id="t" class="idle" data-tauri-drag-region="false">Ripple</span></div>
 
 <script>
 (function () {
@@ -146,6 +165,37 @@
     if (document.documentElement) {
       document.documentElement.classList.toggle('opaque', !!on);
     }
+  }
+
+  /*
+   * L-11（审查报告，1.3.8）：拖动区跟锁定状态联动。
+   *
+   * 两件事一起做，因为它们本来就是同一个状态的两个消费者：
+   *   ① 未锁定 → 挂拖动区（<html> 承接，文字自己排除，见 CSS 注释）；
+   *      锁定   → 摘掉拖动区。锁定的语义是「点击穿透、别动它」，
+   *      留着拖动区自相矛盾。
+   *   ② 锁定态给 <html> 加 locked 类，让 CSS 把文字改回不可选中 ——
+   *      虽然锁定后整窗鼠标穿透本来也点不到，但那是 **Rust 窗口级**的
+   *      设置，页面不该假设它一定生效（比如将来有人只改了 flags 没调
+   *      set_ignore_cursor_events）。让 DOM 自己也表达一遍这个状态，
+   *      两个层面各自成立，比互相依赖更稳。
+   *
+   * 为什么这修掉了「st.locked 是死状态」：以前 st.locked 只在收事件时
+   * 被赋值，全文件再无第二处读它 —— 现在它驱动了 DOM 的这一处真实行为。
+   */
+  function applyDragRegion(locked) {
+    var root = document.documentElement;
+    if (!root) return;
+    /* ① 拖动区只在未锁定时存在 */
+    if (locked) {
+      root.removeAttribute('data-tauri-drag-region');
+    } else {
+      /* "deep" 让点在 <html>/<body> 的任意空白处都能拖，
+         而 #t 上的 "false" 会先于它被 drag.js 命中、从而阻断拖动。 */
+      root.setAttribute('data-tauri-drag-region', 'deep');
+    }
+    /* ② 文字可选性 */
+    root.classList.toggle('locked', !!locked);
   }
 
   /* 当前状态。初值与 Rust 侧 LyricState::default() 对齐。 */
@@ -288,7 +338,7 @@
        * 用 assign 会把缺失字段盖成 undefined，尺寸/颜色直接回默认值 ——
        * 表现为「歌词偶尔闪一下变成 15px 白字」。
        */
-      if (typeof d.locked === 'boolean') st.locked = d.locked;
+      if (typeof d.locked === 'boolean') { st.locked = d.locked; applyDragRegion(st.locked); }
       if (typeof d.text === 'string') st.text = d.text;
       if (typeof d.progress === 'number') st.progress = d.progress;
       if (typeof d.color === 'string' && d.color) st.color = d.color;
@@ -329,8 +379,11 @@
      * 「确定的」一次拿到 opaque 的机会（Rust 推送可能比页面起来更早被丢掉）。
      */
     if (typeof d.opaque === 'boolean') applyOpaque(d.opaque);
+    /* 首帧也要应用拖动区状态：Rust 可能比页面起来更早推过事件（被丢掉），
+       只靠事件会让「锁定状态下重开歌词窗」暂时留着拖动区。 */
+    applyDragRegion(st.locked);
     render();
-  }).catch(function () { render(); });
+  }).catch(function () { applyDragRegion(st.locked); render(); });
 
   /* ---------- 拖动结束后回报位置 ---------- */
   /*
@@ -368,6 +421,8 @@
     }).catch(function () {});
   }
 
+  /* 初次渲染前把拖动区定到默认（未锁定）状态，避免首帧短暂不可拖 */
+  applyDragRegion(st.locked);
   render();
 })();
 </script>

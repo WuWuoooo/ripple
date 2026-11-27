@@ -378,13 +378,31 @@
     mapSongs(arr, pick) {
       if (!Array.isArray(arr)) return [];
       const out = [];
+      /* 缺 id 的条目数，循环结束后记一条日志（见下面那段说明） */
+      let dropped = 0;
       for (const x of arr) {
         /* 先挡掉非对象：pick 回调里会直接写 x.songInfo，
            对 null 调用就是 TypeError（测试用真实源码跑这条路径时抓到了） */
         if (!x || typeof x !== 'object') continue;
         const raw = pick ? pick(x) : x;
         const t = this.mapSong(raw);
-        if (t && t.neId) out.push(t);
+        /*
+         * ⚠️ 判据必须是「有没有 id」，不能写 if (t && t.neId)（审查 1.3.8 的 H-6）：
+         *   · 0 是**假值** —— 上游 id: 0 的条目（版权受限占位项、
+         *     下架条目、部分榜单的空壳项）会被整条静默丢掉，
+         *     列表少一行且不报错、不打日志，只表现为「搜索结果少一条」；
+         *   · null / undefined / 空串 才是「真的映射不出 id」，该丢。
+         * 所以显式排除 nullish 与空串，其余（含 0）全部保留。
+         * 有项被丢时记一条日志：宁可日志多一点，也不要让「少了一行」无从查起。
+         */
+        if (t && t.neId !== undefined && t.neId !== null && t.neId !== '') {
+          out.push(t);
+        } else {
+          dropped++;
+        }
+      }
+      if (dropped) {
+        try { if (typeof Log !== 'undefined' && Log && Log.add) Log.add('NCM', 'mapSongs dropped ' + dropped + ' item(s) without id'); } catch (e) {}
       }
       return out;
     },
@@ -402,6 +420,16 @@
        * .filter(Boolean) 把它丢掉，与 heartMode 现有的过滤约定一致。
        */
       if (!s || typeof s !== 'object') return null;
+      /*
+       * 没有 id 的条目直接判为「映射不出来」，返回 null 让调用方丢掉。
+       *
+       * 以前这里不判，于是 s.id 缺失时产出 id: 'ne_undefined' —— 一个
+       * 看起来完全合法、实际永远查不到音源的假 id（比返回 null 更危险：
+       * 它会让曲目进队列、进喜欢列表，点播放才失败，而且日志里根本
+       * 看不出是「上游没给 id」）。判据用 == null 同时挡掉 undefined 与 null；
+       * id: 0 是合法值，必须保留（见 mapSongs 里 H-6 的说明）。
+       */
+      if (s.id === undefined || s.id === null || s.id === '') return null;
       const ar = s.ar || s.artists || [];
       const al = s.al || s.album || {};
       const dt = s.dt || s.duration || 0;
@@ -425,7 +453,19 @@
       };
     },
 
+    /**
+     * 歌单映射。
+     *
+     * ⚠️ 必须有 null 防御（审查 1.3.8 的 M-4）：这里被 3 处裸 .map 直接调用，
+     * 上游列表里混一个 null（下架歌单、占位项、接口偶发空元素）就会抛
+     * TypeError，而 .map 一旦中断，整块推荐歌单 / 排行榜 / 我的歌单**全空**，
+     * 异常还被上层 catch 吞掉、错误提示也不显示 —— 用户只看到「这里没内容」。
+     * 返回 null 让调用方用 mapPlaylists() 过滤掉，与 mapSongs 的约定一致。
+     */
     mapPlaylist(p) {
+      if (!p || typeof p !== 'object') return null;
+      /* 没有 id 的歌单同样映射不出来（'pl_undefined' 是个查不到的假 id） */
+      if (p.id === undefined || p.id === null || p.id === '') return null;
       return {
         id: 'pl_' + p.id,
         plId: p.id,
@@ -438,6 +478,23 @@
       };
     },
 
+    /**
+     * 歌单列表的统一入口：与 mapSongs 同构，过滤掉映射不出来的项。
+     *
+     * 三个调用点（搜索歌单 / 推荐歌单 / 我的歌单）以前各写一句裸
+     * `.map((p) => this.mapPlaylist(p))` —— 上游混一个 null 就整块空掉（M-4）。
+     * 统一到这里之后，过滤规则只有一处，谁也不会忘。
+     */
+    mapPlaylists(arr) {
+      if (!Array.isArray(arr)) return [];
+      const out = [];
+      for (const p of arr) {
+        const t = this.mapPlaylist(p);
+        if (t) out.push(t);
+      }
+      return out;
+    },
+
     async searchSongs(kw, limit = 30, offset = 0) {
       const r = await this.call('search', { keywords: kw, type: 1, limit, offset });
       const songs = (r.result && r.result.songs) || [];
@@ -447,7 +504,7 @@
     async searchPlaylists(kw, limit = 20, offset = 0) {
       const r = await this.call('search', { keywords: kw, type: 1000, limit, offset });
       const pls = (r.result && r.result.playlists) || [];
-      return { total: (r.result && r.result.playlistCount) || pls.length, list: pls.map((p) => this.mapPlaylist(p)) };
+      return { total: (r.result && r.result.playlistCount) || pls.length, list: this.mapPlaylists(pls) };
     },
 
     async songDetail(ids) {
@@ -530,7 +587,7 @@
 
     async personalizedPlaylists(limit = 10) {
       const r = await this.call('personalized', { limit });
-      return (r.result || []).map((p) => this.mapPlaylist(p));
+      return this.mapPlaylists(r.result);
     },
 
     async likelist() {
@@ -549,7 +606,7 @@
       const uid = this._profile ? this._profile.userId : '';
       if (!uid) return [];
       const r = await this.call('user_playlist', { uid: String(uid), limit });
-      return (r.playlist || []).map((p) => this.mapPlaylist(p));
+      return this.mapPlaylists(r.playlist);
     },
 
     async hotSearch() {
@@ -660,7 +717,9 @@
     /** 无限漫游：拿相似歌曲不断续队列（未登录也能用） */
     async roamSongs(songId, limit = 20, offset = 0) {
       const r = await this.call('simi_song', { songId: String(songId), limit, offset });
-      return (r.songs || []).map((s) => this.mapSong(s));
+      /* 走 mapSongs 而不是裸 .map(mapSong)：mapSong 现在会对缺 id 的条目返回 null，
+         裸 .map 会把 null 留在数组里（列表出现一行空白），这里统一走过滤器。 */
+      return this.mapSongs(r.songs);
     },
 
     /** 私人 FM：兜底无限流 */
@@ -674,7 +733,8 @@
        * 比如 search / song_url；刷新型读必须显式跳过。
        */
       const r = await this.call('personal_fm', {}, { noDedupe: true });
-      return (r.data || []).map((s) => this.mapSong(s));
+      /* 同上：统一走 mapSongs，避免 null 混进队列 */
+      return this.mapSongs(r.data);
     },
 
     /** 歌曲评论（热评 + 最新） */

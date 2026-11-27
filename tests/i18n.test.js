@@ -347,10 +347,23 @@ test('store.js 的 ENUMS.lang 与内置语言列表一致', () => {
  *     · 纯内部异常（FileNotFoundException 之类，只在日志里出现）
  *   留下来的就是「会被 toast / 弹窗 / 崩溃页显示」的那批。
  */
-const NATIVE_I18N_FILES = [
-  'android/app/src/main/java/com/ripple/app/NeteaseClient.java',
-  'android/app/src/main/java/com/ripple/app/HttpBridge.java',
-];
+/*
+ * 原生层的取样范围（审查 1.3.8 · M-19）。
+ *
+ * 这里以前是**手写清单**（只有 NeteaseClient.java 和 HttpBridge.java）。
+ * 后果：1.3.8 新增的 LyricOverlay.java（11 处 L10n.t 的原生 UI）完全不在
+ * 检查范围内 —— 它当前是干净的，但那是**运气，不是护栏**。
+ * 下一个往原生层加用户可见文案的人不会被任何测试拦住。
+ *
+ * 改成扫目录自动发现：*.java 里只要出现中文，就必须被这条规则看到。
+ * 手写清单的毛病就是「加文件时忘了加」，而目录扫描根本不存在「忘」这件事。
+ */
+const NATIVE_I18N_DIR = 'android/app/src/main/java/com/ripple/app';
+const NATIVE_I18N_FILES = fs
+  .readdirSync(path.join(ROOT, NATIVE_I18N_DIR))
+  .filter((f) => f.endsWith('.java'))
+  .sort()
+  .map((f) => NATIVE_I18N_DIR + '/' + f);
 
 /** 抽出一个文件里「用户可见但没包 L10n.t / i18n::t」的中文字面量 */
 function untranslatedUserFacingStrings(relPath) {
@@ -374,10 +387,24 @@ function untranslatedUserFacingStrings(relPath) {
     if (!CJK.test(t)) continue;
     if (!/"[^"]*"/.test(t)) continue;
     /*
-     * 日志不是文案：它写给开发者看，翻了反而不好检索
-     * （这一点与 app/js/log.js 的口径一致）。
+     * 判据必须在**拼接后的语句**上做，不能只看本行。
+     *
+     * 原因（审查 1.3.8 · M-19 把取样范围从「手写 2 个文件」扩大到
+     * 「扫目录所有 *.java」之后暴露出来的假阳性）：
+     *   ① 多行日志调用：LogBridge.add(..., "MEDIA", 在上一行、
+     *      中文字面量在下一行 —— 只看本行就认不出它在写日志；
+     *   ② 异常/内部错误串：FileNotFoundException("路径形状非法") 这类
+     *      只会进日志或抛给调用方，界面上永远看不到原文；
+     *   ③ 日志缓冲区/轨迹截断标记："…(更早的日志已截断)…"、"…（trace 已截断于 …KB）"。
+     * 三类都不是 UI 文案，按 log.js 的口径（日志不翻译）一律跳过。
      */
-    if (/LogBridge\.|Log\.|log\(|eprintln!|println!/.test(t)) continue;
+    const stmt = lines.slice(Math.max(0, i - 4), i + 1).join('\n');
+    /* ① 日志：它写给开发者看，翻了反而不好检索 */
+    if (/LogBridge\.|Log\.|log\(|eprintln!|println!/.test(stmt)) continue;
+    /* ② 异常/内部错误串 */
+    if (/new\s+\w*Exception\s*\(/.test(stmt)) continue;
+    /* ③ 崩溃记录 / 轨迹截断标记 */
+    if (/CrashLog\.record|recordMessage|trace|已截断|BUF\.insert/.test(stmt)) continue;
     /*
      * 多行 L10n.t(...) 的**第二行**（英文串那一行）不含中文，不会被误抓；
      * 而中文串那一行往往也不含 `L10n.t` —— 它在上一行。所以往上多看两行。
@@ -418,5 +445,417 @@ test('原生层判据有效：未包 L10n.t 的中文串会被抓出', () => {
     assert.match(found[0], /必须被抓到/);
   } finally {
     try { fs.unlinkSync(tmp); } catch (e) {}
+  }
+});
+
+/**
+ * 元测试（审查 1.3.8 · M-19 的配套）：证明取样范围**覆盖了所有原生文件**。
+ *
+ * M-19 的病根是「NATIVE_I18N_FILES 是手写清单，加文件时忘了加」。
+ * 只把清单改成扫目录还不够 —— 必须有一条断言盯着「扫描结果 == 目录实际内容」，
+ * 否则将来有人把扫目录改回手写、或加了子目录，就又回到「恒真」状态。
+ */
+test('原生层取样范围完整：目录里每个 .java 都在取样清单里', () => {
+  const onDisk = fs
+    .readdirSync(path.join(ROOT, NATIVE_I18N_DIR))
+    .filter((f) => f.endsWith('.java'))
+    .map((f) => NATIVE_I18N_DIR + '/' + f)
+    .sort();
+  assert.deepEqual(
+    NATIVE_I18N_FILES,
+    onDisk,
+    '取样清单与目录实际内容不一致 —— 有文件漏检（这正是 M-19 的病根）'
+  );
+  /* 1.3.8 新增的 LyricOverlay.java 必须在内（它是本轮最容易漏的那个） */
+  assert.ok(
+    NATIVE_I18N_FILES.some((p) => p.endsWith('LyricOverlay.java')),
+    'LyricOverlay.java（1.3.8 新增的原生 UI）不在取样范围里'
+  );
+});
+
+/* ---------------------------------------------------------- DOM 层：剪枝（1.3.8 B-1 / B-1a / H-8） */
+
+/*
+ * 这一节真的把 index.html + i18n.js + en.js 装进 jsdom 跑，断言「英文界面下
+ * 歌名 / 艺人 / 歌词保持中文，静态标签被翻成英文」。
+ *
+ * 为什么前面那些测试挡不住 B-1：它们全部在**纯函数**层面（T() / 词典 / 白名单），
+ * 而 B-1 的缺陷在 **MutationObserver → walk() → inSkip() 的调用链**里 ——
+ * 一条通路漏了守卫，纯函数测试一条都看不见。1.3.6 之所以把 B-1 当成
+ * 「1.3.5 的 H-1 已经修好」，正是因为 tests/i18n.test.js 全文对
+ * SKIP_SEL / inSkip / textContent 零覆盖。
+ *
+ * jsdom 是**仓库外**的依赖（本机在 /tmp/node_modules/jsdom，仓库里没有
+ * package.json，CI 也不跑 npm install）。所以这里做两件事：
+ *   ① 找不到 jsdom 时**跳过并大声说明**（列出因此失去的覆盖面），不静默；
+ *   ② 另加一条不依赖任何外部包的**名单漂移断言**（见本节末尾），
+ *      保证「有人把 #dockTitle 从名单里删掉」这种回退在 CI 上也能被抓到。
+ */
+
+/** jsdom 解析顺序：显式环境变量 → 正常 require → 本机 /tmp 兜底 */
+function loadJsdom() {
+  const cands = [];
+  if (process.env.RIPPLE_JSDOM) cands.push(process.env.RIPPLE_JSDOM);
+  cands.push('jsdom', '/tmp/node_modules/jsdom');
+  for (const c of cands) {
+    try {
+      const mod = require(c);
+      /* jsdom 的导出形状有两套：新版是 { JSDOM }，老版/直连路径直接是构造函数 */
+      if (typeof mod === 'function') return mod;
+      if (mod && typeof mod.JSDOM === 'function') return mod.JSDOM;
+    } catch (e) { /* 继续试下一个 */ }
+  }
+  return null;
+}
+
+const JSDOM = loadJsdom();
+const NO_JSDOM = JSDOM ? false
+  : 'jsdom 不可用（试过 $RIPPLE_JSDOM / jsdom / /tmp/node_modules/jsdom）'
+    + ' —— 回调层（MutationObserver → walk → inSkip）的断言本次未执行';
+
+/**
+ * 往引擎源码里打一个「破坏补丁」，用来做元测试。
+ *
+ * 每处补丁都**断言锚点确实存在**：锚点漂了（有人重构了这段代码）时
+ * 必须当场报错，而不是安静地打一个空补丁、让元测试变成重言式。
+ */
+function breakEngine(src, p) {
+  if (src.indexOf(p.from) < 0) {
+    throw new Error('破坏补丁的锚点不存在（' + p.why + '）：' + JSON.stringify(p.from.slice(0, 60)));
+  }
+  return src.replace(p.from, p.to);
+}
+
+/** 三个破坏补丁，分别对应 B-1 / B-1a / H-8 的修复 */
+const BREAK_B1 = {
+  from: '      if (inSkip(node)) return;\n      translateTextNode(node);',
+  to: '      translateTextNode(node);',
+  why: 'B-1：去掉 walk() 文本节点分支的 inSkip 守卫',
+};
+const BREAK_B1A = {
+  from: "    '#dockTitle', '#dockArtist',                 // 底部 dock 歌名/艺人（与播放页同源数据）\n",
+  to: '',
+  why: 'B-1a：把 #dockTitle / #dockArtist 从 SKIP_SEL 里删掉',
+};
+const BREAK_H8 = {
+  from: "  var UNSKIP_SEL = '.c-k';",
+  to: "  var UNSKIP_SEL = '.c-k-disabled';",
+  why: 'H-8：让反剪枝名单不再命中 .c-k（等价于「只从 SKIP_SEL 删掉 .c-k」这一步）',
+};
+
+/**
+ * 用真实 index.html 起一个英文界面的 jsdom 页面。
+ * @param {string} [src] 引擎源码（默认读仓库里的；元测试传破坏版）
+ */
+function bootDom(src) {
+  const engine = src || fs.readFileSync(path.join(ROOT, 'app', 'js', 'i18n.js'), 'utf8');
+  const html = fs.readFileSync(path.join(ROOT, 'app', 'index.html'), 'utf8');
+  const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://localhost/' });
+  const w = dom.window;
+  w.eval(engine);
+  w.eval(fs.readFileSync(path.join(ROOT, 'app', 'js', 'lang', 'en.js'), 'utf8'));
+  return {
+    w, d: w.document, I: w.I18n,
+    close() { try { w.close(); } catch (e) { /* 已关 */ } },
+  };
+}
+
+/** 等 MutationObserver 的回调跑完（观察器回调是微任务，150ms 足够宽松） */
+function domTick() {
+  return new Promise((r) => setTimeout(r, 150));
+}
+
+/** 五个「远程数据」元素 + 真实业务会写进去的中文短词 */
+const REMOTE_CASES = [
+  ['#npTitle', '全部', '播放页歌名'],
+  ['#npArtist', '深', '播放页艺人'],
+  ['#lyrCur', '全部', '收起态当前句歌词'],
+  ['#dockTitle', '全部', '底部 dock 歌名'],
+  ['#dockArtist', '深', '底部 dock 艺人'],
+];
+
+/**
+ * 公共流程：英文态 → 给五个元素赋中文短词 → 读回。
+ * @param {string} [src] 引擎源码（元测试传破坏版）
+ */
+async function assignRemoteAndRead(src) {
+  const page = bootDom(src);
+  try {
+    page.I.setLang('en', true);
+    await domTick();
+    for (const c of REMOTE_CASES) {
+      const el = page.d.querySelector(c[0]);
+      assert.ok(el, 'index.html 里找不到 ' + c[0] + '（选择器或结构变了，本节断言失去依据）');
+      /* 用 textContent 赋值 = 真实业务写法（app.js:2578 / :2662 / :3293）。
+         它在 DOM 层产生 childList 变更，正是 B-1 漏掉的那条通路。 */
+      el.textContent = c[1];
+    }
+    await domTick();
+    const got = {};
+    for (const c of REMOTE_CASES) got[c[0]] = page.d.querySelector(c[0]).textContent;
+    return got;
+  } finally {
+    page.close();
+  }
+}
+
+test('B-1 / B-1a：英文态下歌名、艺人、歌词不被翻译（inSkip 必须覆盖 textContent 通路）', { skip: NO_JSDOM }, async () => {
+  const got = await assignRemoteAndRead();
+  /*
+   * 判据是「等于中文原文」，不是「不等于 All」—— 后者在引擎整体瘫痪时也通过，
+   * 那正是这类测试最容易变成空转的地方（见下一条对照测试）。
+   */
+  for (const c of REMOTE_CASES) {
+    assert.equal(got[c[0]], c[1],
+      c[2] + '（' + c[0] + '）被翻译了：期望 ' + JSON.stringify(c[1])
+      + '，实际 ' + JSON.stringify(got[c[0]])
+      + ' —— 用户在听的内容必须原样显示');
+  }
+});
+
+test('对照：同一次赋值里，静态界面文案确实被翻成英文（否则上面那条是空转）', { skip: NO_JSDOM }, async () => {
+  /*
+   * 这条是前一条的**有效性前提**：如果引擎压根没跑起来（en.js 没加载、
+   * setLang 没生效、观察器没启动），前一条会因为「什么都没变」而假通过。
+   * 所以这里断言同一份页面里普通元素确实变成了英文 ——
+   * 证明「仍是中文」是剪枝的结果，而不是翻译整体失效。
+   */
+  const page = bootDom();
+  try {
+    page.I.setLang('en', true);
+    await domTick();
+    const tab = page.d.querySelector('.tabbar a[data-nav="home"]');
+    assert.ok(tab, '找不到底部导航的「发现」项');
+    assert.equal(tab.textContent.trim(), 'Discover', '英文态下静态标签没被翻译，说明引擎没生效');
+    assert.equal(page.I.T('发现'), 'Discover', 'T() 本身在英文态应返回译文');
+  } finally {
+    page.close();
+  }
+});
+
+test('H-8：首页卡片里的 .c-k 静态标签要被翻译，同一张卡的远程标题仍保持中文', { skip: NO_JSDOM }, async () => {
+  const page = bootDom();
+  try {
+    page.I.setLang('en', true);
+    await domTick();
+    const car = page.d.querySelector('#carousel');
+    assert.ok(car, 'index.html 里找不到 #carousel');
+    /*
+     * 复刻 app.js:916-922 的 carouselHTML：.c-card 整张卡既有远程数据
+     * （.c-tx 里的歌单标题/副标题），也有写死的界面标签（.c-k 的 kind）。
+     */
+    car.innerHTML = '<div class="c-card"><div class="c-k">歌单</div>'
+      + '<div class="c-tx"><b>全部</b><span>深</span></div></div>';
+    await domTick();
+    const k = car.querySelector('.c-k');
+    assert.equal(k.textContent, 'Playlists',
+      '.c-k 是静态界面标签（netease.js 的 歌单/收藏 两个字面量），英文态必须翻译；'
+      + '实际 ' + JSON.stringify(k.textContent));
+    /* 反向保护：不能为了修 H-8 把整张卡的远程数据一起放出来 */
+    assert.equal(car.querySelector('.c-tx b').textContent, '全部',
+      '.c-card 里的歌单标题是远程数据，必须保持中文');
+    assert.equal(car.querySelector('.c-tx span').textContent, '深',
+      '.c-card 里的副标题是远程数据，必须保持中文');
+    /* 真实渲染会反复重建卡片，重写一次 .c-k 也要翻（childList 通路） */
+    k.textContent = '收藏';
+    await domTick();
+    assert.equal(k.textContent, 'Favorite',
+      '.c-k 重新赋值后应变成 Favorite，实际 ' + JSON.stringify(k.textContent));
+  } finally {
+    page.close();
+  }
+});
+
+test('剪枝是可逆的：切回中文再切英文，被跳过的容器内容仍是原文', { skip: NO_JSDOM }, async () => {
+  /*
+   * 剪枝最容易写错的方向是「英文态不翻、切回中文也回不去」。
+   * 这里走一遍 en → zh → en。
+   */
+  const page = bootDom();
+  try {
+    page.I.setLang('en', true);
+    await domTick();
+    for (const c of REMOTE_CASES) page.d.querySelector(c[0]).textContent = c[1];
+    const car = page.d.querySelector('#carousel');
+    car.innerHTML = '<div class="c-card"><div class="c-k">歌单</div></div>';
+    await domTick();
+
+    page.I.setLang('zh', true);
+    await domTick();
+    for (const c of REMOTE_CASES) {
+      assert.equal(page.d.querySelector(c[0]).textContent, c[1], '切回中文后 ' + c[0] + ' 应是原文');
+    }
+    assert.equal(car.querySelector('.c-k').textContent, '歌单', '切回中文后 .c-k 应是原文');
+
+    page.I.setLang('en', true);
+    await domTick();
+    for (const c of REMOTE_CASES) {
+      assert.equal(page.d.querySelector(c[0]).textContent, c[1], '再切英文后 ' + c[0] + ' 仍应是原文');
+    }
+    assert.equal(car.querySelector('.c-k').textContent, 'Playlists', '再切英文后 .c-k 应重新翻译');
+  } finally {
+    page.close();
+  }
+});
+
+/*
+ * ---------- 元测试：证明上面那些断言不是空转 ----------
+ *
+ * 做法与「原生层判据有效」那条一致：把修复**故意破坏**，用同一套断言去跑，
+ * 要求它必须变红。三条修复各配一个补丁，缺一条都会让对应修复失去防线。
+ *
+ * 特别注意 BREAK_H8：它把 UNSKIP_SEL 改成一个匹配不到任何元素的值 ——
+ * 这正是「只把 .c-k 从 SKIP_SEL 里删掉、忘了祖先 .c-card 会整棵剪掉」的状态。
+ * 1.3.8 的修复建议里只写了「去掉 .c-k」，本机实测那样改之后 .c-k 仍是中文。
+ */
+
+test('元测试：去掉 walk() 文本分支的 inSkip → B-1/B-1a 断言必须变红', { skip: NO_JSDOM }, async () => {
+  const broken = breakEngine(fs.readFileSync(path.join(ROOT, 'app', 'js', 'i18n.js'), 'utf8'), BREAK_B1);
+  const got = await assignRemoteAndRead(broken);
+  /* 破坏之后至少 #npTitle 与 #dockTitle 必须被翻掉，否则元测试本身无效 */
+  assert.notEqual(got['#npTitle'], '全部',
+    '去掉 inSkip 守卫后 #npTitle 仍是中文 —— 说明这条元测试没有真的破坏到 B-1 的修复路径');
+  assert.equal(got['#npTitle'], 'All', '破坏版应把「全部」译成 All，实际 ' + JSON.stringify(got['#npTitle']));
+  assert.equal(got['#dockTitle'], 'All', '破坏版应把 dockTitle「全部」译成 All');
+});
+
+test('元测试：把 #dockTitle / #dockArtist 从 SKIP_SEL 删掉 → B-1a 断言必须变红', { skip: NO_JSDOM }, async () => {
+  const broken = breakEngine(fs.readFileSync(path.join(ROOT, 'app', 'js', 'i18n.js'), 'utf8'), BREAK_B1A);
+  const got = await assignRemoteAndRead(broken);
+  assert.equal(got['#dockTitle'], 'All', '删掉 #dockTitle 后它应被翻译（B-1a 的原始症状）');
+  assert.equal(got['#dockArtist'], 'Dark', '删掉 #dockArtist 后它应被翻译');
+  /* 反向：播放页那几个还在名单里，破坏这一条不该波及它们 —— 证明两条根因是独立的 */
+  assert.equal(got['#npTitle'], '全部', 'B-1 的修复独立生效，不该被 B-1a 的破坏波及');
+});
+
+test('元测试：让反剪枝名单不命中 .c-k → H-8 断言必须变红', { skip: NO_JSDOM }, async () => {
+  const broken = breakEngine(fs.readFileSync(path.join(ROOT, 'app', 'js', 'i18n.js'), 'utf8'), BREAK_H8);
+  const page = bootDom(broken);
+  try {
+    page.I.setLang('en', true);
+    await domTick();
+    const car = page.d.querySelector('#carousel');
+    car.innerHTML = '<div class="c-card"><div class="c-k">歌单</div></div>';
+    await domTick();
+    assert.equal(car.querySelector('.c-k').textContent, '歌单',
+      '反剪枝失效后 .c-k 应仍是中文（这正是「只从 SKIP_SEL 删掉 .c-k」的实测结果）');
+  } finally {
+    page.close();
+  }
+});
+
+/*
+ * ---------- 名单漂移防护（不需要任何外部依赖，CI 一定跑得到） ----------
+ *
+ * jsdom 缺席时上面整节会 skip，于是「有人把 #dockTitle 从 SKIP_SEL 里删掉」
+ * 这类回退在 CI 上就是隐形的。这条测试直接读源码里的两份名单，
+ * 断言 1.3.8 修复过的条目一个都不许少 —— 它抓不到逻辑错误，但抓得住回退。
+ */
+
+/**
+ * 从源码里抠出 `var NAME = ...;` 这一句里所有单/双引号字面量。
+ * 用来在**不依赖 jsdom** 的情况下读 SKIP_SEL / UNSKIP_SEL 名单。
+ */
+function extractSelectorList(src, name) {
+  const m = new RegExp('var ' + name + ' = ').exec(src);
+  if (!m) return null;
+  const end = src.indexOf(';\n', m.index);
+  const body = src.slice(m.index + m[0].length, end < 0 ? src.length : end);
+  const re = /'([^']*)'|"([^"]*)"/g;
+  const out = [];
+  let x;
+  while ((x = re.exec(body)) !== null) {
+    const v = x[1] !== undefined ? x[1] : x[2];
+    if (v && v !== ',') out.push(v);   // ',' 是 .join 的分隔符，不是选择器
+  }
+  return out;
+}
+
+test('名单漂移：SKIP_SEL / UNSKIP_SEL 里 1.3.8 修复过的条目一个都不许少', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'app', 'js', 'i18n.js'), 'utf8');
+  const skip = extractSelectorList(src, 'SKIP_SEL');
+  const unskip = extractSelectorList(src, 'UNSKIP_SEL');
+
+  /* 先证明解析器真的读到了东西（否则下面的 includes 全是空转） */
+  assert.ok(skip && skip.length > 10,
+    'SKIP_SEL 解析失败或条目数异常（实际 ' + (skip ? skip.length : 'null')
+    + '）—— 正则与源码形状对不上了，这条测试已经失效');
+  assert.ok(unskip && unskip.length >= 1, 'UNSKIP_SEL 解析失败');
+
+  /* B-1a：底部 dock 的两个 id 必须在跳过名单里 */
+  assert.ok(skip.indexOf('#dockTitle') >= 0,
+    '#dockTitle 掉了 → 底部 dock 歌名会被翻译（B-1a 复发）');
+  assert.ok(skip.indexOf('#dockArtist') >= 0,
+    '#dockArtist 掉了 → 底部 dock 艺人会被翻译（B-1a 复发）');
+
+  /* H-8：.c-k 必须**不在** SKIP_SEL、而在 UNSKIP_SEL 里（两半缺一不可） */
+  assert.equal(skip.indexOf('.c-k'), -1,
+    '.c-k 又回到 SKIP_SEL 了 —— 首页卡片的「歌单/收藏」在英文界面会永远中文（H-8 复发）');
+  assert.ok(unskip.indexOf('.c-k') >= 0,
+    '.c-k 不在 UNSKIP_SEL 里 —— 光从 SKIP_SEL 删掉是不够的，祖先 .c-card 仍会整棵剪掉');
+
+  /* 播放页三项是 1.3.5 修的，一并钉住，防止以后清名单时误删 */
+  for (const id of ['#npTitle', '#npArtist', '#npMeta']) {
+    assert.ok(skip.indexOf(id) >= 0, id + ' 掉了 → 播放页歌名/艺人会被翻译');
+  }
+});
+
+/*
+ * 元测试：证明名单漂移断言不是空转 ——
+ * 把 1.3.8 的三处修复全部回退成「修复前」的名单，同一套判据必须报错。
+ */
+test('元测试：把 SKIP_SEL / UNSKIP_SEL 回退成修复前状态 → 漂移断言必须变红', () => {
+  const repaired = fs.readFileSync(path.join(ROOT, 'app', 'js', 'i18n.js'), 'utf8');
+  let reverted = breakEngine(repaired, BREAK_B1A);
+  reverted = breakEngine(reverted, BREAK_H8);
+
+  const skip = extractSelectorList(reverted, 'SKIP_SEL');
+  const unskip = extractSelectorList(reverted, 'UNSKIP_SEL');
+
+  /* 回退之后：dock 两项不在名单里、.c-k 也不在反剪枝名单里 */
+  assert.equal(skip.indexOf('#dockTitle'), -1, '回退版里 #dockTitle 应当不在 SKIP_SEL');
+  assert.equal(unskip.indexOf('.c-k'), -1, '回退版里 .c-k 应当不在 UNSKIP_SEL');
+
+  /* 这正是修复前会漏掉的两条断言 —— 证明上面的检查对这类回退是敏感的 */
+  const problems = [];
+  if (skip.indexOf('#dockTitle') < 0) problems.push('dock');
+  if (unskip.indexOf('.c-k') < 0) problems.push('ck');
+  assert.deepEqual(problems, ['dock', 'ck'],
+    '回退后必须同时触发 dock 与 .c-k 两项告警，实际 ' + JSON.stringify(problems));
+});
+
+/*
+ * ---------- H-8 的连带风险：.c-k 被翻译后，读回显示文本的代码会拿到英文 ----------
+ *
+ * app.js:5898-5903 打开歌单详情页时这样取 kind：
+ *   kind: (plEl.querySelector('.c-k') || {}).textContent
+ * 再写进 #plKind（app.js:5290）。.c-k 不翻译时读到的是中文原文，链路自洽；
+ * 一旦按 H-8 翻成英文，读回来就是 Playlists —— 实测切回中文后 #plKind 仍留英文。
+ *
+ * 根治要改 app.js（读事实源别读显示文本），但那不在本文件的写入范围。
+ * 所以 i18n.js 负责把原文暴露成 data-i18n-src，这里断言它确实可用；
+ * 同时把「读 textContent 会拿到英文」这个事实钉住 —— 它一旦变了，
+ * 说明 app.js 那边已经改成读 data-i18n-src 了，这条测试该更新。
+ */
+test('H-8 连带：.c-k 的原文通过 data-i18n-src 暴露，供读回显示文本的代码改用', { skip: NO_JSDOM }, async () => {
+  const page = bootDom();
+  try {
+    page.I.setLang('en', true);
+    await domTick();
+    const car = page.d.querySelector('#carousel');
+    car.innerHTML = '<div class="c-card" data-pl="p1"><div class="c-k">歌单</div></div>';
+    await domTick();
+    const k = car.querySelector('.c-k');
+    assert.equal(k.textContent, 'Playlists', '英文态显示值应是译文');
+    assert.equal(k.getAttribute('data-i18n-src'), '歌单',
+      'data-i18n-src 必须留着中文原文 —— app.js:5902 拿它当 kind 用；'
+      + '实际 ' + JSON.stringify(k.getAttribute('data-i18n-src')));
+    /* 切回中文：显示值回原文，data-i18n-src 仍是原文 */
+    page.I.setLang('zh', true);
+    await domTick();
+    assert.equal(k.textContent, '歌单', '切回中文后 .c-k 应显示原文');
+    assert.equal(k.getAttribute('data-i18n-src'), '歌单', 'data-i18n-src 应保持原文');
+  } finally {
+    page.close();
   }
 });

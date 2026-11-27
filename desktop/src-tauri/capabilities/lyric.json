@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "lyric",
-  "description": "歌词窗专属能力（D-09，1.3.4）。只开它真正需要的那几项：点击穿透、移动位置、读取当前位置。主窗口不该持有这些权限。",
+  "description": "歌词窗专属能力（D-09，1.3.4）。只开它真正需要的那几项：事件监听、点击穿透、移动位置、读取当前位置。主窗口不该持有这些权限。",
   "windows": [
     "lyric"
   ],
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:window:allow-set-ignore-cursor-events",

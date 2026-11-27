@@ -43,6 +43,16 @@
         "displayLanguageSelector": true
       }
     },
+    "linux": {
+      "deb": {
+        "recommends": [
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-plugins-ugly",
+          "gstreamer1.0-libav"
+        ]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

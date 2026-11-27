@@ -89,8 +89,22 @@ impl Client {
         let cookie_path = data_dir.join("netease-cookie");
         let cookie_jar = fs::read_to_string(&cookie_path).unwrap_or_default();
 
+        /*
+         * 1.3.9：单请求超时从 25s 收紧到 12s，并单独给连接阶段一个更短的超时。
+         *
+         * 原来「一个超时 25 秒」+「status 内部串行 4 次」= 最坏 100 秒占住
+         * 一个 worker。而工作池只有 2 个线程（现已扩到 8），网络差的时候
+         * 几条这样的请求就能让整个 IPC 通道排队 —— 用户看到的是
+         * 「所有请求都超时」+「顶栏按钮点了没反应」。
+         *
+         * 12 秒的依据：前端 song_url 的超时是 25 秒、status 是 60 秒，
+         * 单次要留出「重试一次」的余量；同时 `connect_timeout` 单独设 6 秒 ——
+         * 连不上和连上了没响应是两种故障，前者应该很快失败，
+         * 不要把 12 秒耗在等 TCP 握手/代理上。
+         */
         let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(25))
+            .timeout(Duration::from_secs(12))
+            .connect_timeout(Duration::from_secs(6))
             .user_agent(UA)
             .gzip(true)
             .build()
@@ -339,15 +353,48 @@ impl Client {
                     "total": true,
                 });
                 let r = self.post("cloudsearch/pc", body)?;
-                // E-15：只有「拿不到 result.songs」且「code != 200」时才回落老接口，
-                // 与 Java:331-341 同口径。早的判据是「没有 result.songs 就回落」，
-                // 于是云搜索被限流但返回 {"result":{},"code":200} 时会多打一次请求
-                // 并给出另一批数据。
-                let ok = serde_json::from_str::<Value>(&r)
+                /*
+                 * E-15 + H-4（审查报告，1.3.8）：回落老接口的判据必须与
+                 * server.js / NeteaseClient.java **完全同口径** ——
+                 *   有 result.songs  **或**  code == 200  → 信任这次云搜索的结果，不回落；
+                 *   两者都不成立                            → 才回落 search/get。
+                 *
+                 * 为什么 code == 200 这一半不能少（H-4 的实质）：
+                 * 上游最常见的限流形态是 {"result":{},"code":200} ——
+                 * 即 HTTP 与业务码都成功、只是结果为空。
+                 *   · Java（NeteaseClient.java）与 Node（server.js）：has=false 但
+                 *     code==200 → **不回落** → 前端拿到空结果；
+                 *   · 本文件以前只判 has → **回落** → 多打一次 search/get，
+                 *     返回一批**不一样**的数据。
+                 * 后果就是同一时刻、同一账号、同一关键词，APK/网页版给空结果、
+                 * 桌面端给另一批搜索结果；而且限流时多打一次请求
+                 * 更容易被二次风控。
+                 *
+                 * 以前这里注释已经写着「且 code != 200」，但代码只抄了前半句 ——
+                 * 注释与实现不符比没注释更危险（下一个人会以为已经修好了）。
+                 * 现在把两个量一起算出来，判据写在一行里，注释与代码不可能再漂。
+                 */
+                let (has, code) = serde_json::from_str::<Value>(&r)
                     .ok()
-                    .and_then(|v| v.get("result").and_then(|x| x.get("songs")).map(|_| ()))
-                    .is_some();
-                if ok {
+                    .map(|v| {
+                        let has = v.get("result").and_then(|x| x.get("songs")).is_some();
+                        /* code 缺失按 200 处理：与 Java 的 j.optInt("code", 200)、
+                        Node 的 typeof j.code === 'number' ? j.code : 200 一致。 */
+                        let code = v.get("code").and_then(Value::as_i64).unwrap_or(200);
+                        (has, code)
+                    })
+                    /*
+                     * 响应根本不是合法 JSON —— 与「code 缺失」是两件事，不能混：
+                     *   · code 缺失但 JSON 合法 → 按 200（与 Java 的 optInt 默认值、
+                     *     Node 的 typeof 判定一致，见上一段）；
+                     *   · 整段不是 JSON → 拿不到任何可用结果，按「既不 has 也不是 200」
+                     *     处理 → 走回落老接口，多试一条可能还能给用户结果。
+                     * 这里刻意**不**照抄 Java：那边 JSON 解析失败会直接抛异常、
+                     * 整条命令失败；而桌面端回落到 search/get 仍有机会成功，
+                     * 对用户更有用。差异点写在这里，避免以后有人以为是抄漏了。
+                     */
+                    .unwrap_or((false, 0));
+                if has || code == 200 {
                     return Ok(r);
                 }
                 let old = self.post(

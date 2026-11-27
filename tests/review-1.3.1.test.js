@@ -193,18 +193,77 @@ test('D-09 personal_fm 三端路径一致（v1/radio/get）', () => {
 /* ---------------------------------------------------------------
  * D-02 [high] 桌面端版本号必须纳入唯一来源链条
  * --------------------------------------------------------------- */
+/*
+ * B-4（审查 1.3.8）：这里是版本判据的**第三份抄本**。
+ *
+ * 原来那一行是：
+ *   const cv = (cargo.match(/^version = "([0-9.]+)"/m) || [])[1];
+ * —— 匹配文件**第一处** version =，和当年两个 workflow 抄的是同一个错判据。
+ * Cargo.toml 里只要 [package] 之前有一个 [profile.release] / [workspace.metadata]
+ * / [[bin]] 带 version 键，这条测试就会拿错表的值去比，**恰好一致时还报绿**。
+ *
+ * 现在直接 require 唯一解析器 scripts/version-facts.js 的 cargoTomlPackageVersion()
+ * —— 它是段内定位（先切 [package] 再取 version）。这一条从此不再是「第三份实现」，
+ * 而是「对同一个实现的调用」。
+ *
+ * 顺带把这个用例的价值提上去了：它现在还能抓出「解析器自己退化成第一处匹配」
+ * 这种反向事故（下面的对抗样本断言）。
+ */
+const { cargoTomlPackageVersion } = require('../scripts/version-facts.js');
+
 test('D-02 桌面端版本号：Cargo.toml / Cargo.lock 与 version.json 一致', () => {
   const vj = JSON.parse(read('version.json'));
   const cargo = read('desktop/src-tauri/Cargo.toml');
   const lock = read('desktop/src-tauri/Cargo.lock');
   const tauri = JSON.parse(read('desktop/src-tauri/tauri.conf.json'));
 
-  const cv = (cargo.match(/^version = "([0-9.]+)"/m) || [])[1];
+  /* B-4：不再自带正则，调唯一解析器 */
+  const cv = cargoTomlPackageVersion(cargo);
   const lv = (lock.match(/\[\[package\]\]\s*\nname = "ripple-desktop"\s*\nversion = "([0-9.]+)"/) || [])[1];
 
-  assert.strictEqual(cv, vj.versionName, `Cargo.toml 版本 ${cv} ≠ version.json ${vj.versionName}`);
+  assert.strictEqual(cv, vj.versionName, `Cargo.toml [package].version ${cv} ≠ version.json ${vj.versionName}`);
   assert.strictEqual(lv, vj.versionName, `Cargo.lock 版本 ${lv} ≠ version.json ${vj.versionName}`);
   assert.strictEqual(tauri.version, vj.versionName, `tauri.conf.json 版本 ≠ version.json`);
+});
+
+/*
+ * B-4 的元测试（对抗样本）：这正是报告里证明「三处检查同时报绿」的那个构造。
+ *
+ * 同一个 Cargo.toml 文本：
+ *   · 按老判据（读第一处 ^version =）→ 得到 1.3.9，与 version.json 一致 → 报绿；
+ *   · 按唯一解析器（[package] 段内）→ 得到 1.2.0 → 报红。
+ *
+ * 这条断言把「老判据是错的」这件事本身钉进测试：如果哪天有人把
+ * cargoTomlPackageVersion 改回「读第一处」，这条会立刻红。
+ */
+test('D-02/B-4 版本判据：段内定位，不被 [package] 之前的 version 键带偏', () => {
+  const sample = [
+    '[profile.release]',
+    'version = "1.3.9"',
+    '',
+    '[package]',
+    'name = "ripple-desktop"',
+    'version = "1.2.0"',
+    '',
+    '[dependencies]',
+    'serde = "1"',
+    '',
+  ].join('\n');
+
+  /* 老判据（复刻被删掉的那一行）——故意留着做对照，证明它真的会读错 */
+  const oldStyle = (sample.match(/^version = "([0-9.]+)"/m) || [])[1];
+  assert.strictEqual(oldStyle, '1.3.9', '老判据（读第一处）应当读到 1.3.9 —— 这就是它报绿的原因');
+  assert.notStrictEqual(oldStyle, '1.2.0', '老判据读不到真正的 [package].version');
+
+  /* 唯一解析器必须读到 [package] 段内的值 */
+  assert.strictEqual(cargoTomlPackageVersion(sample), '1.2.0',
+    'cargoTomlPackageVersion 必须段内定位；读成 1.3.9 说明它退化成了「读第一处」');
+  assert.notStrictEqual(cargoTomlPackageVersion(sample), oldStyle,
+    '唯一解析器的结果必须与老判据**不同** —— 这正是 B-4 要防的那次误判');
+
+  /* 边界：没有 [package] 段时返回 null（绝不能退化成「全文第一处」） */
+  assert.strictEqual(cargoTomlPackageVersion('[profile.release]\nversion = "1.3.9"\n'), null,
+    '没有 [package] 段时必须返回 null，而不是回落到全文第一处 version');
 });
 
 test('D-02 sync-version.sh 必须同步桌面端（否则下次发版又漂移）', () => {
@@ -526,7 +585,28 @@ test('S-03 登出：cookie 代际必须挡住迟到的 Set-Cookie', () => {
 test('S-10 上游响应体：必须有上限（请求方向已有 256KB，别单边不对称）', () => {
   const src = read('server.js');
   assert.match(src, /MAX_UPSTREAM_BODY/, '必须有响应体上限常量');
-  assert.match(src, /data\.length > MAX_UPSTREAM_BODY/, '累积时必须检查上限');
+
+  /*
+   * 审查 1.3.8 · L-8：这条断言以前匹配的是 `data.length > MAX_UPSTREAM_BODY`。
+   * 但 data.length 是 **UTF-16 码元数**，全中文时 16MB 的上限实际能吃到 48MB；
+   * 请求方向（R-20）早就改成按真实字节累计了，响应方向却保留了同一个错误判据
+   * —— 单边修过的典型遗漏。
+   *
+   * 所以这里跟着改成「按字节」：
+   *   · 必须有 makeByteCounter / Buffer.byteLength 参与上限判定；
+   *   · 且**不得**再用 data.length 直接比上限（那正是 L-8 的病）。
+   * 只改判据不放宽：它依然要求「累积时必须检查上限」这件事成立。
+   */
+  assert.match(
+    src,
+    /makeByteCounter|Buffer\.byteLength\(chunk/,
+    '累积时必须按真实字节计数（L-8：不能按 UTF-16 码元数）'
+  );
+  assert.doesNotMatch(
+    src,
+    /data\.length > MAX_UPSTREAM_BODY/,
+    '不得再按 data.length（UTF-16 码元）判定上限 —— 全中文时会超 3 倍'
+  );
 });
 
 /* ---------------------------------------------------------------

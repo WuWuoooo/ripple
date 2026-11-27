@@ -91,9 +91,32 @@ if ! grep -q 'package="'"$PKG"'"' "$OUT/AndroidManifest.xml"; then
   echo "❌ 向 AndroidManifest.xml 注入 package 失败（可能是根标签不再是 <manifest ...>）" >&2
   exit 1
 fi
+# H-15（审查 1.3.8）：与 android/app/build.gradle 的 aaptOptions.noCompress 'mp3'
+# 保持一致，否则「官方构建入口」与「可选的 Gradle 路径」出的 APK 不是同一个包。
+#
+# 今天 app/ 里恰好没有 mp3（实测 0 个）所以不产生可见差异；但只要有人往
+# app/ 放一个 mp3（音效 / 试听片段），Gradle 出的包不压缩它、这里出的包会
+# deflate → streaming 场景多一次解压、内存峰值更高、两条构建路径产物不等价。
+# 这类「两条路径只在某种输入下不同」的差异最容易长期潜伏。
+#
+# ⚠️ 参数选择踩过一次坑，记在这里：aapt2 link 的 `--no-compress` 是**布尔开关**
+# （"Do not compress any resources."），**不接受扩展名参数**。审查报告 B-15 的
+# 建议写法 `--no-compress mp3` 实测会直接把 mp3 当成一个输入文件：
+#     mp3: error: failed to open file: No such file or directory.
+#     error: failed parsing input.
+# 也就是说照着报告改会把构建**改坏**（而且是在 link 阶段才炸，前面几步白跑）。
+# 与 Gradle 的 `noCompress 'mp3'`（只针对 mp3 这一种扩展名）语义等价的参数是
+# `--no-compress-regex`（aapt2 自带 help：Do not compress extensions matching
+# the regular expression；ECMAScript 语法、大小写敏感、记得写 $）。
+#
+# 扩展名名单与 build.gradle 的 noCompress 必须一一对应 ——
+# scripts/check-manifest-consistency.js 的 [H] 项会机械比对这两处。
+NO_COMPRESS_EXTS='mp3'
+NO_COMPRESS_REGEX='\.mp3$'
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" \
   --manifest "$OUT/AndroidManifest.xml" -A "$HERE/app/src/main/assets" \
   --java "$OUT/gen" --min-sdk-version 24 --target-sdk-version 34 \
+  --no-compress-regex "$NO_COMPRESS_REGEX" \
   --version-code "$VC" --version-name "$VN" "$OUT/res.zip"
 
 # 复核产物：base.apk 里的 package 必须真的是我们的
@@ -103,21 +126,28 @@ if ! "$BT/aapt2" dump packagename "$OUT/base.apk" 2>/dev/null | grep -q "$PKG"; 
 fi
 
 echo "[4/7] javac"
-# L-8：用 mapfile 读成数组再展开，不用裸露的 $(find ...)。
+# L-8：不能用裸露的 $(find ...) —— 裸命令替换会做 word splitting + glob 展开，
+# 路径里只要有空格（Windows 上 "C: Program Files/..." 很常见）就会被拆成
+# 多个参数，编译报一堆 "file not found"，而踩到它的人会在完全无关的报错里迷路。
 #
-# 裸命令替换会做 word splitting + glob 展开，路径里只要有空格（Windows 上
-# "C:\\Program Files\\..." 很常见）就会被拆成多个参数，编译报一堆
-# "file not found"。当前仓库路径没空格所以不触发，但这是一枚埋着的雷 ——
-# 而踩到它的人会在完全无关的报错里迷路。
-# -print0 + read -d '' 是 bash 里唯一对任意文件名都安全的写法。
-mapfile -d '' JAVA_SRCS < <(find "$HERE/app/src/main/java" "$OUT/gen" -name '*.java' -print0)
-javac -encoding UTF-8 -nowarn -source 17 -target 17 -classpath "$JAR" -d "$OUT/classes" \
-  "${JAVA_SRCS[@]}"
+# H-14（审查 1.3.8）：这里原来用的是 bash 4.0+ 才有的 mapfile -d ''。
+# 方向对（NUL 分隔是唯一对任意文件名都安全的写法），但它给脚本引入了一个
+# **平台下限**：macOS 至今 /bin/bash 仍是 3.2.57，而 shebang 是
+# #!/usr/bin/env bash → 命中 /bin/bash 3.2 →
+#   build-apk.sh: line 113: mapfile: command not found
+# 紧接着 javac 收到空参数列表 → "error: no source files"，报错信息与真实原因
+# 完全无关。而 CONTRIBUTING.md 把「bash android/build-apk.sh」写在构建入口
+# 第一条 —— macOS 照文档操作直接失败。
+#
+# 现在改用 xargs -0：无 bash 版本依赖（3.2 / 4 / 5 行为一致），
+# 同样以 NUL 分隔传参，路径含空格或换行都不会碎。
+find "$HERE/app/src/main/java" "$OUT/gen" -name '*.java' -print0 \
+  | xargs -0 javac -encoding UTF-8 -nowarn -source 17 -target 17 \
+      -classpath "$JAR" -d "$OUT/classes"
 
 echo "[5/7] d8"
-mapfile -d '' CLASS_FILES < <(find "$OUT/classes" -name '*.class' -print0)
-"$D8BT/d8" --lib "$JAR" --min-api 24 --output "$OUT/dex" \
-  "${CLASS_FILES[@]}"
+find "$OUT/classes" -name '*.class' -print0 \
+  | xargs -0 "$D8BT/d8" --lib "$JAR" --min-api 24 --output "$OUT/dex"
 
 echo "[6/7] 合并 dex + zipalign"
 cd "$OUT"

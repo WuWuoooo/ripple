@@ -654,6 +654,30 @@ function assertUpstreamPath(rawPath, url) {
  */
 const MAX_UPSTREAM_BODY = 16 * 1024 * 1024;
 
+/**
+ * L-8：按**真实 UTF-8 字节**累计的字节计数器。
+ *
+ * 为什么单独提出来：请求方向的同一件事（R-20）在 handleRequest 里手写了一份，
+ * 响应方向（L-8）原本还按 `data.length` 判 —— 也就是 UTF-16 码元数。
+ * `res.setEncoding('utf8')` 之后，一个中文 3 字节只算 1、一个 emoji 4 字节只算 2，
+ * 于是 16MB 的上限在全中文响应下实际能吃到约 48MB。
+ * 提成唯一实现后，判据只有一份，并由 tests/server-http.test.js 的两条用例盯着：
+ * 一条跑「字节 vs 码元」单元对抗，一条用假上游推全中文大响应验真实接线。
+ *
+ * add(chunk) 的语义：加入本次 chunk 后**总量超限**返回 true，调用方据此中止。
+ * 超限的那一块不进入累积的 body（与以前「先判断、再 data += c」的行为一致）。
+ */
+function makeByteCounter(limit) {
+  let bytes = 0;
+  return {
+    add(chunk) {
+      bytes += Buffer.byteLength(chunk, 'utf8');
+      return bytes > limit;
+    },
+    get bytes() { return bytes; },
+  };
+}
+
 function ncmPost(path, body) {
   return new Promise((resolve, reject) => {
     let url;
@@ -701,9 +725,18 @@ function ncmPost(path, body) {
       const done = (fn, arg) => { if (settled) return; settled = true; fn(arg); };
 
       res.setEncoding('utf8');
+      /*
+       * L-8：上限必须按**真实字节**判，不能按 data.length。
+       *
+       * setEncoding('utf8') 之后 chunk 是字符串，.length 数的是 UTF-16 码元：
+       * 一个中文字符 3 字节却只算 1、一个 emoji 4 字节只算 2。全中文时
+       * 16MB 的上限实际能吃到接近 48MB —— 与请求侧（R-20 已改成按字节）不对称，
+       * 「1000 个中文歌名的大响应」这类上游异常会先把内存吃掉。
+       */
+      const seen = makeByteCounter(MAX_UPSTREAM_BODY);
       res.on('data', (c) => {
         /* S-10 顺带：响应体无上限累积会和 256KB 的请求上限形成单边不对称（实测两并发可到 1.5GB RSS） */
-        if (data.length > MAX_UPSTREAM_BODY) {
+        if (seen.add(c)) {
           /* 超限：主动断开，按上游失败处理，别把进程内存吃光 */
           done(reject, new Error('上游响应体过大（超过 ' + (MAX_UPSTREAM_BODY / 1024 / 1024) + 'MB）'));
           try { req.destroy(); } catch (e) {}
@@ -952,7 +985,20 @@ async function ncmCall(cmd, p = {}) {
     case 'personal_fm':
       return ncmPost('v1/radio/get', {});
     default:
-      return JSON.stringify({ code: -2, msg: '未知命令 ' + cmd });
+      /*
+       * L-9：未知命令是**客户端**错误，必须让状态码说话。
+       *
+       * 以前这里 `return JSON.stringify({ code: -2, msg: '未知命令 ' + cmd })`，
+       * 于是这条响应一路走到 `res.writeHead(200)` —— 一个打错的命令名
+       * 在监控 / 日志 / 前端 `fetch` 的 HTTP 层完全看不出来，只有解析 body
+       * 才知道失败了。排查时最典型的现象是「接口返回 200 但页面什么都不显示」。
+       *
+       * 把它改成 badRequest 后，走的是与参数校验失败同一条 400 路径
+       * （E-18 的 `err.badRequest` 标记），前端 proxyCall 的
+       * `throw new Error('HTTP ' + r.status)` 能立刻报出 400。
+       * 命令表本身没变，正常命令不受影响。
+       */
+      throw badRequest('未知命令 ' + cmd);
   }
 }
 
@@ -995,14 +1041,38 @@ const MIME = {
   '.md': 'text/markdown; charset=utf-8',
 };
 
-function json(res, code, obj) {
+/**
+ * 统一的 JSON 响应（错误路径用）。
+ *
+ * H-10：这里以前**硬编码** `'Access-Control-Allow-Origin': '*'`，
+ * 而正常 200 路径（handleRequest 的 /ncm/ 成功分支）用的是回显 `req.headers.origin`。
+ * 同一个接口两套 CORS 口径，后果有三：
+ *   ① 413 / 400 / 502 / 500 这四条错误路径的响应体可被**任意网页**跨域读取
+ *     （ACAO: * + 无凭据时浏览器允许读），而 400/502 的 msg 里可能带上游错误原文；
+ *   ② 未来若有人给这些响应加 Set-Cookie / 凭据，`*` 会让浏览器直接拒绝（口径不一致的隐患）；
+ *   ③ 排查时无法从响应头判断「这条是错误路径」还是「正常路径」。
+ *
+ * 所以 CORS 头从本函数里**拿掉**，改由第 4 个参数 req 决定：有 Origin 就回显，
+ * 没有就不发（与 200 路径 `if (req.headers.origin) ...` 完全同一套判据）。
+ * 并统一补 `Vary: Origin` —— 否则中间层缓存会把「回显了 origin 的那份」复用给别的 origin。
+ *
+ * @param {import('http').ServerResponse} res
+ * @param {number} code   HTTP 状态码
+ * @param {*} obj         响应体（JSON.stringify 之）
+ * @param {import('http').IncomingMessage} [req] 给了就按请求的 Origin 回显 ACAO
+ */
+function json(res, code, obj, req) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, {
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
     'Cache-Control': 'no-store',
+    'Vary': 'Origin',
     'Content-Length': Buffer.byteLength(body),
-  });
+  };
+  /* 与 200 路径同口径：有 Origin 就原样回显，没有就不发这个头 */
+  const org = req && req.headers && req.headers.origin;
+  if (org) headers['Access-Control-Allow-Origin'] = org;
+  res.writeHead(code, headers);
   res.end(body);
 }
 
@@ -1017,9 +1087,10 @@ function json(res, code, obj) {
  * 修法：先声明 Connection: close（客户端收到后直接把连接标成不可复用），
  * 再写响应，最后才 destroy。顺序不能反 —— 反过来写响应时会撞上已销毁的 socket。
  */
-function jsonTooLarge(res) {
+function jsonTooLarge(res, req) {
   res.setHeader('Connection', 'close');
-  json(res, 413, { code: 413, msg: 'body too large' });
+  /* H-10：CORS 口径与 200 路径一致 —— 有 Origin 才回显，不再无条件发 '*' */
+  json(res, 413, { code: 413, msg: 'body too large' }, req);
 }
 
 /* 代码类资源必须每次回源校验（配 ETag 走 304），否则改了前端 24 小时不生效 */
@@ -1087,6 +1158,23 @@ function serveStatic(req, res) {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Cache-Control': cache,
       ETag: etag,
+      /*
+       * H-11：静态资源以前**一个安全响应头都没有**（全仓 grep 'nosniff' 零命中）。
+       * 今天没有可直接利用的 XSS（esc() 覆盖与 safeCoverUrl() 白名单都核对过），
+       * 但缺这些头等于「将来任何一处注入点都直接变成 XSS，没有第二道防线」。
+       *
+       * 只上这三条零风险项：
+       *   · nosniff —— 禁止浏览器把 .js/.json 按 HTML 猜类型解析（老浏览器行为差异）；
+       *   · Referrer-Policy: no-referrer —— 本站 URL 不必带 query 泄露给外链；
+       *   · X-Frame-Options: SAMEORIGIN —— 挡点击劫持（--lan 开启时尤其相关）。
+       *
+       * 明确**不加 CSP**：1.3.5 的 L-4 已复核过「检查更新需要跨域 fetch GitHub API」
+       * 这条权衡，本轮报告也写明不推翻它。CSP 要单独评估（nonce / connect-src 白名单），
+       * 不能顺手塞一条会让更新检查静默失败的策略进来。
+       */
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      'X-Frame-Options': 'SAMEORIGIN',
     };
     /* 编辑器改名/覆盖后 mtime+size 通常会变；配合 ETag 让客户端少下一份 */
     if (ext === '.html' || cache === 'no-cache') headers['Last-Modified'] = st.mtime.toUTCString();
@@ -1124,7 +1212,8 @@ const server = http.createServer((req, res) => {
     handleRequest(req, res);
   } catch (e) {
     console.error('[ripple] request failed:', e && e.message);
-    try { json(res, 500, { code: 500, msg: 'internal error' }); } catch (e2) {}
+    /* H-10：500 路径同样按请求回显 Origin（以前走 json() 里的通配符） */
+    try { json(res, 500, { code: 500, msg: 'internal error' }, req); } catch (e2) {}
   }
 });
 
@@ -1242,7 +1331,7 @@ function handleRequest(req, res) {
          * 少了这一步，客户端会把这条即将被销毁的连接放回空闲池，
          * 紧接着的下一个请求复用它就 ECONNRESET（实测修前 30 次里失败 13 次）。
          */
-        try { jsonTooLarge(res); } catch (e) {}
+        try { jsonTooLarge(res, req); } catch (e) {}
         try { req.destroy(); } catch (e) {}
       }
     });
@@ -1274,7 +1363,8 @@ function handleRequest(req, res) {
         const bad = e && e.badRequest === true
           || /^bad upstream path/.test(msg)
           || /^(comments|comment_add|song_detail): /.test(msg);
-        json(res, bad ? 400 : 502, { code: bad ? 400 : 502, msg: msg });
+        /* H-10：400/502 也回显本次请求的 Origin，不再用通配符 */
+        json(res, bad ? 400 : 502, { code: bad ? 400 : 502, msg: msg }, req);
       }
     });
     return;
@@ -1465,4 +1555,12 @@ module.exports = {
   /* 几个测试要直接断言的内部函数（纯读，不改变状态） */
   allowedHosts: allowedHosts,
   tokenStats: tokenStats,
+  /*
+   * L-8：响应体的字节计数器与上限常量。
+   * 导出是为了让 tests/server-http.test.js 能直接验证「按字节而非 UTF-16 码元」——
+   * 这条判据没法用 e2e 测（要真让上游吐出 16MB 中文），只能做单元级对抗：
+   * 同一批 chunk 分别喂给真计数器与朴素的 length 计数器，要求两者结论不同。
+   */
+  makeByteCounter: makeByteCounter,
+  MAX_UPSTREAM_BODY: MAX_UPSTREAM_BODY,
 };

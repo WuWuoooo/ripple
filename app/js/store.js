@@ -528,9 +528,21 @@
         imports: arr(saved.imports),
         onlineCache: arr(saved.onlineCache).filter((x) => x && x.id),
       };
-      // 进度小键优先（它比整份 state 更新），字段仍然挂在 settings 上，其他代码不用改
+      /*
+       * 进度小键只管「只有进度才有」的三样：位置 / 队列 / 下标。
+       *
+       * ⚠️ lastTrackId **不在这里覆盖**（审查 1.3.8 的 H-5）。
+       * 以前这里写着「进度小键优先（它比整份 state 更新）」并无条件覆盖
+       * lastTrackId —— 这个前提只在两个键由同一次写入产生时成立，而实际：
+       *   · Store.set('lastTrackId', X)（切歌时）走 rAF 合帧，写**整份** KEY，
+       *     settings.lastTrackId 立刻是新值；
+       *   · saveProgress()（只写 KEY_PROGRESS）有 12 秒节流，
+       *     冷启动恢复期（App._restorePending）还完全不写。
+       * 于是两者长期不一致：KEY 是新的、KEY_PROGRESS 是旧的 ——
+       * 加载时旧的赢，用户「听着 B、重启回到 A」，lastPosition 也一起被
+       * 拽回 A 的进度。lastTrackId 交给整份存档负责即可，那里是即时写的。
+       */
       if (prog && typeof prog === 'object') {
-        if (typeof prog.lastTrackId === 'string') this.state.settings.lastTrackId = prog.lastTrackId;
         if (Number(prog.lastPosition) >= 0) this.state.settings.lastPosition = Number(prog.lastPosition);
         if (Array.isArray(prog.lastQueue)) this.state.settings.lastQueue = prog.lastQueue.filter((x) => typeof x === 'string');
         if (Number(prog.queueIndex) >= 0) this.state.settings.queueIndex = Number(prog.queueIndex);
