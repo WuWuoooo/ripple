@@ -8,7 +8,7 @@ The single source of truth for the version number is `version.json` in the root 
 
 ## 1.3.9 — Sixteenth Version
 
-> **Basis**: two things. (1) On a stripped Windows 11 install the owner reported "the lyric overlay
+> **Basis**: three things. (1) On a stripped Windows 11 install the owner reported "the lyric overlay
 > won't open, and a cmd black box pops up" — investigation confirmed the WebView2 Runtime *is* installed
 > (registry `pv = 157.0.4341.42`) and the main window renders fine, so the failure is not the runtime,
 > it is the lyric window's own creation path plus an error that was being discarded.
@@ -16,6 +16,12 @@ The single source of truth for the version number is `version.json` in the root 
 > `Ripple_1.3.8_Linux实测锐评.md` (9 items). **Both were re-checked line by line against the source**;
 > every reproducible item was verified locally. Items that turned out to be wrong or already fixed
 > (e.g. B-2 fixed in the previous round, M-5 already had a two-way comparison) were not re-addressed.
+> (3) On 2026-11-27 the owner sent two more Windows screenshots showing two "hugging the window edge"
+> gaps: the time + weekday in the titlebar sat too close to the top edge, and the comments / details /
+> download buttons at the bottom of the player sat too close to the bottom edge. Filed as pending then,
+> fixed together in this release (see "Desktop").
+> **Acceptance**: the desktop build was run end to end on a local Linux box (Xvfb + software rendering),
+> so the desktop fixes carry end-to-end evidence for the first time instead of only a green compile.
 > **Implementation and docs by**: Deepseek V4.1 Flash.
 
 ### Shared (frontend / build chain)
@@ -120,6 +126,24 @@ The single source of truth for the version number is `version.json` in the root 
 - Fixed a wrong `rust-version` declaration, removed the never-registered
   `tauri-plugin-shell` dead dependency, and stopped `open_external` from rejecting valid URLs
   that contain `%`
+- **Fixed the titlebar and the bottom of the player "hugging the window edge"** (the owner's 2026-11-27
+  Windows screenshots): both had the same root cause — `.topbar`'s padding-top uses `var(--safe-t)`
+  and `.np-actions`'s padding-bottom uses `var(--safe-b)`, and those two variables mean "the height
+  taken by the **system** status bar / gesture bar". On a phone they hold real values (the APK rewrites
+  them with measured insets); on desktop **both are 0** — there is no status bar and no gesture bar —
+  so the breathing space the system chrome used to provide vanished entirely and the content sat
+  against the window edge. The compensation lives on the desktop side (`bridge.js` sets
+  `data-plat="desktop"` on `<html>`, and `:root[data-plat="desktop"]` tops `--safe-t` /
+  `--safe-b` up to 18px each); it is **not** hardcoded padding in the shared CSS, because `app/`
+  is shared by all three platforms and a fixed value there would give Android "real status bar height
+  + the new value", i.e. double padding. The numbers were measured: 15px at the top and 13px at the
+  bottom before, which visibly hugged the edge; with 18px added they measure 19px / 19px
+- **Fixed "check for updates" inverting new and old**: the desktop path fetches the GitHub Release and
+  compared with `ver !== cur`, a string comparison — with 1.3.9 running locally and only v1.3.8
+  published it still popped "a new version is available", printing "current 1.3.9 → latest 1.3.8",
+  which is visibly wrong; and further ahead, going from 1.3.9 to 1.3.10 would be judged "no new
+  version" by lexicographic order. Now compared per numeric segment (missing segments count as 0), and
+  the prompt only appears when the remote version is **actually newer**
 
 ### Android
 
@@ -180,10 +204,6 @@ The single source of truth for the version number is `version.json` in the root 
   (`csp` stays `null` — the 1.3.5 trade-off is not being overturned)
 - Fixed the upstream body limit being measured in UTF-16 code units instead of real bytes
   (a 16MB limit could actually consume 48MB of all-Chinese text)
-
-### Linux
-
-- Shares the same Rust and frontend as Windows, so it benefits from the three fixes above
 
 ---
 
