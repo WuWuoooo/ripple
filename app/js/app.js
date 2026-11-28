@@ -8989,6 +8989,33 @@
     }
     try { localStorage.setItem(UPDATE_LAST_KEY, String(now)); } catch (e) {}
 
+    /*
+     * 按数字逐段比较版本号：a > b 返回 1，相等 0，小于 -1。
+     *
+     * 为什么不能直接 ver !== cur（这里原来是这么写的，是个真 bug）：
+     *   字符串比较下 '1.3.10' < '1.3.9'（字典序），于是从 1.3.9 升到 1.3.10
+     *   会被判成「没有新版本」；反过来当前版本比远端新时又会误报有更新。
+     *   2026-11-27 本机 Linux 实测就撞到了后一种：本地 1.3.9（尚未发 Release），
+     *   GitHub 最新 Release 还是 v1.3.8，弹窗写着「发现新版本」并显示
+     *   「当前 1.3.9 → 最新 1.3.8」—— 一眼就是错的。
+     *
+     * 逐段转成整数再比，缺的段按 0 补（1.3 与 1.3.0 相等）。
+     * 后缀（-beta / -rc）不参与比较：Ripple 的 versionName 契约里
+     * 只有三段数字（version.json 由 scripts/release-notes.js 强制校验），
+     * 给不存在的形态写兼容分支只会让人以为这里支持预发布版。
+     */
+    function compareVersion(a, b) {
+      const pa = String(a || '').split('.').map((x) => parseInt(x, 10) || 0);
+      const pb = String(b || '').split('.').map((x) => parseInt(x, 10) || 0);
+      const n = Math.max(pa.length, pb.length);
+      for (let i = 0; i < n; i++) {
+        const x = pa[i] || 0;
+        const y = pb[i] || 0;
+        if (x !== y) return x > y ? 1 : -1;
+      }
+      return 0;
+    }
+
     fetch('https://api.github.com/repos/WuWuoooo/ripple/releases/latest', {
       headers: { Accept: 'application/vnd.github+json' },
     }).then((r) => {
@@ -9000,7 +9027,8 @@
       const tag = String(rel.tag_name || '');
       const ver = tag.replace(/^v/, '');
       const cur = (RIPPLE_VERSION && RIPPLE_VERSION.name) || '';
-      if (ver && ver !== cur) {
+      /* 只有远端**确实更新**才提示；相等或本地更新时都不打扰用户。 */
+      if (ver && compareVersion(ver, cur) > 0) {
         _updateState.remote = { hasNew: true, version: ver, notes: rel.body || '' };
         _updateVal('有新版本 ›');
         const h = $('#updateHint');

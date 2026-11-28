@@ -378,6 +378,36 @@
    */
   g.RippleNative = bridge;
 
+  /* ================= 桌面端顶栏 / 播放页底部的呼吸空间 ================= 
+   *
+   * 用户 2026-11-27 用 Windows 截图报了两处「贴边」：
+   *
+   *   ① 顶栏第一行「15:43 · 星期五」离窗口上边缘太近；
+   *   ② 播放页底部三个按钮（评论 / 歌曲详情 / 下载）离窗口下边缘太近。
+   *
+   * 两处的根因是同一个：前端那套间距是按**手机**设计的 ——
+   * .topbar 的 padding-top 用 var(--safe-t)，.np-actions 的 padding-bottom
+   * 用 var(--safe-b)，而这两个变量的语义是「系统状态栏 / 手势条占掉的高度」。
+   * 手机上有真实值，APK 会把它改写成量出来的像素；
+   * **桌面端两个变量都是 0** —— 没有状态栏，也没有手势条。
+   * 于是本该由「系统 chrome」提供的留白在桌面端完全消失，内容贴着窗沿。
+   *
+   * 为什么不在 app/css 里给 .topbar / .np-actions 直接加固定 padding：
+   *   app/ 是三端共享的前端。在那里加固定值，Android 上就会变成
+   *   「状态栏高度 + 新加的值」= 双份留白，反而更难看。
+   *   而「桌面端没有系统栏」这件事**只有桌面端自己知道**，
+   *   所以补偿必须写在桌面端这一层。
+   *
+   * 实现方式：给 <html> 加一个 data-plat="desktop"，由 CSS 按它微调。
+   * 用 CSS 变量而不是直接改 padding，是因为那两条规则本来就是
+   * 「padding + var(--safe-*)」的形状 —— 只把变量补上，样式规则一个字都不用动，
+   * 以后手机端改了 padding 也不会和这里打架。
+   */
+  (function applyDesktopInsets() {
+    if (!document.documentElement) return;
+    document.documentElement.setAttribute('data-plat', 'desktop');
+  })();
+
   /* ================= 歌词窗创建失败 → 用户可见的提示 =================
    *
    * 1.3.9 之前这条链路是这样断的：
